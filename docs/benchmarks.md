@@ -1,5 +1,21 @@
 # Headless benchmark guide
 
+## Published measurements
+
+The [README results](../README.md#benchmarks) come from three release runs of
+`3094b93745859378b939209a4c196dab9b2c5b19` on Linux x86-64 with Rust 1.100.0,
+an NVIDIA GeForce RTX 4050 Laptop GPU, and NVIDIA Vulkan driver 620.70.06. Each workload
+uses 4× MSAA. The p50 and p95 values use the nearest rank across the pooled samples
+for that workload. The crosshair pass recorded zero static scene rebuilds in all three runs.
+
+The CSVs include the run number, frame index within the run, and elapsed milliseconds.
+
+- [500,000-segment pan and zoom](benchmarks/rtx-4050-vulkan/cad2d-pan-zoom.csv)
+- [Crosshair updates](benchmarks/rtx-4050-vulkan/cad2d-crosshair.csv)
+- [100,000-instance orbit](benchmarks/rtx-4050-vulkan/instanced-orbit.csv)
+
+## Reproduce the workloads
+
 ```sh
 cargo run --release --locked -p iletki --example showcase -- target/showcase
 ```

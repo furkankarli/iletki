@@ -1,19 +1,40 @@
 # iletki
 
-A fast, UI-framework-agnostic `wgpu` viewport for 2D/3D CAD, BIM, GIS, game editors and technical visualization, written in pure Rust.
+A framework-agnostic `wgpu` viewport library for 2D and 3D CAD, GIS, and editors. Add cameras,
+scene rendering, and GPU picking to a Rust application while keeping control of its window,
+event loop, and GPU device.
+
+Run the interactive desktop demo from a checkout.
+
+```sh
+cargo run --release --locked -p iletki-demo
+```
+
+![Top, perspective, front, and side views of a shared scene with a selection outline and transform gizmo](docs/images/quad-view.webp)
 
 ## Why iletki?
 
-- **Framework-independent integration.** The core crates have no UI or windowing dependencies. Use the resolved offscreen `TextureView` (`OwnedTarget`) or composite its color into your own `RenderPass` (`BorrowedPass`). The [`iletki-egui`](crates/iletki-egui) adapter is optional.
-- **Large-world `f64` precision.** 2D geometry uses split `hi/lo` `f32` vertex subtraction. 3D scenes render camera-relative with infinite Reversed-Z (`Depth32Float`). These paths retain local detail near national grid coordinates such as `(661_858 m, 4_491_159 m)`.
-- **Dual execution modes.** `OnDemand` caches the static MSAA scene offscreen (0 static draw calls on pointer hover / overlay updates); `Continuous` streams at full frame rate for games and live simulation.
-- **Multi-viewport by design.** Share one scene across N independent `ViewportHost` instances (e.g. Top / Front / Right / Perspective CAD quad views) inside a single `wgpu::CommandEncoder` via per-`ViewportId` uniform buffers.
-- **Built-in editor primitives.** 64-bit GPU picking (`Rg32Uint` + Reversed-Z depth reconstruction, sync & cross-platform async for native + WebGPU), Jump-Flood (JFA) screen-space selection outlines, 6 world-space section clip planes, *Shaded with Edges* depth-offset wireframes, 100k+ GPU instancing, infinite 3D ground grid, screen-size-invariant 3D transform gizmo, `Camera::fit_3d`, standard CAD views and smooth `CameraTransition`s.
-- **Defensive input handling and permissive licensing.** The libraries forbid `unsafe` and deny panicking primitives and unchecked indexing. They build for native and `wasm32-unknown-unknown` and use `MIT OR Apache-2.0`.
+- **Embed a viewport in your renderer.** Use a resolved offscreen `TextureView` or composite it
+  into your own `wgpu::RenderPass`. An optional adapter supplies an `egui_wgpu` paint callback.
+- **Keep local detail in large worlds.** World coordinates and cameras use `f64`. The 2D renderer
+  uses split coordinates, and the 3D renderer uses camera-relative transforms and Reversed-Z.
+- **Reuse work between frames.** `OnDemand` caches static geometry so a crosshair or hover
+  overlay can update on its own. Choose `Continuous` for live simulation and animation.
+- **Build an editor around a shared scene.** Give multiple viewports independent cameras and
+  use 64-bit GPU picking, selection outlines, section planes, and transform gizmos.
 
 ## Benchmarks
 
-The headless showcase measures a 500,000-segment 2D CAD scene at 1024×768, 100,000 instanced boxes at 800×600 (1.2 million triangles), and a 120-frame drag-resize workload. See the [benchmark guide](docs/benchmarks.md) for commands, timing boundaries and output files.
+Synchronized offscreen frame latency on an NVIDIA GeForce RTX 4050 Laptop GPU with Vulkan,
+at 4× MSAA. Three release runs contributed samples to each workload.
+
+| Workload | Frames | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| Pan and zoom across 500,000 2D segments at 1024×768 | 180 | 0.31 ms | 0.47 ms |
+| Update the crosshair in the same scene with zero static redraws | 90 | 0.10 ms | 0.13 ms |
+| Orbit 100,000 instanced boxes (1.2 million triangles) at 800×600 | 180 | 1.47 ms | 1.67 ms |
+
+[Benchmark commands, measurement scope, and raw CSV data](docs/benchmarks.md)
 
 ## Quick start
 
@@ -59,28 +80,28 @@ let frame = host.render_to_texture(&device, &queue, &mut encoder, &(), &mut laye
 For native asynchronous picking in an event-driven UI, submit the frame, call `begin_pick_rect`, and schedule checks with `PendingPick::try_read` until the result is ready. WebGPU drives its mapping callbacks asynchronously. See the [`ViewportHost` API](crates/iletki-wgpu/src/host.rs).
 
 The [standalone egui example](examples/egui) shows how to render a viewport through an
-`egui_wgpu` callback and pick an object. It uses versioned dependencies.
+`egui_wgpu` callback and pick an object. It uses registry dependencies. From a checkout, the
+package verification command below runs it against locally built archives.
 
-## Workspace layout
+## Which crate should I use?
 
-See [docs/architecture.md](docs/architecture.md) for the crate layering rules.
+| Crate | Use it when |
+| --- | --- |
+| [`iletki`](crates/iletki) | You want the usual starting point. The default features include the GPU host and both scene layers. Choose `cad2d` or `cad3d` with default features disabled to use a single scene layer. |
+| [`iletki-core`](crates/iletki-core) | You need `f64` math, cameras, navigation, or viewport input types without runtime dependencies. |
+| [`iletki-wgpu`](crates/iletki-wgpu) | You have your own rendering layers and need a viewport host with render targets, caching, compositing, and picking. |
+| [`iletki-2d`](crates/iletki-2d) | You need split-precision lines and fills, spatial culling, grids, or overlays for 2D drawings. |
+| [`iletki-3d`](crates/iletki-3d) | You need 3D meshes, instancing, selection outlines, section planes, or transform gizmos. |
+| [`iletki-egui`](crates/iletki-egui) | You use `egui` or `eframe` and want a paint callback and input translation for your viewport. |
 
-- `crates/iletki-core` — Zero-dependency `f64` math, 2D/3D cameras, `fit_2d`/`fit_3d`, `StandardView`, `CameraTransition`, clip planes, frustums, camera rigs, input/command contracts, `PickId`, `ViewportId`, 256 px block sizing.
-- `crates/iletki-wgpu` — `ViewportHost`, `OnDemand` / `Continuous`, `OwnedTarget` / `BorrowedPass`, Jump-Flood selection outlines, 64-bit sync + async GPU picking, headless RGBA readback.
-- `crates/iletki-2d` — Split `hi/lo` 2D lines, fills, wide lines, 8×8 spatial culling, 64 MiB `PagedBuffer`, adaptive grids and overlays.
-- `crates/iletki-3d` — Camera-relative Reversed-Z 3D meshes, *Shaded with Edges*, `InstancedMesh3DLayer`, infinite 3D grid, 92 px transform gizmo.
-- `crates/iletki-egui` — Optional thin `egui` / `eframe` adapter (`ViewportPaintCallback`, input & command translation).
-- `crates/iletki` — Top-level facade re-exporting workspace crates behind feature flags (`wgpu`, `cad2d`, `cad3d`).
-- `apps/iletki-demo` — Standalone interactive native demo (`winit` + `wgpu`, unpublished).
+The workspace also contains the unpublished `iletki-demo` desktop app and `xtask` development tool.
+See the [architecture guide](docs/architecture.md) for crate layering and renderer integration.
 
-## Running demos & CI
+## Development and CI
 
 ```sh
-# Interactive desktop demo (3D Arch, 4-Way Quad-View, 2D 500k UTM CAD, 100k 3D Instances, GPU Pick)
-cargo run --release -p iletki-demo
-
 # Headless visual showcase (writes PNGs and timing CSVs to target/showcase)
-cargo run --release -p iletki --example showcase
+cargo run --release --locked -p iletki --example showcase
 
 # Full quality gate (fmt, clippy, tests, docs, cargo-deny, wasm32)
 rustup target add wasm32-unknown-unknown
@@ -98,6 +119,10 @@ The [CI workflow](.github/workflows/ci.yml) checks rendered pixels and 64-bit pi
 Linux/Vulkan (Mesa lavapipe), Windows/DX12, macOS/Metal, and Chrome/WebGPU (SwiftShader).
 Each job requires its named backend. These headless tests cover offscreen rendering and picking.
 The standalone egui example also checks compositing into an egui render pass.
+
+## Support iletki
+
+If iletki helps your project, you can support its development through [GitHub Sponsors](https://github.com/sponsors/furkankarli).
 
 ## License
 
