@@ -151,18 +151,75 @@ pub const fn cursor_to_egui(kind: CursorKind) -> egui::CursorIcon {
     }
 }
 
-/// Applies [`ViewportCommand`]s returned by [`ViewportHost::on_input`] to `egui::Context`.
+/// Applies window-wide viewport commands to `egui::Context`.
+/// Use [`apply_viewport_commands_for_response`] for widget-local cursor wrapping and raw motion.
 pub fn apply_viewport_commands(ctx: &egui::Context, commands: &[ViewportCommand]) {
     for cmd in commands {
         match cmd {
             ViewportCommand::SetCursor(kind) => ctx.set_cursor_icon(cursor_to_egui(*kind)),
             ViewportCommand::RequestRedraw => ctx.request_repaint(),
-            _ => {}
+            ViewportCommand::GrabPointer(grab) => {
+                let mode = if *grab {
+                    egui::CursorGrab::Locked
+                } else {
+                    egui::CursorGrab::None
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(mode));
+            }
+            ViewportCommand::WrapPointer(_) => {}
         }
     }
 }
 
-/// Translates `egui` pointer, drag, wheel, pinch and Space-pan events on `response` into
+/// Applies viewport commands with a widget responsible for pointer lock and cursor wrapping.
+pub fn apply_viewport_commands_for_response(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    commands: &[ViewportCommand],
+) {
+    let owner_id = grab_owner_id(ctx);
+    for command in commands {
+        match command {
+            ViewportCommand::GrabPointer(true) => {
+                ctx.data_mut(|data| data.insert_temp(owner_id, response.id));
+                response.request_focus();
+            }
+            ViewportCommand::GrabPointer(false) => {
+                ctx.data_mut(|data| data.remove::<egui::Id>(owner_id));
+            }
+            ViewportCommand::WrapPointer(pos) if pos.is_finite() => {
+                let offset = egui::vec2(pos.x as f32, pos.y as f32);
+                if offset.is_finite() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(
+                        response.rect.min + offset,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        apply_viewport_commands(ctx, std::slice::from_ref(command));
+    }
+}
+
+fn grab_owner_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique(("iletki pointer grab", ctx.viewport_id()))
+}
+
+fn navigation_key(key: egui::Key) -> Option<KeyCode> {
+    Some(match key {
+        egui::Key::Space => KeyCode::Space,
+        egui::Key::Escape => KeyCode::Escape,
+        egui::Key::W => KeyCode::W,
+        egui::Key::A => KeyCode::A,
+        egui::Key::S => KeyCode::S,
+        egui::Key::D => KeyCode::D,
+        egui::Key::Q => KeyCode::Q,
+        egui::Key::E => KeyCode::E,
+        _ => return None,
+    })
+}
+
+/// Translates `egui` pointer, drag, wheel, pinch, navigation and focus events on `response` into
 /// viewport-local [`ViewportInput`] events (logical points, `(0, 0)` at `rect.min`).
 #[must_use]
 pub fn translate_egui_input(
@@ -171,37 +228,42 @@ pub fn translate_egui_input(
     rect: egui::Rect,
 ) -> Vec<ViewportInput> {
     let mut events = Vec::new();
+    let owner_id = grab_owner_id(ctx);
+    let grabbed = ctx.data(|data| data.get_temp::<egui::Id>(owner_id)) == Some(response.id);
+    let hovered = response.hovered();
+    let dragged = response.dragged();
+    let focused = response.has_focus();
     let to_local =
         |p: egui::Pos2| Vec2::new(f64::from(p.x - rect.min.x), f64::from(p.y - rect.min.y));
 
     ctx.input(|input| {
         let modifiers = modifiers_from_egui(input.modifiers);
+        let center = to_local(rect.center());
 
         for ev in &input.events {
             match ev {
                 egui::Event::Key {
-                    key: egui::Key::Space,
+                    key,
+                    physical_key,
                     pressed,
+                    modifiers,
                     ..
-                } if response.hovered() || response.has_focus() => {
-                    events.push(if *pressed {
-                        ViewportInput::KeyDown {
-                            key: KeyCode::Space,
-                            modifiers,
-                        }
-                    } else {
-                        ViewportInput::KeyUp {
-                            key: KeyCode::Space,
-                            modifiers,
-                        }
-                    });
+                } if grabbed || focused || (hovered && *key == egui::Key::Space) => {
+                    if let Some(key) = navigation_key(physical_key.unwrap_or(*key)) {
+                        let modifiers = modifiers_from_egui(*modifiers);
+                        events.push(if *pressed {
+                            ViewportInput::KeyDown { key, modifiers }
+                        } else {
+                            ViewportInput::KeyUp { key, modifiers }
+                        });
+                    }
                 }
                 egui::Event::PointerButton {
                     pos,
                     button,
                     pressed,
                     ..
-                } if response.hovered() || response.dragged() || !*pressed => {
+                } if grabbed || hovered || dragged || !*pressed => {
                     let mapped = match button {
                         egui::PointerButton::Primary => Some(PointerButton::Primary),
                         egui::PointerButton::Secondary => Some(PointerButton::Secondary),
@@ -226,7 +288,7 @@ pub fn translate_egui_input(
                         });
                     }
                 }
-                egui::Event::MouseWheel { unit, delta, .. } if response.hovered() => {
+                egui::Event::MouseWheel { unit, delta, .. } if hovered || grabbed => {
                     let pos = input.pointer.hover_pos().map_or(
                         Vec2::new(
                             f64::from(rect.width()) * 0.5,
@@ -245,7 +307,7 @@ pub fn translate_egui_input(
                         modifiers,
                     });
                 }
-                egui::Event::Zoom(factor) if response.hovered() && factor.is_finite() => {
+                egui::Event::Zoom(factor) if hovered && factor.is_finite() => {
                     let pos = input.pointer.hover_pos().map_or(
                         Vec2::new(
                             f64::from(rect.width()) * 0.5,
@@ -258,13 +320,24 @@ pub fn translate_egui_input(
                         scale_factor: f64::from(*factor),
                     });
                 }
+                egui::Event::MouseMoved(delta) if grabbed => {
+                    events.push(ViewportInput::PointerMove {
+                        pos: center,
+                        delta: Vec2::new(f64::from(delta.x), f64::from(delta.y)),
+                        modifiers,
+                    });
+                }
+                egui::Event::WindowFocused(false) => events.push(ViewportInput::FocusLost),
                 _ => {}
             }
         }
 
-        if let Some(pos) = input.pointer.interact_pos() {
+        if !grabbed
+            && input.focused
+            && let Some(pos) = input.pointer.interact_pos()
+        {
             let delta = input.pointer.delta();
-            if (response.hovered() || response.dragged()) && (delta.x != 0.0 || delta.y != 0.0) {
+            if (hovered || dragged) && (delta.x != 0.0 || delta.y != 0.0) {
                 events.push(ViewportInput::PointerMove {
                     pos: to_local(pos),
                     delta: Vec2::new(f64::from(delta.x), f64::from(delta.y)),
@@ -273,6 +346,10 @@ pub fn translate_egui_input(
             }
         }
     });
+
+    if response.lost_focus() && !events.contains(&ViewportInput::FocusLost) {
+        events.push(ViewportInput::FocusLost);
+    }
 
     events
 }
@@ -307,5 +384,29 @@ mod tests {
         assert_eq!(desc.sample_count, 1);
         assert_eq!(desc.depth_format, None);
         assert!(desc.blend_alpha);
+    }
+
+    #[test]
+    fn widget_pointer_grab_routes_motion_and_focus_loss() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::MouseMoved(egui::vec2(3.0, -2.0)),
+                egui::Event::WindowFocused(false),
+            ],
+            ..egui::RawInput::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let (_, response) = ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::drag());
+            apply_viewport_commands_for_response(&ctx, &response, &[ViewportCommand::GrabPointer(true)]);
+            let events = translate_egui_input(&ctx, &response, response.rect);
+            assert!(events.contains(&ViewportInput::FocusLost));
+            assert!(events.iter().any(|event| matches!(event, ViewportInput::PointerMove { delta, .. } if *delta == Vec2::new(3.0, -2.0))));
+            apply_viewport_commands_for_response(&ctx, &response, &[ViewportCommand::GrabPointer(false)]);
+        });
+        output.textures_delta.clear();
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands.contains(&egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked)));
+        assert!(commands.contains(&egui::ViewportCommand::CursorGrab(egui::CursorGrab::None)));
     }
 }

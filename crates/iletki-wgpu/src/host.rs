@@ -9,7 +9,7 @@ use crate::target::{DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig};
 use crate::uniforms::CameraGpu;
 use iletki_core::{
     Camera, CameraRig, DirtyFlags, DrawPhase, DrawPhaseMask, OutlineConfig, PickHit, PickId,
-    TargetSize, Vec2, ViewportCommand, ViewportId, ViewportInput, ViewportMode,
+    RigOutcome, TargetSize, Vec2, ViewportCommand, ViewportId, ViewportInput, ViewportMode,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -315,18 +315,24 @@ impl ViewportHost {
         }
     }
 
-    /// Routes an input event to `rig`, updating the camera and dirty flags automatically.
+    /// Routes input to the camera rig and returns its requested host commands.
+    /// Use [`Self::handle_input`] to also receive whether the rig consumed the event.
     pub fn on_input(
         &mut self,
         input: &ViewportInput,
         rig: &mut dyn CameraRig,
     ) -> Vec<ViewportCommand> {
+        self.handle_input(input, rig).commands
+    }
+
+    /// Routes input to the rig, preserving its decision about further event dispatch.
+    pub fn handle_input(&mut self, input: &ViewportInput, rig: &mut dyn CameraRig) -> RigOutcome {
         let logical = self.logical_size();
         let outcome = rig.handle_input(input, &mut self.camera, logical);
         if outcome.camera_changed {
             self.dirty.insert(DirtyFlags::CAMERA);
         }
-        outcome.commands
+        outcome
     }
 
     /// Advances time-based rig animation (e.g. fly movement or smooth damping).
@@ -387,8 +393,9 @@ impl ViewportHost {
         stats
     }
 
-    /// Path B (`BorrowedPass`, step 2): blits the finished viewport into the host's active render
-    /// pass (e.g. `egui_wgpu::CallbackTrait::paint` or a swapchain pass).
+    /// Path B (`BorrowedPass`, step 2): composites the resolved offscreen color into the host's
+    /// active render pass. The host sets the viewport and scissor. Scene depth stays offscreen;
+    /// an external depth attachment only affects pipeline compatibility.
     pub fn paint_into_pass(&self, pass: &mut wgpu::RenderPass<'_>, pass_target: PassTargetDesc) {
         let Some(pipeline) = self.blit.get_pipeline(
             pass_target.format,
