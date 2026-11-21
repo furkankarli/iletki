@@ -25,6 +25,12 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    create_headless_device_with_limits(wgpu::Limits::default())
+}
+
+fn create_headless_device_with_limits(
+    required_limits: wgpu::Limits,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
@@ -43,9 +49,82 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()?;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki-2d test device"),
+        required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
     .ok()
+}
+
+#[test]
+fn picking_matches_geometry_across_pages_and_unpickable_chunks() {
+    let Some((device, queue)) = create_headless_device_with_limits(wgpu::Limits {
+        max_buffer_size: 16 * 1024,
+        ..wgpu::Limits::default()
+    }) else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            initial_px: [64, 64],
+            msaa_samples: 1,
+            ..ViewportConfig::default()
+        },
+    );
+    let wanted = PickId::new(1, 77, 2);
+    let mut scene = Scene2DLayer::new(1);
+    let mut mesh = Mesh2D::default();
+    let style = |id| DrawStyle2D::new([255, 0, 0, 255], false, 0.5, id);
+    for _ in 0..114 {
+        mesh.push_rect_fill(
+            Vec2::new(-1000.0, -10.0),
+            Vec2::new(-990.0, 10.0),
+            style(PickId::NONE),
+        );
+    }
+    mesh.push_rect_fill(
+        Vec2::new(-10.0, -10.0),
+        Vec2::new(10.0, 10.0),
+        style(wanted),
+    );
+    scene.upload_static_mesh(&device, &queue, &mesh);
+
+    let pick_center = |host: &mut ViewportHost, scene: &mut Scene2DLayer| {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [scene];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+        queue.submit([encoder.finish()]);
+        host.pick_rect_blocking(&device, &queue, &(), &mut layers, [32, 32, 1, 1])
+            .unwrap()
+    };
+    assert_eq!(
+        pick_center(&mut host, &mut scene).first().map(|hit| hit.id),
+        Some(wanted)
+    );
+
+    scene.set_static_mesh(&Mesh2D::default());
+    let mut unpickable = Mesh2D::default();
+    unpickable.push_rect_fill(
+        Vec2::new(-30.0, -10.0),
+        Vec2::new(-20.0, 10.0),
+        style(PickId::NONE),
+    );
+    scene.insert_chunk(&unpickable);
+    let mut pickable = Mesh2D::default();
+    pickable.push_rect_fill(
+        Vec2::new(-10.0, -10.0),
+        Vec2::new(10.0, 10.0),
+        style(wanted),
+    );
+    let handle = scene.insert_chunk(&pickable);
+    assert_eq!(
+        pick_center(&mut host, &mut scene).first().map(|hit| hit.id),
+        Some(wanted)
+    );
+
+    pickable.triangle_pick_ids.clear();
+    scene.update_chunk(handle, &pickable);
+    assert!(pick_center(&mut host, &mut scene).is_empty());
 }
 
 #[test]
