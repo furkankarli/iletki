@@ -1,0 +1,24 @@
+[package]
+name = "iletki"
+description = "Fast, framework-agnostic wgpu viewport for 2D/3D CAD, game editors and visualization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["wgpu", "cad2d", "cad3d"]
+wgpu = ["dep:iletki-wgpu"]
+cad2d = ["wgpu", "dep:iletki-2d"]
+cad3d = ["wgpu", "dep:iletki-3d"]
+
+[dependencies]
+iletki-core.workspace = true
+iletki-wgpu = { workspace = true, optional = true }
+iletki-2d = { workspace = true, optional = true }
+iletki-3d = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "iletki-3d"
+description = "Camera-relative Reversed-Z 3D scene, infinite ground grid, section clip planes and transform gizmos for iletki"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iletki-core.workspace = true
+iletki-wgpu.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

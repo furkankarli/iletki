@@ -1,0 +1,31 @@
+//! Framework-agnostic `wgpu` viewport runtime for `iletki`.
+//!
+//! `iletki-wgpu` plugs into any host that provides a `wgpu::Device` and `wgpu::Queue` (`egui`,
+//! `winit`, `iced`, `slint`, custom hybrid UI frameworks, or headless CLI/CI runners):
+//!
+//! - **Dual rendering paths:**
+//!   - [`ViewportHost::render_to_texture`] produces a zero-copy `wgpu::TextureView` cropped by
+//!     `uv_max`.
+//!   - [`ViewportHost::prepare_for_pass`] + [`ViewportHost::paint_into_pass`] blits directly into
+//!     a host-owned `wgpu::RenderPass`.
+//! - **Dual scheduling modes:** [`iletki_core::ViewportMode::OnDemand`] caches the static scene in
+//!   an offscreen MSAA target so pointer moves incur zero static draw calls;
+//!   [`iletki_core::ViewportMode::Continuous`] streams directly at full frame rate.
+//! - **256 px block-aligned targets:** stutter-free resizing with shrink hysteresis.
+//! - **64-bit ID + Reversed-Z depth picking** and **headless RGBA readback**.
+
+mod blit;
+pub mod error;
+pub mod host;
+pub mod layer;
+mod outline;
+pub mod target;
+pub mod uniforms;
+
+pub use error::ViewportError;
+pub use host::{FrameOutput, FrameStats, PassTargetDesc, RgbaImage, ViewportHost};
+pub use layer::{PaintCtx, PrepareCtx, ViewportLayer};
+pub use outline::OUTLINE_MASK_FORMAT;
+pub use target::{DEPTH_FORMAT, PICK_ID_FORMAT, ViewportConfig};
+pub use uniforms::{CAMERA_WGSL, CameraUniformsGpu};
+pub use wgpu;

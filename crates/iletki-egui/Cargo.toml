@@ -1,0 +1,18 @@
+[package]
+name = "iletki-egui"
+description = "Thin egui / eframe adapter for the iletki GPU viewport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+egui-wgpu = { version = "0.37", default-features = false }
+iletki-core = { workspace = true }
+iletki-wgpu = { workspace = true }
+
+[lints]
+workspace = true

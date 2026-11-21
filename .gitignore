@@ -1,0 +1,19 @@
+# Build output
+/target
+
+# Local planning notes and reference material, kept out of the public repository
+/plan/
+
+# Local test captures and snapshots
+/out/
+
+# Local agent settings
+/.claude/
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

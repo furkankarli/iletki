@@ -1,0 +1,17 @@
+[package]
+name = "iletki-core"
+description = "Framework-agnostic 2D/3D viewport math, cameras, rigs and rendering contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "iletki-2d"
+description = "High-precision 2D CAD and vector layer kit for iletki with split hi/lo precision and paged incremental GPU buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iletki-core.workspace = true
+iletki-wgpu.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

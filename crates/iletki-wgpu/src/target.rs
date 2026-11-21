@@ -1,0 +1,373 @@
+//! Over-allocated offscreen MSAA, depth, static-cache and picking render targets.
+
+use crate::blit::BlitResources;
+use iletki_core::{BlockSizing, OutlineConfig, TargetSize, UploadBudget, ViewportMode};
+
+/// Standard depth format used across all `iletki-wgpu` viewports (32-bit Reversed-Z float).
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Standard GPU picking ID texture format (64-bit packed [`iletki_core::PickId`]).
+pub const PICK_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+
+/// Configuration for creating a [`crate::ViewportHost`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportConfig {
+    /// Color format of the viewport's offscreen targets (default `Rgba8UnormSrgb`).
+    pub color_format: wgpu::TextureFormat,
+    /// Multisample anti-aliasing count (`1` or `4`; default `4`).
+    pub msaa_samples: u32,
+    /// Background clear color `[r, g, b, a]` in linear space.
+    pub clear_color: [f64; 4],
+    /// Initial scheduling mode (`OnDemand` for CAD/editors, `Continuous` for games/animation).
+    pub mode: ViewportMode,
+    /// Per-frame GPU upload budget passed to layers during `prepare`.
+    pub upload_budget: UploadBudget,
+    /// Visual configuration for the Jump-Flooding selection outline pass.
+    pub outline: OutlineConfig,
+    /// Initial physical pixel extent `[width, height]`.
+    pub initial_px: [u32; 2],
+    /// Initial logical-to-physical DPI scale.
+    pub dpi_scale: f32,
+}
+
+impl Default for ViewportConfig {
+    fn default() -> Self {
+        Self {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            msaa_samples: 4,
+            clear_color: [0.09, 0.09, 0.10, 1.0],
+            mode: ViewportMode::OnDemand,
+            upload_budget: UploadBudget::default(),
+            outline: OutlineConfig::default(),
+            initial_px: [256, 256],
+            dpi_scale: 1.0,
+        }
+    }
+}
+
+impl ViewportConfig {
+    /// Sanitizes MSAA sample count to a WebGPU-valid value (`1` or `4`).
+    pub(crate) fn sanitized_msaa(&self) -> u32 {
+        if self.msaa_samples >= 4 { 4 } else { 1 }
+    }
+
+    /// Returns `wgpu::Color` from sRGB `clear_color`, converting to linear when targeting an sRGB
+    /// texture format so colors stay perceptually identical across linear and sRGB targets.
+    pub(crate) fn wgpu_clear_color(&self) -> wgpu::Color {
+        let [r, g, b, a] = self.clear_color;
+        if self.color_format.is_srgb() {
+            let lin = |c: f64| {
+                let c = c.clamp(0.0, 1.0);
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            wgpu::Color {
+                r: lin(r),
+                g: lin(g),
+                b: lin(b),
+                a,
+            }
+        } else {
+            wgpu::Color { r, g, b, a }
+        }
+    }
+}
+
+/// Backing textures for a single viewport instance.
+pub(crate) struct TargetSet {
+    sizing: BlockSizing,
+    format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    msaa_view: Option<wgpu::TextureView>,
+    depth_view: wgpu::TextureView,
+    #[cfg(not(target_arch = "wasm32"))]
+    static_texture: wgpu::Texture,
+    static_view: wgpu::TextureView,
+    static_identity_bg: wgpu::BindGroup,
+    static_crop_bg: wgpu::BindGroup,
+    #[cfg(not(target_arch = "wasm32"))]
+    output_texture: wgpu::Texture,
+    output_view: wgpu::TextureView,
+    output_crop_bg: wgpu::BindGroup,
+}
+
+impl std::fmt::Debug for TargetSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TargetSet")
+            .field("sizing", &self.sizing.current())
+            .field("format", &self.format)
+            .field("msaa_samples", &self.msaa_samples)
+            .finish()
+    }
+}
+
+impl TargetSet {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        blit: &BlitResources,
+        initial_px: [u32; 2],
+        format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> Self {
+        let sizing = BlockSizing::new(initial_px);
+        let [w, h] = sizing.current().allocated_px;
+        Self::allocate(device, blit, sizing, [w, h], format, msaa_samples)
+    }
+
+    /// Updates active size and reallocates backing textures only when crossing a 256 px block or
+    /// after shrink hysteresis. Returns `true` if textures were reallocated.
+    pub(crate) fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        blit: &BlitResources,
+        requested_px: [u32; 2],
+    ) -> bool {
+        if !self.sizing.request(requested_px) {
+            return false;
+        }
+        let alloc = self.sizing.current().allocated_px;
+        *self = Self::allocate(
+            device,
+            blit,
+            self.sizing,
+            alloc,
+            self.format,
+            self.msaa_samples,
+        );
+        true
+    }
+
+    fn allocate(
+        device: &wgpu::Device,
+        blit: &BlitResources,
+        sizing: BlockSizing,
+        [width, height]: [u32; 2],
+        format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> Self {
+        let max_dim = device.limits().max_texture_dimension_2d.max(1);
+        let width = width.clamp(1, max_dim);
+        let height = height.clamp(1, max_dim);
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let msaa_view = (msaa_samples > 1).then(|| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iletki msaa color"),
+                size,
+                mip_level_count: 1,
+                sample_count: msaa_samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            tex.create_view(&wgpu::TextureViewDescriptor::default())
+        });
+
+        let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iletki depth32"),
+            size,
+            mip_level_count: 1,
+            sample_count: msaa_samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let single_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+
+        let static_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iletki static cache"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: single_usage,
+            view_formats: &[],
+        });
+        let static_view = static_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let static_identity_bg = blit.create_identity_bind_group(device, &static_view);
+        let static_crop_bg = blit.create_crop_bind_group(device, &static_view);
+
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iletki output"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: single_usage,
+            view_formats: &[],
+        });
+        let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let output_crop_bg = blit.create_crop_bind_group(device, &output_view);
+
+        Self {
+            sizing,
+            format,
+            msaa_samples,
+            msaa_view,
+            depth_view,
+            #[cfg(not(target_arch = "wasm32"))]
+            static_texture,
+            static_view,
+            static_identity_bg,
+            static_crop_bg,
+            #[cfg(not(target_arch = "wasm32"))]
+            output_texture,
+            output_view,
+            output_crop_bg,
+        }
+    }
+
+    pub(crate) fn size(&self) -> TargetSize {
+        self.sizing.current()
+    }
+
+    pub(crate) fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    pub(crate) fn msaa_samples(&self) -> u32 {
+        self.msaa_samples
+    }
+
+    pub(crate) fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+
+    /// Returns `(color_attachment_view, resolve_target)` targeting the static cache texture.
+    pub(crate) fn static_color_views(&self) -> (&wgpu::TextureView, Option<&wgpu::TextureView>) {
+        match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&self.static_view)),
+            None => (&self.static_view, None),
+        }
+    }
+
+    /// Returns `(color_attachment_view, resolve_target)` targeting the final output texture.
+    pub(crate) fn output_color_views(&self) -> (&wgpu::TextureView, Option<&wgpu::TextureView>) {
+        match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&self.output_view)),
+            None => (&self.output_view, None),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn static_texture(&self) -> &wgpu::Texture {
+        &self.static_texture
+    }
+
+    pub(crate) fn static_view(&self) -> &wgpu::TextureView {
+        &self.static_view
+    }
+
+    pub(crate) fn static_identity_bg(&self) -> &wgpu::BindGroup {
+        &self.static_identity_bg
+    }
+
+    pub(crate) fn static_crop_bg(&self) -> &wgpu::BindGroup {
+        &self.static_crop_bg
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn output_texture(&self) -> &wgpu::Texture {
+        &self.output_texture
+    }
+
+    pub(crate) fn output_view(&self) -> &wgpu::TextureView {
+        &self.output_view
+    }
+
+    pub(crate) fn output_crop_bg(&self) -> &wgpu::BindGroup {
+        &self.output_crop_bg
+    }
+}
+
+/// Lazily allocated 1x picking targets (`Rg32Uint` ID + `Depth32Float`) for on-demand GPU picking.
+pub(crate) struct PickTargets {
+    extent: [u32; 2],
+    id_texture: wgpu::Texture,
+    id_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+}
+
+impl std::fmt::Debug for PickTargets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PickTargets")
+            .field("extent", &self.extent)
+            .finish()
+    }
+}
+
+impl PickTargets {
+    pub(crate) fn ensure<'a>(
+        slot: &'a mut Option<Self>,
+        device: &wgpu::Device,
+        allocated_px: [u32; 2],
+    ) -> &'a Self {
+        let needs_alloc = slot.as_ref().is_none_or(|p| p.extent != allocated_px);
+        if needs_alloc {
+            *slot = None;
+        }
+        slot.get_or_insert_with(|| {
+            let [width, height] = allocated_px;
+            let size = wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            };
+            let id_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iletki pick id"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: PICK_ID_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let id_view = id_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iletki pick depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            Self {
+                extent: allocated_px,
+                id_texture,
+                id_view,
+                depth_view,
+            }
+        })
+    }
+
+    pub(crate) fn id_texture(&self) -> &wgpu::Texture {
+        &self.id_texture
+    }
+
+    pub(crate) fn id_view(&self) -> &wgpu::TextureView {
+        &self.id_view
+    }
+
+    pub(crate) fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+}

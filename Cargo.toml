@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Furkan Karlı and iletki contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/furkankarli/iletki"
+
+[workspace.dependencies]
+# internal
+iletki-core = { version = "0.1.0", path = "crates/iletki-core" }
+iletki-wgpu = { version = "0.1.0", path = "crates/iletki-wgpu" }
+iletki-2d = { version = "0.1.0", path = "crates/iletki-2d" }
+iletki-3d = { version = "0.1.0", path = "crates/iletki-3d" }
+
+# gpu
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+
+# testing
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Never crash: library code returns errors or safe fallbacks instead of panicking
+# (tests are exempt, see clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+float_cmp = "warn"
