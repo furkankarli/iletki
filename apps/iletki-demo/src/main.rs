@@ -11,7 +11,7 @@
 //! - Left click: 64-bit GPU Pick (highlights selected 3D chunk with Jump-Flood outline + moves gizmo)
 //! - `1` : 3D Architectural Scene (Shaded with Edges + JFA Outline + Grid + Gizmo)
 //! - `2` : 2D National-Grid CAD Stress (500,000 segments at UTM 661km / 4491km)
-//! - `3` : 100,000-Instance 3D City Stress (3.6M triangles in 1 draw call)
+//! - `3` : 100,000-Instance 3D City Stress (1.2M triangles in 1 draw call)
 //! - `Q` : Toggle 4-Way CAD Quad-View (Top / Persp / Front / Right in 1 CommandEncoder)
 //! - `C` : Toggle 3D Section Clip Plane
 //! - `M` : Toggle `OnDemand` (0 static draws on idle) vs `Continuous`
@@ -451,7 +451,7 @@ impl GpuState {
                 }
             }
             DemoScene::Cad2D => "2D 500k CAD (UTM)",
-            DemoScene::Instanced100k => "3D 100k Instances (3.6M tris)",
+            DemoScene::Instanced100k => "3D 100k Instances (1.2M tris)",
         };
         let mode = match self.vp_main.mode() {
             ViewportMode::OnDemand => "OnDemand",

@@ -24,5 +24,16 @@ below it, and core layers never pull in a UI or windowing framework.
 - **Large-world precision.** World coordinates stay `f64`. 2D shaders subtract split `hi/lo` `f32`
   pairs; 3D shaders render camera-relative with Reversed-Z (`Depth32Float`, `GreaterEqual`,
   infinite far plane).
-- **Never panics.** All inputs (sizes, NaNs, camera factors, clip counts) are validated and clamped;
-  `unsafe` and panicking primitives are forbidden in library code.
+- **Defensive input handling.** The core clamps target sizes and filters non-finite camera inputs.
+  GPU readback checks device buffer limits. The libraries forbid `unsafe` and deny panicking
+  primitives.
+
+The application owns the device, event loop and presentation. `OwnedTarget` exposes resolved
+offscreen color and its UV bounds. `BorrowedPass` prepares the same offscreen rendering, then
+composites color into the application's pass using its viewport and scissor. The application's depth
+attachment affects pipeline compatibility. Viewport scene depth is stored in the offscreen target.
+
+`OnDemand` refreshes its cached passes when shared layers report new revisions or their membership
+changes. Hosts can schedule another frame while `FrameStats::streaming_pending` is set. Native
+hosts using `begin_pick_rect` keep checking `PendingPick::try_read` while the request is pending.
+WebGPU drives its mapping callbacks automatically.
