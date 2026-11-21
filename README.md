@@ -4,21 +4,16 @@ A fast, UI-framework-agnostic `wgpu` viewport for 2D/3D CAD, BIM, GIS, game edit
 
 ## Why iletki?
 
-- **Zero UI lock-in.** Core crates (`iletki-core`, `iletki-wgpu`, `iletki-2d`, `iletki-3d`) depend only on `wgpu` and `bytemuck` — never on `egui`, `winit`, `iced` or `slint`. Render either to a zero-copy `TextureView` (`OwnedTarget`) or directly into an external `RenderPass` (`BorrowedPass`). An optional thin [`iletki-egui`](crates/iletki-egui) adapter is provided separately.
-- **Large-world `f64` precision.** 2D geometry uses split `hi/lo` `f32` vertex subtraction; 3D scenes render camera-relative with infinite Reversed-Z (`Depth32Float`). Stay sub-millimetre accurate at national grid coordinates (`661_858 m, 4_491_159 m`) where single-precision `f32` renderers snap in 50 cm jumps.
+- **Framework-independent integration.** The core crates have no UI or windowing dependencies. Use the resolved offscreen `TextureView` (`OwnedTarget`) or composite its color into your own `RenderPass` (`BorrowedPass`). The [`iletki-egui`](crates/iletki-egui) adapter is optional.
+- **Large-world `f64` precision.** 2D geometry uses split `hi/lo` `f32` vertex subtraction. 3D scenes render camera-relative with infinite Reversed-Z (`Depth32Float`). These paths retain local detail near national grid coordinates such as `(661_858 m, 4_491_159 m)`.
 - **Dual execution modes.** `OnDemand` caches the static MSAA scene offscreen (0 static draw calls on pointer hover / overlay updates); `Continuous` streams at full frame rate for games and live simulation.
 - **Multi-viewport by design.** Share one scene across N independent `ViewportHost` instances (e.g. Top / Front / Right / Perspective CAD quad views) inside a single `wgpu::CommandEncoder` via per-`ViewportId` uniform buffers.
 - **Built-in editor primitives.** 64-bit GPU picking (`Rg32Uint` + Reversed-Z depth reconstruction, sync & cross-platform async for native + WebGPU), Jump-Flood (JFA) screen-space selection outlines, 6 world-space section clip planes, *Shaded with Edges* depth-offset wireframes, 100k+ GPU instancing, infinite 3D ground grid, screen-size-invariant 3D transform gizmo, `Camera::fit_3d`, standard CAD views and smooth `CameraTransition`s.
-- **Never panics, zero `unsafe`, permissive license.** `unsafe_code = "forbid"`, panicking primitives and unchecked indexing denied in library code, `MIT OR Apache-2.0`, builds for native and `wasm32-unknown-unknown`.
+- **Defensive input handling and permissive licensing.** The libraries forbid `unsafe` and deny panicking primitives and unchecked indexing. They build for native and `wasm32-unknown-unknown` and use `MIT OR Apache-2.0`.
 
-## Benchmarks (NVIDIA RTX 4050 Laptop, Vulkan, 800×600, `--release`)
+## Benchmarks
 
-| Workload | Metric |
-|---|---|
-| **2D National-Grid CAD** (500,000 segments at UTM `661 km / 4,491 km`, 4× MSAA, 8×8 spatial culling) | Pan+Zoom: **0.33–0.64 ms** (~1,550–3,050 fps) · Idle crosshair (`OnDemand`): **0.11 ms** (0 static draws) |
-| **3D 100,000 Instanced Boxes** (3.6M triangles, 1 draw call) | 1× MSAA: **1.22 ms (823 fps)** · 4× MSAA: **1.47 ms (681 fps)** (p99 1.58 ms) |
-| **3D Architectural Scene** (4× MSAA + Shaded Edges + JFA Outline + Infinite Grid + 92 px Gizmo) | Orbit: **0.43 ms (2,329 fps)** · Idle (`OnDemand`): **0.063 ms** |
-| **120 Continuous Drag-Resize Frames** (600 px ↔ 1200 px) | **3** GPU texture reallocations total (256 px block hysteresis) |
+The headless showcase measures a 500,000-segment 2D CAD scene at 1024×768, 100,000 instanced boxes at 800×600 (1.2 million triangles), and a 120-frame drag-resize workload. See the [benchmark guide](docs/benchmarks.md) for commands, timing boundaries and output files.
 
 ## Quick start
 
@@ -61,6 +56,8 @@ let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut scene];
 let frame = host.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
 ```
 
+For native asynchronous picking in an event-driven UI, submit the frame, call `begin_pick_rect`, and schedule checks with `PendingPick::try_read` until the result is ready. WebGPU drives its mapping callbacks asynchronously. See the [`ViewportHost` API](crates/iletki-wgpu/src/host.rs).
+
 ## Workspace layout
 
 See [docs/architecture.md](docs/architecture.md) for the crate layering rules.
@@ -79,7 +76,7 @@ See [docs/architecture.md](docs/architecture.md) for the crate layering rules.
 # Interactive desktop demo (3D Arch, 4-Way Quad-View, 2D 500k UTM CAD, 100k 3D Instances, GPU Pick)
 cargo run --release -p iletki-demo
 
-# Headless visual showcase & stress benchmarks (outputs PNGs to target/showcase)
+# Headless visual showcase (writes PNGs and timing CSVs to target/showcase)
 cargo run --release -p iletki --example showcase
 
 # Full quality gate (fmt, clippy, tests, docs, cargo-deny, wasm32)

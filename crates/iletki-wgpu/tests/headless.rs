@@ -8,8 +8,8 @@
 
 use iletki_core::{DirtyFlags, DrawPhase, DrawPhaseMask, PickId, ViewportMode};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportHost,
-    ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportError,
+    ViewportHost, ViewportLayer, wgpu,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -27,7 +27,14 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    create_headless_device_with_limits(wgpu::Limits::default())
+}
+
+fn create_headless_device_with_limits(
+    required_limits: wgpu::Limits,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
         compatible_surface: None,
@@ -45,9 +52,59 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()?;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki test device"),
+        required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
     .ok()
+}
+
+#[test]
+fn required_headless_backend_is_available() {
+    if std::env::var_os("ILETKI_REQUIRE_GPU_TESTS").is_some() {
+        assert!(
+            create_headless_device().is_some(),
+            "no headless GPU adapter available"
+        );
+    }
+}
+
+#[test]
+fn target_sizing_and_readback_respect_device_limits() {
+    let Some((device, queue)) = create_headless_device_with_limits(wgpu::Limits {
+        max_texture_dimension_2d: 500,
+        max_buffer_size: 16 * 1024,
+        ..wgpu::Limits::default()
+    }) else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    );
+    host.resize(&device, [513, 128], 1.0);
+    assert_eq!(host.size().active_px, [500, 128]);
+    assert_eq!(host.size().allocated_px, [500, 256]);
+    assert_eq!(
+        host.size().uv_max.map(f32::to_bits),
+        [1.0_f32, 0.5].map(f32::to_bits)
+    );
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let mut layers: [&mut dyn ViewportLayer<()>; 0] = [];
+    host.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+    queue.submit([encoder.finish()]);
+
+    assert_eq!(
+        host.readback_rgba_blocking(&device, &queue),
+        Err(ViewportError::RegionTooLarge)
+    );
+    assert_eq!(
+        host.pick_rect_blocking(&device, &queue, &(), &mut layers, [0, 0, 500, 128]),
+        Err(ViewportError::RegionTooLarge)
+    );
 }
 
 /// Test layer that draws a green quad in `Opaque`, an optional red center quad in `Overlay`, and
@@ -313,4 +370,35 @@ fn on_demand_caches_static_scene_and_picks_64bit_id() {
     assert_eq!(async_hits.len(), 1);
     assert_eq!(async_hits[0].id, expected_id);
     assert!((async_hits[0].depth - 0.5).abs() < 1e-4);
+}
+
+#[test]
+fn pick_can_start_before_render_and_outlive_the_viewport() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            msaa_samples: 1,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    );
+    let id = PickId::new(7, 98, 3);
+    let mut layer = SolidQuadLayer::new(id);
+    let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut layer];
+    let mut request = host
+        .begin_pick_rect(&device, &queue, &(), &mut layers, [60, 60, 9, 9])
+        .unwrap();
+    host.resize(&device, [512, 384], 2.0);
+    drop(host);
+    drop(layer);
+
+    let hits = block_on(std::future::poll_fn(|_| request.try_read())).unwrap();
+    assert_eq!(hits.first().map(|hit| hit.id), Some(id));
+    assert_eq!(
+        request.try_read(),
+        Poll::Ready(Err(ViewportError::PickAlreadyRead))
+    );
 }

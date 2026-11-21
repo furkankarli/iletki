@@ -7,7 +7,10 @@ use bytemuck::{Pod, Zeroable};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer};
+use iletki_wgpu::{
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    ViewportLifetime,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -54,6 +57,7 @@ struct InstPipelines {
 
 struct ViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
@@ -63,6 +67,8 @@ struct ViewportBinding {
 /// picking and simultaneous multi-viewport sharing.
 pub struct InstancedMesh3DLayer {
     layer_id: u16,
+    revision: LayerRevision,
+    prepared_origin: Option<Vec3>,
     /// Shared `f64` world origin of all instances in this batch.
     pub origin: Vec3,
     prototype: Option<Mesh3D>,
@@ -92,6 +98,8 @@ impl InstancedMesh3DLayer {
     pub fn new(layer_id: u16, origin: Vec3, prototype: Mesh3D) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
+            prepared_origin: None,
             origin: if origin.is_finite() {
                 origin
             } else {
@@ -111,6 +119,7 @@ impl InstancedMesh3DLayer {
     /// Replaces the instance list (uploaded on the next `prepare`).
     pub fn set_instances(&mut self, instances: Vec<Instance3D>) {
         self.pending_instances = Some(instances);
+        self.revision.mark_static();
     }
 
     /// Returns the number of uploaded instances.
@@ -283,13 +292,29 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
         }
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        self.per_viewport
+            .retain(|binding| binding.lifetime.is_alive());
+        if self.prepared_origin != Some(self.origin) {
+            self.prepared_origin = Some(self.origin);
+            self.revision.mark_static();
+        }
         self.ensure_pipelines(ctx);
         let Some(p) = &self.pipelines else {
             return false;
         };
 
+        if let Some(proto) = &self.prototype
+            && !ctx.uploads.reserve(size_of_val(proto.vertices.as_slice()))
+        {
+            return true;
+        }
         if let Some(proto) = self.prototype.take() {
+            self.revision.mark_static();
             self.vertex_count = u32::try_from(proto.vertices.len()).unwrap_or(0);
             if self.vertex_count > 0 {
                 self.vertex_buf = Some(ctx.device.create_buffer_init(
@@ -300,9 +325,15 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
                     },
                 ));
             }
+            ctx.uploads.finish_upload();
         }
 
-        if let Some(insts) = self.pending_instances.take() {
+        let pending = self
+            .pending_instances
+            .as_ref()
+            .is_some_and(|instances| !ctx.uploads.reserve(size_of_val(instances.as_slice())));
+        if !pending && let Some(insts) = self.pending_instances.take() {
+            self.revision.mark_static();
             self.instance_count = u32::try_from(insts.len()).unwrap_or(0);
             if self.instance_count > 0 {
                 self.instance_buf = Some(ctx.device.create_buffer_init(
@@ -315,6 +346,7 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             } else {
                 self.instance_buf = None;
             }
+            ctx.uploads.finish_upload();
         }
 
         // Per-ViewportId uniform buffer so 4-way quad views never clobber each other!
@@ -335,8 +367,12 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
                     resource: buf.as_entire_binding(),
                 }],
             });
-            self.per_viewport
-                .push(ViewportBinding { id: vp_id, buf, bg });
+            self.per_viewport.push(ViewportBinding {
+                id: vp_id,
+                lifetime: ctx.viewport_lifetime(),
+                buf,
+                bg,
+            });
         }
 
         if let Some(binding) = self.per_viewport.iter().find(|b| b.id == vp_id) {
@@ -348,7 +384,7 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             ctx.queue
                 .write_buffer(&binding.buf, 0, bytemuck::bytes_of(&u));
         }
-        false
+        pending
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {

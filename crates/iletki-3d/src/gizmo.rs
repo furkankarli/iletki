@@ -6,7 +6,10 @@ use crate::vertex::{Mesh3D, Vertex3D};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Projection, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer};
+use iletki_wgpu::{
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    ViewportLifetime,
+};
 
 /// Sub-object axis identifier encoded in [`PickId::sub`] for [`TransformGizmoLayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,6 +41,7 @@ impl GizmoAxis {
 
 struct GizmoViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
@@ -65,6 +69,9 @@ struct GizmoGpu {
 /// distance, with an optional [`TransformGizmoLayer::max_world_scale`] clamp.
 pub struct TransformGizmoLayer {
     layer_id: u16,
+    revision: LayerRevision,
+    prepared_origin: Option<Vec3>,
+    prepared_scale: (u64, Option<u64>),
     object_id: u32,
     /// World-space `f64` position of the gizmo (set `None` to hide).
     pub origin: Option<Vec3>,
@@ -94,6 +101,9 @@ impl TransformGizmoLayer {
     pub fn new(layer_id: u16, object_id: u32) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
+            prepared_origin: None,
+            prepared_scale: (92.0_f64.to_bits(), None),
             object_id,
             origin: None,
             size_px: 92.0,
@@ -308,7 +318,24 @@ impl<W> ViewportLayer<W> for TransformGizmoLayer {
         }
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.per_viewport
+                .retain(|binding| binding.lifetime.is_alive());
+        }
+        let scale = (
+            self.size_px.to_bits(),
+            self.max_world_scale.map(f64::to_bits),
+        );
+        if self.prepared_origin != self.origin || self.prepared_scale != scale {
+            self.prepared_origin = self.origin;
+            self.prepared_scale = scale;
+            self.revision.mark_dynamic();
+        }
         let Some(origin) = self.origin else {
             return false;
         };
@@ -336,8 +363,12 @@ impl<W> ViewportLayer<W> for TransformGizmoLayer {
                     resource: buf.as_entire_binding(),
                 }],
             });
-            gpu.per_viewport
-                .push(GizmoViewportBinding { id: vp_id, buf, bg });
+            gpu.per_viewport.push(GizmoViewportBinding {
+                id: vp_id,
+                lifetime: ctx.viewport_lifetime(),
+                buf,
+                bg,
+            });
         }
         if let Some(binding) = gpu.per_viewport.iter().find(|b| b.id == vp_id) {
             let cam_pos = ctx.camera.position_3d();

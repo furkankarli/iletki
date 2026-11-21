@@ -13,7 +13,7 @@
 //!    scene (`Scene3DLayer` + *Shaded with Edges* + Jump-Flood selection outline + infinite 3D
 //!    ground grid + 3D transform gizmo + section clip) in a SINGLE `CommandEncoder`, composited
 //!    into `quad_view.png` (1024x1024, 4x MSAA).
-//! 3. **100,000-Instance 3D Stress** — 100,000 instanced 3D boxes (3.6M triangles) in ONE GPU draw
+//! 3. **100,000-Instance 3D Stress** — 100,000 instanced 3D boxes (1.2M triangles) in ONE GPU draw
 //!    call, measuring 60-frame orbit latency and rendering `instanced_100k.png` (800x600, 4x MSAA).
 //! 4. **Drag-Resize Hysteresis Stress** — 120 simulated drag-resize frames proving 256 px
 //!    over-allocation eliminates per-frame texture thrashing.
@@ -45,7 +45,8 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn create_device() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
@@ -62,7 +63,10 @@ fn create_device() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
     })
     .map_err(|e| format!("no GPU adapter available: {e}"))?;
     let info = adapter.get_info();
-    let name = format!("{} ({:?})", info.name, info.backend);
+    let name = format!(
+        "{} ({:?}, {} {})",
+        info.name, info.backend, info.driver, info.driver_info
+    );
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki showcase device"),
         ..wgpu::DeviceDescriptor::default()
@@ -71,25 +75,41 @@ fn create_device() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
     Ok((device, queue, name))
 }
 
-fn wait_gpu(device: &wgpu::Device) {
-    let _ = device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    });
+fn wait_gpu(
+    device: &wgpu::Device,
+    submission: Option<wgpu::SubmissionIndex>,
+) -> Result<(), String> {
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: submission,
+            timeout: None,
+        })
+        .map(|_| ())
+        .map_err(|e| format!("GPU submission did not complete: {e}"))
 }
 
-fn percentiles(samples_ms: &mut [f64]) -> (f64, f64, f64, f64) {
+fn summarize_samples(
+    path: &std::path::Path,
+    samples_ms: &mut [f64],
+) -> Result<(f64, f64, f64), String> {
+    use std::fmt::Write as _;
+
+    let mut csv = String::from("frame,wall_ms\n");
+    for (index, ms) in samples_ms.iter().enumerate() {
+        writeln!(&mut csv, "{index},{ms:.6}").map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, csv).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+
     if samples_ms.is_empty() {
-        return (0.0, 0.0, 0.0, 0.0);
+        return Ok((0.0, 0.0, 0.0));
     }
     samples_ms.sort_by(f64::total_cmp);
-    let sum: f64 = samples_ms.iter().sum();
-    let mean = sum / (samples_ms.len() as f64);
-    let at = |p: f64| -> f64 {
+    let mean = samples_ms.iter().sum::<f64>() / (samples_ms.len() as f64);
+    let at = |p: f64| {
         let idx = ((samples_ms.len() - 1) as f64 * p).round() as usize;
-        samples_ms.get(idx).copied().unwrap_or(0.0)
+        samples_ms.get(idx).copied().unwrap_or_default()
     };
-    (mean, at(0.50), at(0.95), at(0.99))
+    Ok((mean, at(0.50), at(0.95)))
 }
 
 /// Minimal zero-dependency uncompressed-DEFLATE PNG writer (RGBA8).
@@ -289,8 +309,8 @@ fn bench_2d_national_grid(
         let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut scene];
         host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
     }
-    queue.submit(std::iter::once(enc.finish()));
-    wait_gpu(device);
+    let submission = queue.submit([enc.finish()]);
+    wait_gpu(device, Some(submission))?;
     let first_ms = t_first.elapsed().as_secs_f64() * 1000.0;
 
     // 60 active pan+zoom frames (simulating continuous CAD navigation)
@@ -306,11 +326,12 @@ fn bench_2d_national_grid(
             let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut scene];
             host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
         }
-        queue.submit(std::iter::once(enc.finish()));
-        wait_gpu(device);
+        let submission = queue.submit([enc.finish()]);
+        wait_gpu(device, Some(submission))?;
         pan_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
-    let (mean, p50, p95, p99) = percentiles(&mut pan_samples);
+    let (mean, p50, p95) =
+        summarize_samples(&out_dir.join("cad2d-pan-zoom.csv"), &mut pan_samples)?;
 
     // 30 idle cursor-hover frames (OnDemand static cache hit = 0 static redraws!)
     let mut idle_samples = Vec::with_capacity(30);
@@ -346,11 +367,12 @@ fn bench_2d_national_grid(
                 static_rebuilds_during_idle += 1;
             }
         }
-        queue.submit(std::iter::once(enc.finish()));
-        wait_gpu(device);
+        let submission = queue.submit([enc.finish()]);
+        wait_gpu(device, Some(submission))?;
         idle_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
-    let (idle_mean, idle_p50, _, _) = percentiles(&mut idle_samples);
+    let (idle_mean, idle_p50, _) =
+        summarize_samples(&out_dir.join("cad2d-crosshair.csv"), &mut idle_samples)?;
 
     let img = host
         .readback_rgba_blocking(device, queue)
@@ -359,8 +381,7 @@ fn bench_2d_national_grid(
     write_png(&png_path, img.width, img.height, &img.pixels)?;
 
     println!(
-        "  CPU build + 8x8 spatial tile sort: {build_ms:.2} ms\n  First GPU upload + render:         {first_ms:.2} ms\n  Pan+Zoom (60 frames, 4x MSAA):     mean {mean:.2} ms ({:.0} fps) | p50 {p50:.2} | p95 {p95:.2} | p99 {p99:.2} ms\n  Idle crosshair hover (OnDemand):   mean {idle_mean:.2} ms | p50 {idle_p50:.2} ms (static rebuilds: {static_rebuilds_during_idle})\n  Saved: {}",
-        if mean > 0.0 { 1000.0 / mean } else { 0.0 },
+        "  CPU build + 8x8 spatial tile sort: {build_ms:.2} ms\n  First GPU upload + render:         {first_ms:.2} ms\n  Pan+Zoom (60 frames, 4x MSAA):     mean {mean:.2} ms | p50 {p50:.2} | p95 {p95:.2} ms\n  Crosshair updates (OnDemand):   mean {idle_mean:.2} ms | p50 {idle_p50:.2} ms (static rebuilds: {static_rebuilds_during_idle})\n  Saved: {}",
         png_path.display()
     );
     Ok(())
@@ -512,8 +533,8 @@ fn render_quad_view_showcase(
         vp_right.render_to_texture(device, queue, &mut enc, &(), &mut layers);
         vp_persp.render_to_texture(device, queue, &mut enc, &(), &mut layers);
     }
-    queue.submit(std::iter::once(enc.finish()));
-    wait_gpu(device);
+    let submission = queue.submit([enc.finish()]);
+    wait_gpu(device, Some(submission))?;
     let quad_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let img_top = vp_top
@@ -544,7 +565,7 @@ fn bench_instanced_100k(
     queue: &wgpu::Queue,
     out_dir: &std::path::Path,
 ) -> Result<(), String> {
-    println!("\n=== Scenario 3: 100,000-Instance 3D Stress (3.6M triangles, 1 draw call) ===");
+    println!("\n=== Scenario 3: 100,000-Instance 3D Stress (1.2M triangles, 1 draw call) ===");
     let mut host = ViewportHost::new(
         device,
         ViewportConfig {
@@ -602,8 +623,8 @@ fn bench_instanced_100k(
         let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut inst_layer];
         host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
     }
-    queue.submit(std::iter::once(enc.finish()));
-    wait_gpu(device);
+    let submission = queue.submit([enc.finish()]);
+    wait_gpu(device, Some(submission))?;
 
     // Save visual render of the 100k-instance 3D city
     let img = host
@@ -630,20 +651,19 @@ fn bench_instanced_100k(
             let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut inst_layer];
             host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
         }
-        queue.submit(std::iter::once(enc.finish()));
-        wait_gpu(device);
+        let submission = queue.submit([enc.finish()]);
+        wait_gpu(device, Some(submission))?;
         samples.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
-    let (mean, p50, p95, p99) = percentiles(&mut samples);
+    let (mean, p50, p95) = summarize_samples(&out_dir.join("instanced-orbit.csv"), &mut samples)?;
     println!(
-        "  60-frame orbit (100k boxes = 3.6M tris, 4x MSAA, 1 draw call): mean {mean:.2} ms ({:.0} fps) | p50 {p50:.2} | p95 {p95:.2} | p99 {p99:.2} ms\n  Saved: {}",
-        if mean > 0.0 { 1000.0 / mean } else { 0.0 },
+        "  60-frame orbit (100k boxes = 1.2M tris, 4x MSAA, 1 draw call): mean {mean:.2} ms | p50 {p50:.2} | p95 {p95:.2} ms\n  Saved: {}",
         png_path.display()
     );
     Ok(())
 }
 
-fn bench_resize_hysteresis(device: &wgpu::Device, queue: &wgpu::Queue) {
+fn bench_resize_hysteresis(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), String> {
     println!("\n=== Scenario 4: Drag-Resize Hysteresis Stress (120 frames, 600px <-> 1200px) ===");
     let mut host = ViewportHost::new(
         device,
@@ -656,6 +676,7 @@ fn bench_resize_hysteresis(device: &wgpu::Device, queue: &wgpu::Queue) {
         },
     );
     let mut reallocs = 0u32;
+    let mut last_submission = None;
     let t0 = Instant::now();
     for frame in 0..120u32 {
         let w = if frame < 60 {
@@ -671,13 +692,14 @@ fn bench_resize_hysteresis(device: &wgpu::Device, queue: &wgpu::Queue) {
         if out.stats.target_reallocated {
             reallocs += 1;
         }
-        queue.submit(std::iter::once(enc.finish()));
+        last_submission = Some(queue.submit([enc.finish()]));
     }
-    wait_gpu(device);
+    wait_gpu(device, last_submission)?;
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "  120 continuous drag-resize frames: {total_ms:.2} ms total | GPU texture reallocations: {reallocs} (vs 120 without 256 px block hysteresis!)"
+        "  120 drag-resize frames: {total_ms:.2} ms total | target-set reallocations after initialization: {reallocs}"
     );
+    Ok(())
 }
 
 fn main() -> Result<(), String> {
@@ -694,7 +716,7 @@ fn main() -> Result<(), String> {
     bench_2d_national_grid(&device, &queue, &out_dir)?;
     render_quad_view_showcase(&device, &queue, &out_dir)?;
     bench_instanced_100k(&device, &queue, &out_dir)?;
-    bench_resize_hysteresis(&device, &queue);
+    bench_resize_hysteresis(&device, &queue)?;
 
     Ok(())
 }

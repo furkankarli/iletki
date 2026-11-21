@@ -37,4 +37,18 @@ jobs:
         with:
           tool: cargo-deny
 
+      - name: Select a deterministic Vulkan adapter
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          lavapipe_icd=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
+          test -n "$lavapipe_icd"
+          {
+            echo "VK_DRIVER_FILES=$lavapipe_icd"
+            echo 'WGPU_BACKEND=vulkan'
+            echo 'ILETKI_REQUIRE_GPU_TESTS=1'
+          } >> "$GITHUB_ENV"
+
       - run: cargo xtask ci

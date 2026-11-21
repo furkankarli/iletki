@@ -3,13 +3,13 @@
 
 use crate::blit::{BlitResources, DepthCopyPipeline};
 use crate::error::ViewportError;
-use crate::layer::{PaintCtx, PrepareCtx, ViewportLayer};
+use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer};
 use crate::outline::OutlineEngine;
 use crate::target::{DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig};
 use crate::uniforms::CameraGpu;
 use iletki_core::{
-    Camera, CameraRig, DirtyFlags, DrawPhase, OutlineConfig, PickHit, PickId, TargetSize, Vec2,
-    ViewportCommand, ViewportId, ViewportInput, ViewportMode,
+    Camera, CameraRig, DirtyFlags, DrawPhase, DrawPhaseMask, OutlineConfig, PickHit, PickId,
+    RigOutcome, TargetSize, Vec2, ViewportCommand, ViewportId, ViewportInput, ViewportMode,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -110,12 +110,19 @@ enum ActiveOutput {
     DynamicOutput,
 }
 
+struct LayerState {
+    id: u16,
+    phases: DrawPhaseMask,
+    revision: LayerRevision,
+}
+
 /// Independent GPU viewport instance sharing a host `wgpu::Device` and `wgpu::Queue`.
 ///
 /// Multiple [`ViewportHost`] instances can render the same application `World` from independent
 /// cameras (e.g. CAD quad views or 2D plan + 3D perspective) with zero duplicated scene buffers.
 pub struct ViewportHost {
     id: ViewportId,
+    lifetime: Arc<()>,
     config: ViewportConfig,
     camera: Camera,
     dpi_scale: f32,
@@ -129,6 +136,10 @@ pub struct ViewportHost {
     active_output: ActiveOutput,
     static_valid: bool,
     pending_reallocated: bool,
+    streaming_pending: bool,
+    upload_clock: Option<fn() -> f64>,
+    cached_layers: Vec<LayerState>,
+    prepared_layers: Vec<LayerState>,
 }
 
 impl std::fmt::Debug for ViewportHost {
@@ -164,6 +175,7 @@ impl ViewportHost {
         let targets = TargetSet::new(device, &blit, config.initial_px, config.color_format, msaa);
         Self {
             id,
+            lifetime: Arc::new(()),
             config,
             camera: Camera::default(),
             dpi_scale,
@@ -177,6 +189,10 @@ impl ViewportHost {
             active_output: ActiveOutput::StaticCache,
             static_valid: false,
             pending_reallocated: false,
+            streaming_pending: false,
+            upload_clock: None,
+            cached_layers: Vec::new(),
+            prepared_layers: Vec::new(),
         }
     }
 
@@ -196,6 +212,12 @@ impl ViewportHost {
     #[must_use]
     pub fn config(&self) -> ViewportConfig {
         self.config
+    }
+
+    /// Sets a monotonic, millisecond clock supplied by the host. Web callers can supply their
+    /// browser clock to enforce the soft upload time limit alongside the byte limit.
+    pub fn set_upload_clock(&mut self, clock: Option<fn() -> f64>) {
+        self.upload_clock = clock;
     }
 
     /// Returns the active [`ViewportMode`].
@@ -269,7 +291,8 @@ impl ViewportHost {
         Vec2::new(f64::from(w) * inv, f64::from(h) * inv)
     }
 
-    /// Updates physical pixel dimensions and DPI scale.
+    /// Updates physical pixel dimensions and DPI scale. The physical size is capped at the
+    /// device's maximum texture dimension, which is reflected in [`Self::size`].
     ///
     /// Reallocates backing GPU textures only when crossing a 256 px block boundary or after the
     /// shrink hysteresis window.
@@ -292,18 +315,24 @@ impl ViewportHost {
         }
     }
 
-    /// Routes an input event to `rig`, updating the camera and dirty flags automatically.
+    /// Routes input to the camera rig and returns its requested host commands.
+    /// Use [`Self::handle_input`] to also receive whether the rig consumed the event.
     pub fn on_input(
         &mut self,
         input: &ViewportInput,
         rig: &mut dyn CameraRig,
     ) -> Vec<ViewportCommand> {
+        self.handle_input(input, rig).commands
+    }
+
+    /// Routes input to the rig, preserving its decision about further event dispatch.
+    pub fn handle_input(&mut self, input: &ViewportInput, rig: &mut dyn CameraRig) -> RigOutcome {
         let logical = self.logical_size();
         let outcome = rig.handle_input(input, &mut self.camera, logical);
         if outcome.camera_changed {
             self.dirty.insert(DirtyFlags::CAMERA);
         }
-        outcome.commands
+        outcome
     }
 
     /// Advances time-based rig animation (e.g. fly movement or smooth damping).
@@ -364,8 +393,9 @@ impl ViewportHost {
         stats
     }
 
-    /// Path B (`BorrowedPass`, step 2): blits the finished viewport into the host's active render
-    /// pass (e.g. `egui_wgpu::CallbackTrait::paint` or a swapchain pass).
+    /// Path B (`BorrowedPass`, step 2): composites the resolved offscreen color into the host's
+    /// active render pass. The host sets the viewport and scissor. Scene depth stays offscreen;
+    /// an external depth attachment only affects pipeline compatibility.
     pub fn paint_into_pass(&self, pass: &mut wgpu::RenderPass<'_>, pass_target: PassTargetDesc) {
         let Some(pipeline) = self.blit.get_pipeline(
             pass_target.format,
@@ -409,25 +439,13 @@ impl ViewportHost {
         }
         self.camera_gpu.write(queue, cam_data);
 
-        // Let each layer prepare its GPU resources within the per-frame budget.
-        let mut prep_ctx = PrepareCtx {
-            viewport_id: self.id,
-            device,
-            queue,
-            camera: &self.camera,
-            camera_bind_group_layout: self.camera_gpu.layout(),
-            world,
-            active_px: size.active_px,
-            logical_size: logical,
-            dpi_scale: self.dpi_scale,
-            budget: self.config.upload_budget,
-            color_format: self.targets.format(),
-            depth_format: DEPTH_FORMAT,
-            msaa_samples: self.targets.msaa_samples(),
-        };
-        for layer in layers.iter_mut() {
-            if layer.prepare(&mut prep_ctx) {
-                stats.streaming_pending = true;
+        let (pending, untracked_pending) = self.prepare_layers(device, queue, world, layers);
+        stats.streaming_pending = pending;
+        let was_streaming = std::mem::replace(&mut self.streaming_pending, untracked_pending);
+        if self.config.mode == ViewportMode::OnDemand {
+            self.update_layer_cache(layers);
+            if was_streaming || untracked_pending {
+                self.dirty.insert(DirtyFlags::STATIC_SCENE);
             }
         }
 
@@ -527,6 +545,87 @@ impl ViewportHost {
         }
 
         stats
+    }
+
+    fn prepare_layers<W>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &W,
+        layers: &mut [&mut dyn ViewportLayer<W>],
+    ) -> (bool, bool) {
+        let size = self.targets.size();
+        let logical = self.logical_size();
+        let mut prep_ctx = PrepareCtx {
+            viewport_lifetime: &self.lifetime,
+            viewport_id: self.id,
+            device,
+            queue,
+            camera: &self.camera,
+            camera_bind_group_layout: self.camera_gpu.layout(),
+            world,
+            active_px: size.active_px,
+            logical_size: logical,
+            dpi_scale: self.dpi_scale,
+            budget: self.config.upload_budget,
+            uploads: UploadTracker::with_clock(self.config.upload_budget, self.upload_clock),
+            color_format: self.targets.format(),
+            depth_format: DEPTH_FORMAT,
+            msaa_samples: self.targets.msaa_samples(),
+        };
+        let mut pending = false;
+        let mut untracked_pending = false;
+        for layer in layers {
+            if layer.prepare(&mut prep_ctx) {
+                pending = true;
+                untracked_pending |= layer.revision() == LayerRevision::default();
+            }
+        }
+        (pending, untracked_pending)
+    }
+
+    fn update_layer_cache<W>(&mut self, layers: &[&mut dyn ViewportLayer<W>]) {
+        self.prepared_layers.clear();
+        self.prepared_layers
+            .extend(layers.iter().map(|layer| LayerState {
+                id: layer.id(),
+                phases: layer.phases(),
+                revision: layer.revision(),
+            }));
+
+        let static_phases = DrawPhaseMask::OPAQUE.union(DrawPhaseMask::TRANSPARENT);
+        let dynamic_phases = DrawPhaseMask::OUTLINE_MASK
+            .union(DrawPhaseMask::GIZMO)
+            .union(DrawPhaseMask::OVERLAY);
+        let static_layer = |state: &LayerState| {
+            let phases = state.phases.intersection(static_phases);
+            (phases != DrawPhaseMask::NONE).then_some((
+                state.id,
+                phases,
+                state.revision.static_scene,
+            ))
+        };
+        let dynamic_layer = |state: &LayerState| {
+            let phases = state.phases.intersection(dynamic_phases);
+            (phases != DrawPhaseMask::NONE).then_some((state.id, phases, state.revision.dynamic))
+        };
+        if self
+            .cached_layers
+            .iter()
+            .filter_map(static_layer)
+            .ne(self.prepared_layers.iter().filter_map(static_layer))
+        {
+            self.dirty.insert(DirtyFlags::STATIC_SCENE);
+        }
+        if self
+            .cached_layers
+            .iter()
+            .filter_map(dynamic_layer)
+            .ne(self.prepared_layers.iter().filter_map(dynamic_layer))
+        {
+            self.dirty.insert(DirtyFlags::OVERLAY);
+        }
+        std::mem::swap(&mut self.cached_layers, &mut self.prepared_layers);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -827,9 +926,36 @@ impl ViewportHost {
         })
     }
 
-    /// Executes an on-demand 64-bit ID + Reversed-Z depth picking pass over `rect_px`
-    /// (`[x, y, width, height]` in physical pixels) and returns unique [`PickHit`] results sorted
-    /// nearest-first. Works on both native and `wasm32` / WebGPU targets.
+    /// Prepares the current layers and submits a 64-bit pick over `[x, y, width, height]`
+    /// in physical pixels. The returned request owns its camera snapshot and GPU readback.
+    ///
+    /// Submit any previously encoded frames for this host before calling. On native, drive the
+    /// request with [`PendingPick::try_read`] in the host loop or poll the device while awaiting it.
+    /// WebGPU drives mapping callbacks automatically.
+    pub fn begin_pick_rect<W>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &W,
+        layers: &mut [&mut dyn ViewportLayer<W>],
+        rect_px: [u32; 4],
+    ) -> Result<PendingPick, ViewportError> {
+        let staged = self.submit_pick_rect(device, queue, world, layers, rect_px)?;
+        Ok(PendingPick {
+            #[cfg(not(target_arch = "wasm32"))]
+            device: device.clone(),
+            camera: self.camera.clone(),
+            dpi_scale: self.dpi_scale,
+            id_map: request_staging_map(&staged.id_buf),
+            depth_map: request_staging_map(&staged.depth_buf),
+            staged: Some(staged),
+        })
+    }
+
+    /// Awaits the same request as [`Self::begin_pick_rect`], returning hits nearest-first.
+    ///
+    /// Native callers must keep driving `wgpu` polling while awaiting. For an event loop that
+    /// sleeps between frames, use [`Self::begin_pick_rect`] and schedule [`PendingPick::try_read`].
     pub async fn pick_rect_async<W>(
         &mut self,
         device: &wgpu::Device,
@@ -838,17 +964,8 @@ impl ViewportHost {
         layers: &mut [&mut dyn ViewportLayer<W>],
         rect_px: [u32; 4],
     ) -> Result<Vec<PickHit>, ViewportError> {
-        let staged = self.submit_pick_rect(device, queue, world, layers, rect_px)?;
-        let id_bytes = map_staging_async(device, &staged.id_buf, staged.id_layout).await?;
-        let depth_bytes = map_staging_async(device, &staged.depth_buf, staged.depth_layout).await?;
-        Ok(decode_pick_hits(
-            &self.camera,
-            staged.logical,
-            self.dpi_scale,
-            staged.rect,
-            &id_bytes,
-            &depth_bytes,
-        ))
+        self.begin_pick_rect(device, queue, world, layers, rect_px)?
+            .await
     }
 
     /// Executes an on-demand 64-bit ID + Reversed-Z depth picking pass over `rect_px`
@@ -897,8 +1014,11 @@ impl ViewportHost {
             return Err(ViewportError::ZeroSize);
         }
 
-        let id_layout = StagingLayout::compute(w, h, 8)?;
-        let depth_layout = StagingLayout::compute(w, h, 4)?;
+        let max_buffer_size = device.limits().max_buffer_size;
+        let id_layout = StagingLayout::compute(w, h, 8, max_buffer_size)?;
+        let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
+
+        self.streaming_pending |= self.prepare_layers(device, queue, world, layers).1;
 
         let logical = self.logical_size();
         self.camera_gpu
@@ -999,7 +1119,12 @@ struct StagingLayout {
 }
 
 impl StagingLayout {
-    fn compute(width: u32, height: u32, bytes_per_pixel: u32) -> Result<Self, ViewportError> {
+    fn compute(
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        max_buffer_size: u64,
+    ) -> Result<Self, ViewportError> {
         if width == 0 || height == 0 {
             return Err(ViewportError::ZeroSize);
         }
@@ -1014,7 +1139,7 @@ impl StagingLayout {
         let total_bytes = (padded_row as usize)
             .checked_mul(height as usize)
             .ok_or(ViewportError::RegionTooLarge)?;
-        if total_bytes > MAX_READBACK_BYTES {
+        if total_bytes > MAX_READBACK_BYTES || total_bytes as u64 > max_buffer_size {
             return Err(ViewportError::RegionTooLarge);
         }
         Ok(Self {
@@ -1103,40 +1228,98 @@ struct MapState {
     waker: Option<Waker>,
 }
 
-struct MapFuture<'a> {
+/// An in-flight GPU pick. The viewport and its layers can be reused while this request completes.
+pub struct PendingPick {
     #[cfg(not(target_arch = "wasm32"))]
-    device: &'a wgpu::Device,
-    #[cfg(target_arch = "wasm32")]
-    _marker: std::marker::PhantomData<&'a ()>,
-    state: Arc<Mutex<MapState>>,
+    device: wgpu::Device,
+    camera: Camera,
+    dpi_scale: f32,
+    id_map: Arc<Mutex<MapState>>,
+    depth_map: Arc<Mutex<MapState>>,
+    staged: Option<StagedPick>,
 }
 
-impl Future for MapFuture<'_> {
-    type Output = Result<(), ViewportError>;
+impl std::fmt::Debug for PendingPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPick")
+            .field("region", &self.staged.as_ref().map(|staged| staged.rect))
+            .finish()
+    }
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+impl PendingPick {
+    /// Checks for a completed pick, driving one nonblocking GPU poll on native devices.
+    ///
+    /// While this returns `Poll::Pending`, the host can schedule another check without holding
+    /// a borrow of the viewport. A ready result is consumed by this call.
+    pub fn try_read(&mut self) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        self.poll_completion(None)
+    }
+
+    fn poll_completion(
+        &mut self,
+        wake: Option<&Waker>,
+    ) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        let result = self.poll_staged(wake);
+        if result.is_ready() {
+            self.staged = None;
+        }
+        result
+    }
+
+    fn poll_staged(&mut self, wake: Option<&Waker>) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        if self.staged.is_none() {
+            return Poll::Ready(Err(ViewportError::PickAlreadyRead));
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|_| ViewportError::BufferMapFailed)?;
 
-        let Ok(mut guard) = self.state.lock() else {
-            return Poll::Ready(Err(ViewportError::BufferMapFailed));
-        };
-        if let Some(res) = guard.result.take() {
-            Poll::Ready(res.map_err(|_| ViewportError::BufferMapFailed))
-        } else {
-            guard.waker = Some(cx.waker().clone());
-            Poll::Pending
+        let id_ready = map_is_ready(&self.id_map, wake)?;
+        let depth_ready = map_is_ready(&self.depth_map, wake)?;
+        if !id_ready || !depth_ready {
+            return Poll::Pending;
+        }
+
+        let staged = self.staged.take().ok_or(ViewportError::PickAlreadyRead)?;
+        let id_bytes = extract_mapped_rows(&staged.id_buf, staged.id_layout)?;
+        let depth_bytes = extract_mapped_rows(&staged.depth_buf, staged.depth_layout)?;
+        Poll::Ready(Ok(decode_pick_hits(
+            &self.camera,
+            staged.logical,
+            self.dpi_scale,
+            staged.rect,
+            &id_bytes,
+            &depth_bytes,
+        )))
+    }
+}
+
+impl Future for PendingPick {
+    type Output = Result<Vec<PickHit>, ViewportError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_completion(Some(cx.waker()))
+    }
+}
+
+fn map_is_ready(state: &Mutex<MapState>, wake: Option<&Waker>) -> Result<bool, ViewportError> {
+    let mut guard = state.lock().map_err(|_| ViewportError::BufferMapFailed)?;
+    match &guard.result {
+        Some(Ok(())) => Ok(true),
+        Some(Err(_)) => Err(ViewportError::BufferMapFailed),
+        None => {
+            if let Some(waker) = wake {
+                guard.waker = Some(waker.clone());
+            }
+            Ok(false)
         }
     }
 }
 
-async fn map_staging_async(
-    device: &wgpu::Device,
-    staging: &wgpu::Buffer,
-    layout: StagingLayout,
-) -> Result<Vec<u8>, ViewportError> {
-    #[cfg(target_arch = "wasm32")]
-    let _ = device;
+fn request_staging_map(staging: &wgpu::Buffer) -> Arc<Mutex<MapState>> {
     let state = Arc::new(Mutex::new(MapState {
         result: None,
         waker: None,
@@ -1144,23 +1327,16 @@ async fn map_staging_async(
     let cb_state = Arc::clone(&state);
     staging
         .slice(..)
-        .map_async(wgpu::MapMode::Read, move |res| {
-            if let Ok(mut guard) = cb_state.lock() {
-                guard.result = Some(res);
-                if let Some(waker) = guard.waker.take() {
-                    waker.wake();
-                }
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let wake = cb_state.lock().ok().and_then(|mut guard| {
+                guard.result = Some(result);
+                guard.waker.take()
+            });
+            if let Some(waker) = wake {
+                waker.wake();
             }
         });
-    MapFuture {
-        #[cfg(not(target_arch = "wasm32"))]
-        device,
-        #[cfg(target_arch = "wasm32")]
-        _marker: std::marker::PhantomData,
-        state,
-    }
-    .await?;
-    extract_mapped_rows(staging, layout)
+    state
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1174,7 +1350,9 @@ fn map_staging_blocking(
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|_| ViewportError::BufferMapFailed)?;
     rx.recv()
         .map_err(|_| ViewportError::BufferMapFailed)?
         .map_err(|_| ViewportError::BufferMapFailed)?;
@@ -1253,7 +1431,12 @@ fn readback_texture_2d_blocking(
     bytes_per_pixel: u32,
 ) -> Result<Vec<u8>, ViewportError> {
     let [_, _, width, height] = rect;
-    let layout = StagingLayout::compute(width, height, bytes_per_pixel)?;
+    let layout = StagingLayout::compute(
+        width,
+        height,
+        bytes_per_pixel,
+        device.limits().max_buffer_size,
+    )?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("iletki readback copy"),
     });

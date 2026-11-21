@@ -31,7 +31,8 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
@@ -193,7 +194,7 @@ fn instanced_100k_3d_boxes_single_draw_call_and_pick() {
     let mut inst_layer = InstancedMesh3DLayer::new(9, Vec3::ZERO, proto);
     inst_layer.set_instances(instances);
 
-    // Warm up upload + render 100,000 instances (3.6M triangles) in ONE draw call!
+    // Warm up upload + render 100,000 instances (1.2M triangles) in ONE draw call!
     let t0 = std::time::Instant::now();
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
@@ -208,7 +209,7 @@ fn instanced_100k_3d_boxes_single_draw_call_and_pick() {
     });
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(inst_layer.instance_count(), 100_000);
-    eprintln!("100,000 instanced 3D boxes (3.6M tris) upload+render: {elapsed_ms:.2} ms");
+    eprintln!("100,000 instanced 3D boxes (1.2M tris) upload+render: {elapsed_ms:.2} ms");
 
     let img = host.readback_rgba_blocking(&device, &queue).unwrap();
     let center = img.pixel(128, 128).unwrap();

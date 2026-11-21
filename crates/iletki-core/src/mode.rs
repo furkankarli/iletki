@@ -160,6 +160,12 @@ impl DrawPhaseMask {
         Self(self.0 | other.0)
     }
 
+    /// Keeps only the phases present in both masks.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     /// Returns `true` if `phase` is enabled in this mask.
     #[must_use]
     pub const fn contains(self, phase: DrawPhase) -> bool {
@@ -170,7 +176,7 @@ impl DrawPhaseMask {
 /// Per-frame GPU staging budget for progressive streaming of large scenes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UploadBudget {
-    /// Maximum bytes uploaded to the GPU in a single frame.
+    /// Byte allowance for scene uploads in a frame. The first indivisible upload may exceed it.
     pub max_bytes_per_frame: usize,
     /// Soft CPU time cap (milliseconds) spent preparing uploads in a single frame.
     pub max_time_ms: f32,

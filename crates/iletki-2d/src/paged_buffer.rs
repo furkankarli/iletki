@@ -9,12 +9,15 @@
 use crate::spatial::TileRange;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds2, UploadBudget};
-use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
+use iletki_wgpu::{UploadTracker, wgpu};
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default maximum bytes per GPU vertex page (64 MiB, clamped further by device limits).
 const DEFAULT_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+static NEXT_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Handle to a vertex range allocated inside a [`PagedBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +26,7 @@ pub struct SlotHandle {
     offset: usize,
     capacity: usize,
     len: usize,
+    generation: u64,
 }
 
 impl SlotHandle {
@@ -51,12 +55,41 @@ struct Page {
     free: Vec<FreeSpan>,
     tiles: Vec<TileRange>,
     gpu: Option<wgpu::Buffer>,
+    pick_gpu: Option<wgpu::Buffer>,
+    live_slots: HashMap<usize, u64>,
+}
+
+impl Page {
+    fn register_slot(
+        &mut self,
+        page: usize,
+        offset: usize,
+        capacity: usize,
+        len: usize,
+    ) -> SlotHandle {
+        let generation = NEXT_SLOT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.live_slots.insert(offset, generation);
+        self.tiles.clear();
+        SlotHandle {
+            page,
+            offset,
+            capacity,
+            len,
+            generation,
+        }
+    }
 }
 
 struct PendingWrite {
     page: usize,
     offset_verts: usize,
     bytes: Vec<u8>,
+    picks: Option<Vec<[u32; 2]>>,
+}
+
+pub(crate) struct FlushOutcome {
+    pub(crate) pending: bool,
+    pub(crate) changed: bool,
 }
 
 /// Paged GPU vertex buffer supporting both zero-copy bulk loads and incremental slot updates under
@@ -108,6 +141,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         self.pages.iter().all(|p| p.high_water_verts == 0)
     }
 
+    pub(crate) fn has_picks(&self) -> bool {
+        self.pages.iter().any(|page| page.pick_gpu.is_some())
+    }
+
     /// Returns `true` if there are queued GPU writes waiting to be flushed.
     #[must_use]
     pub fn has_pending_uploads(&self) -> bool {
@@ -140,12 +177,25 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         data: &[V],
         tiles: &[TileRange],
     ) {
+        self.upload_paired(device, queue, data, tiles, &[]);
+    }
+
+    pub(crate) fn upload_paired(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[V],
+        tiles: &[TileRange],
+        picks: &[[u32; 2]],
+    ) {
         self.pending.clear();
         if data.is_empty() {
             for page in &mut self.pages {
                 page.high_water_verts = 0;
                 page.free.clear();
                 page.tiles.clear();
+                page.pick_gpu = None;
+                page.live_slots.clear();
             }
             return;
         }
@@ -219,6 +269,15 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                 free: Vec::new(),
                 tiles: page_tiles,
                 gpu: Some(gpu),
+                pick_gpu: picks
+                    .get(page_base..page_end)
+                    .filter(|_| picks.len() == data.len())
+                    .map(|ids| {
+                        let buffer = create_pick_buffer(device, capacity_verts);
+                        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(ids));
+                        buffer
+                    }),
+                live_slots: HashMap::new(),
             });
             page_base = page_end;
         }
@@ -233,11 +292,16 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
     /// Queues replacement of the entire buffer contents with `data` for deferred upload during
     /// [`PagedBuffer::flush`] (respects [`UploadBudget`]).
     pub fn replace_all(&mut self, data: &[V]) {
+        self.replace_paired(data, &[]);
+    }
+
+    pub(crate) fn replace_paired(&mut self, data: &[V], picks: &[[u32; 2]]) {
         self.clear();
         if data.is_empty() {
             return;
         }
         let per_page = self.vertices_per_page(0, DEFAULT_PAGE_BYTES);
+        let mut chunks_of_picks = picks.chunks(per_page);
         for chunk in data.chunks(per_page) {
             let page_idx = self.pages.len();
             self.pages.push(Page {
@@ -246,11 +310,16 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                 free: Vec::new(),
                 tiles: Vec::new(),
                 gpu: None,
+                pick_gpu: None,
+                live_slots: HashMap::new(),
             });
             self.pending.push(PendingWrite {
                 page: page_idx,
                 offset_verts: 0,
                 bytes: bytemuck::cast_slice(chunk).to_vec(),
+                picks: chunks_of_picks
+                    .next()
+                    .and_then(|ids| (picks.len() == data.len()).then(|| ids.to_vec())),
             });
         }
     }
@@ -259,6 +328,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
     ///
     /// Returns `None` if `data` is empty or cannot fit in a single page.
     pub fn insert(&mut self, data: &[V]) -> Option<SlotHandle> {
+        self.insert_paired(data, &[])
+    }
+
+    pub(crate) fn insert_paired(&mut self, data: &[V], picks: &[[u32; 2]]) -> Option<SlotHandle> {
         let len = data.len();
         if len == 0 {
             return None;
@@ -276,26 +349,16 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                         capacity: leftover,
                     });
                 }
-                let slot = SlotHandle {
-                    page: page_idx,
-                    offset: span.offset,
-                    capacity: needed,
-                    len,
-                };
-                self.queue_slot_bytes(slot, data);
+                let slot = page.register_slot(page_idx, span.offset, needed, len);
+                self.queue_slot_bytes(slot, data, picks);
                 return Some(slot);
             }
             let avail = page.capacity_verts.saturating_sub(page.high_water_verts);
             if avail >= needed {
                 let offset = page.high_water_verts;
                 page.high_water_verts = offset.saturating_add(needed);
-                let slot = SlotHandle {
-                    page: page_idx,
-                    offset,
-                    capacity: needed,
-                    len,
-                };
-                self.queue_slot_bytes(slot, data);
+                let slot = page.register_slot(page_idx, offset, needed, len);
+                self.queue_slot_bytes(slot, data, picks);
                 return Some(slot);
             }
         }
@@ -306,39 +369,54 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             return None;
         }
         let page_idx = self.pages.len();
-        self.pages.push(Page {
+        let mut page = Page {
             capacity_verts: page_cap,
             high_water_verts: needed,
             free: Vec::new(),
             tiles: Vec::new(),
             gpu: None,
-        });
-        let slot = SlotHandle {
-            page: page_idx,
-            offset: 0,
-            capacity: needed,
-            len,
+            pick_gpu: None,
+            live_slots: HashMap::new(),
         };
-        self.queue_slot_bytes(slot, data);
+        let slot = page.register_slot(page_idx, 0, needed, len);
+        self.pages.push(page);
+        self.queue_slot_bytes(slot, data, picks);
         Some(slot)
     }
 
     /// Updates an existing slot in place when `data` fits, or reallocates if it grew.
+    /// A request too large for a page leaves the existing slot intact.
     pub fn update(&mut self, slot: SlotHandle, data: &[V]) -> Option<SlotHandle> {
+        self.update_paired(slot, data, &[])
+    }
+
+    pub(crate) fn update_paired(
+        &mut self,
+        slot: SlotHandle,
+        data: &[V],
+        picks: &[[u32; 2]],
+    ) -> Option<SlotHandle> {
+        let page = self.pages.get(slot.page)?;
+        if page.live_slots.get(&slot.offset) != Some(&slot.generation) {
+            return None;
+        }
         if data.is_empty() {
             self.remove(slot);
             return None;
         }
-        if data.len() <= slot.capacity && slot.page < self.pages.len() {
+        if data.len() <= slot.capacity {
             let updated = SlotHandle {
                 len: data.len(),
                 ..slot
             };
-            self.queue_slot_bytes(updated, data);
+            self.queue_slot_bytes(updated, data, picks);
             return Some(updated);
         }
+        let Some(replacement) = self.insert_paired(data, picks) else {
+            return Some(slot);
+        };
         self.remove(slot);
-        self.insert(data)
+        Some(replacement)
     }
 
     /// Frees a slot by zeroing its vertices (turning primitives degenerate so they rasterize 0
@@ -347,11 +425,16 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         let Some(page) = self.pages.get_mut(slot.page) else {
             return;
         };
+        if page.live_slots.get(&slot.offset) != Some(&slot.generation) {
+            return;
+        }
+        page.live_slots.remove(&slot.offset);
         let zero_bytes = slot.capacity.saturating_mul(std::mem::size_of::<V>());
         self.pending.push(PendingWrite {
             page: slot.page,
             offset_verts: slot.offset,
             bytes: vec![0u8; zero_bytes],
+            picks: None,
         });
         page.free.push(FreeSpan {
             offset: slot.offset,
@@ -359,7 +442,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         });
     }
 
-    fn queue_slot_bytes(&mut self, slot: SlotHandle, data: &[V]) {
+    fn queue_slot_bytes(&mut self, slot: SlotHandle, data: &[V], picks: &[[u32; 2]]) {
         let stride = std::mem::size_of::<V>();
         let mut bytes = Vec::with_capacity(slot.capacity.saturating_mul(stride));
         bytes.extend_from_slice(bytemuck::cast_slice(data));
@@ -371,6 +454,11 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             page: slot.page,
             offset_verts: slot.offset,
             bytes,
+            picks: (!picks.is_empty() && picks.len() == data.len()).then(|| {
+                let mut ids = picks.to_vec();
+                ids.resize(slot.capacity, [0; 2]);
+                ids
+            }),
         });
     }
 
@@ -383,43 +471,83 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         queue: &wgpu::Queue,
         budget: UploadBudget,
     ) -> bool {
-        let stride = std::mem::size_of::<V>().max(1) as u64;
-        for page in &mut self.pages {
-            if page.gpu.is_none() && page.capacity_verts > 0 {
-                let size = (page.capacity_verts as u64)
-                    .saturating_mul(stride)
-                    .min(device.limits().max_buffer_size);
-                page.gpu = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(self.label),
-                    size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-        }
+        self.flush_with(device, queue, &mut UploadTracker::new(budget))
+            .pending
+    }
 
-        let mut uploaded = 0usize;
-        let mut remaining = Vec::new();
-        for write in self.pending.drain(..) {
-            if uploaded > 0
-                && uploaded.saturating_add(write.bytes.len()) > budget.max_bytes_per_frame
+    pub(crate) fn flush_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        budget: &mut UploadTracker,
+    ) -> FlushOutcome {
+        let stride = size_of::<V>();
+        if stride == 0 {
+            self.pending.clear();
+            return FlushOutcome {
+                pending: false,
+                changed: false,
+            };
+        }
+        let max_buffer_size = device.limits().max_buffer_size;
+        let mut pending = std::mem::take(&mut self.pending).into_iter();
+        let mut changed = false;
+        while let Some(write) = pending.next() {
+            let Some(page) = self.pages.get_mut(write.page) else {
+                continue;
+            };
+            let capacity_bytes = (page.capacity_verts as u64)
+                .saturating_mul(stride as u64)
+                .min(max_buffer_size);
+            let byte_offset = (write.offset_verts as u64).saturating_mul(stride as u64);
+            let end = byte_offset.saturating_add(write.bytes.len() as u64);
+            if end > capacity_bytes
+                || !byte_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                || !(write.bytes.len() as u64).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
             {
-                remaining.push(write);
                 continue;
             }
-            if let Some(page) = self.pages.get(write.page)
-                && let Some(buf) = &page.gpu
-            {
-                let byte_offset = (write.offset_verts as u64).saturating_mul(stride);
-                let end = byte_offset.saturating_add(write.bytes.len() as u64);
-                if end <= buf.size() {
-                    queue.write_buffer(buf, byte_offset, &write.bytes);
-                    uploaded = uploaded.saturating_add(write.bytes.len());
-                }
+
+            let count = write.bytes.len() / stride;
+            let has_picks = write.picks.is_some() || page.pick_gpu.is_some();
+            let pick_bytes = if has_picks {
+                count.saturating_mul(size_of::<[u32; 2]>())
+            } else {
+                0
+            };
+            if !budget.reserve(write.bytes.len().saturating_add(pick_bytes)) {
+                self.pending.push(write);
+                self.pending.extend(pending);
+                break;
             }
+
+            let buf = page.gpu.get_or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(self.label),
+                    size: capacity_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            queue.write_buffer(buf, byte_offset, &write.bytes);
+            if has_picks {
+                let pick_buffer = page.pick_gpu.get_or_insert_with(|| {
+                    create_pick_buffer(
+                        device,
+                        usize::try_from(buf.size() / stride as u64).unwrap_or(0),
+                    )
+                });
+                let ids = write.picks.unwrap_or_else(|| vec![[0; 2]; count]);
+                let offset = write.offset_verts as u64 * PICK_ID_BYTES;
+                queue.write_buffer(pick_buffer, offset, bytemuck::cast_slice(&ids));
+            }
+            budget.finish_upload();
+            changed = true;
         }
-        self.pending = remaining;
-        !self.pending.is_empty()
+        FlushOutcome {
+            pending: !self.pending.is_empty(),
+            changed,
+        }
     }
 
     /// Issues draw calls for all allocated pages into `pass` (binding slot 0).
@@ -435,7 +563,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             let Some(buf) = &page.gpu else {
                 continue;
             };
-            let Ok(count) = u32::try_from(page.high_water_verts) else {
+            let stride = size_of::<V>().max(1) as u64;
+            let available = usize::try_from(buf.size() / stride).unwrap_or(usize::MAX);
+            let drawable = page.high_water_verts.min(available);
+            let Ok(count) = u32::try_from(drawable) else {
                 continue;
             };
             if count == 0 {
@@ -489,29 +620,79 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         }
     }
 
-    /// Issues paired draw calls for picking, binding `self` at slot 0 and parallel `pick_ids` at
-    /// slot 1.
+    /// Draws two pools containing vertices and pick IDs in the same logical order. The pools can
+    /// use different page sizes. Bindings are placed at slots 0 and 1, respectively.
     pub fn draw_all_with_pick(
         &self,
         pick_ids: &PagedBuffer<[u32; 2]>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
-        for (page, pick_page) in self.pages.iter().zip(pick_ids.pages.iter()) {
-            let (Some(vbuf), Some(pbuf)) = (&page.gpu, &pick_page.gpu) else {
-                continue;
-            };
-            let count_usize = page.high_water_verts.min(pick_page.high_water_verts);
-            let Ok(count) = u32::try_from(count_usize) else {
-                continue;
-            };
-            if count == 0 {
-                continue;
+        let stride = size_of::<V>() as u64;
+        let mut pick_pages = pick_ids.pages.iter().peekable();
+        let mut pick_offset = 0;
+        for page in &self.pages {
+            let mut offset = 0;
+            while offset < page.high_water_verts {
+                let Some(pick_page) = pick_pages.peek() else {
+                    return;
+                };
+                let count =
+                    (page.high_water_verts - offset).min(pick_page.high_water_verts - pick_offset);
+                if count > 0
+                    && let Ok(count_u32) = u32::try_from(count)
+                    && let (Some(vertices), Some(ids)) = (&page.gpu, &pick_page.gpu)
+                {
+                    let vertex_bytes = offset as u64 * stride..(offset + count) as u64 * stride;
+                    let id_bytes = pick_offset as u64 * PICK_ID_BYTES
+                        ..(pick_offset + count) as u64 * PICK_ID_BYTES;
+                    if stride > 0
+                        && vertex_bytes.end <= vertices.size()
+                        && id_bytes.end <= ids.size()
+                    {
+                        pass.set_vertex_buffer(0, vertices.slice(vertex_bytes));
+                        pass.set_vertex_buffer(1, ids.slice(id_bytes));
+                        pass.draw(0..count_u32, 0..1);
+                    }
+                }
+                offset += count;
+                pick_offset += count;
+                if pick_offset == pick_page.high_water_verts {
+                    pick_pages.next();
+                    pick_offset = 0;
+                }
             }
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.set_vertex_buffer(1, pbuf.slice(..));
-            pass.draw(0..count, 0..1);
         }
     }
+
+    pub(crate) fn draw_picking(&self, pass: &mut wgpu::RenderPass<'_>) {
+        for page in &self.pages {
+            let (Some(vertices), Some(picks)) = (&page.gpu, &page.pick_gpu) else {
+                continue;
+            };
+            let stride = size_of::<V>().max(1) as u64;
+            let available = (vertices.size() / stride).min(picks.size() / PICK_ID_BYTES);
+            let drawable = (page.high_water_verts as u64).min(available);
+            let Ok(count) = u32::try_from(drawable) else {
+                continue;
+            };
+            if count > 0 {
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_vertex_buffer(1, picks.slice(..));
+                pass.draw(0..count, 0..1);
+            }
+        }
+    }
+}
+
+const PICK_ID_BYTES: u64 = size_of::<[u32; 2]>() as u64;
+
+fn create_pick_buffer(device: &wgpu::Device, capacity_verts: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("iletki-2d page pick IDs"),
+        size: capacity_verts as u64 * PICK_ID_BYTES,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 #[cfg(test)]
@@ -535,5 +716,23 @@ mod tests {
         let c = pool.insert(&seg).unwrap();
         assert_eq!(c.offset, a.offset);
         assert_eq!(pool.page_count(), 1);
+    }
+
+    #[test]
+    fn stale_or_foreign_slot_handles_cannot_free_a_reused_span() {
+        let mut pool = PagedBuffer::<Vertex2D>::new("test", 2);
+        let mut other = PagedBuffer::<Vertex2D>::new("test", 2);
+        let segment = [Vertex2D::zeroed(); 2];
+        let removed = pool.insert(&segment).unwrap();
+        let foreign = other.insert(&segment).unwrap();
+        pool.remove(removed);
+        let current = pool.insert(&segment).unwrap();
+        assert_eq!(current.offset, removed.offset);
+        assert_ne!(current, removed);
+        pool.remove(removed);
+        pool.remove(foreign);
+        assert!(pool.update(removed, &segment).is_none());
+        assert!(pool.update(current, &segment).is_some());
+        assert_ne!(pool.insert(&segment).unwrap().offset, current.offset);
     }
 }

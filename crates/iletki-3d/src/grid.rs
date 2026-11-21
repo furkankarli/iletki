@@ -4,7 +4,9 @@ use bytemuck::{Pod, Zeroable};
 use iletki_core::{DrawPhase, DrawPhaseMask, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{CAMERA_WGSL, DEPTH_FORMAT, PaintCtx, PrepareCtx, ViewportLayer};
+use iletki_wgpu::{
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PaintCtx, PrepareCtx, ViewportLayer, ViewportLifetime,
+};
 
 /// Ground plane orientation for [`InfiniteGrid3DLayer`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,6 +71,7 @@ struct GridUniforms {
 
 struct GridViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
@@ -84,6 +87,8 @@ struct GridGpu {
 /// Analytic infinite anti-aliased 3D ground grid layer rendered in [`DrawPhase::Transparent`].
 pub struct InfiniteGrid3DLayer {
     layer_id: u16,
+    revision: LayerRevision,
+    prepared_config: Grid3DConfig,
     /// Active grid visual/spacing configuration.
     pub config: Grid3DConfig,
     /// Toggle grid rendering without removing the layer.
@@ -107,6 +112,8 @@ impl InfiniteGrid3DLayer {
     pub fn new(layer_id: u16, config: Grid3DConfig) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
+            prepared_config: config,
             config,
             visible: true,
             gpu: None,
@@ -209,7 +216,19 @@ impl<W> ViewportLayer<W> for InfiniteGrid3DLayer {
         }
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.per_viewport
+                .retain(|binding| binding.lifetime.is_alive());
+        }
+        if self.prepared_config != self.config {
+            self.prepared_config = self.config;
+            self.revision.mark_static();
+        }
         if !self.visible {
             return false;
         }
@@ -234,8 +253,12 @@ impl<W> ViewportLayer<W> for InfiniteGrid3DLayer {
                     resource: buf.as_entire_binding(),
                 }],
             });
-            gpu.per_viewport
-                .push(GridViewportBinding { id: vp_id, buf, bg });
+            gpu.per_viewport.push(GridViewportBinding {
+                id: vp_id,
+                lifetime: ctx.viewport_lifetime(),
+                buf,
+                bg,
+            });
         }
         if let Some(binding) = gpu.per_viewport.iter().find(|b| b.id == vp_id) {
             let cam = ctx.camera.position_3d();

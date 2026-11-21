@@ -5,8 +5,14 @@ use crate::spatial::{TileRange, bucket_plain, bucket_wide};
 use crate::vertex::{DrawStyle2D, Vertex2D, WideVertex2D, push_wide_segment};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Vec2};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    wgpu,
 };
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// CPU-side batch of compact split-precision 2D primitives ready to upload into a [`Scene2DLayer`].
 ///
@@ -142,14 +148,13 @@ impl Mesh2D {
 }
 
 /// Handle to an incrementally managed 2D geometry chunk inside [`Scene2DLayer`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Chunk2DHandle {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Chunk2DHandle(u64);
+
+struct ChunkSlots {
     lines: Option<SlotHandle>,
     triangles: Option<SlotHandle>,
     wide: Option<SlotHandle>,
-    line_picks: Option<SlotHandle>,
-    triangle_picks: Option<SlotHandle>,
-    wide_picks: Option<SlotHandle>,
 }
 
 struct Pipelines {
@@ -168,15 +173,13 @@ struct Pipelines {
 /// 64-bit GPU picking.
 pub struct Scene2DLayer {
     layer_id: u16,
+    revision: LayerRevision,
+    chunks: HashMap<Chunk2DHandle, ChunkSlots>,
     pipelines: Option<Pipelines>,
     // Static scene paged pools
     triangles: PagedBuffer<Vertex2D>,
     wide: PagedBuffer<WideVertex2D>,
     lines: PagedBuffer<Vertex2D>,
-    // Optional parallel pick-ID pools (empty unless PickIds are provided)
-    triangle_picks: PagedBuffer<[u32; 2]>,
-    wide_picks: PagedBuffer<[u32; 2]>,
-    line_picks: PagedBuffer<[u32; 2]>,
     // Dynamic overlay pools (redrawn cheaply on top of static cache)
     overlay_triangles: PagedBuffer<Vertex2D>,
     overlay_wide: PagedBuffer<WideVertex2D>,
@@ -202,13 +205,12 @@ impl Scene2DLayer {
     pub fn new(layer_id: u16) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
+            chunks: HashMap::new(),
             pipelines: None,
             triangles: PagedBuffer::new("iletki-2d fills", 3),
             wide: PagedBuffer::new("iletki-2d wide", 6),
             lines: PagedBuffer::new("iletki-2d lines", 2),
-            triangle_picks: PagedBuffer::new("iletki-2d fill picks", 3),
-            wide_picks: PagedBuffer::new("iletki-2d wide picks", 6),
-            line_picks: PagedBuffer::new("iletki-2d line picks", 2),
             overlay_triangles: PagedBuffer::new("iletki-2d overlay fills", 3),
             overlay_wide: PagedBuffer::new("iletki-2d overlay wide", 6),
             overlay_lines: PagedBuffer::new("iletki-2d overlay lines", 2),
@@ -220,110 +222,116 @@ impl Scene2DLayer {
     /// existing GPU page buffers when capacity fits and attaching any spatial tiles computed by
     /// [`Mesh2D::optimize_spatial`].
     ///
-    /// Mark `DirtyFlags::STATIC_SCENE` on the hosting `ViewportHost`.
+    /// Every viewport using this layer refreshes its cached scene on the next frame.
     pub fn upload_static_mesh(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: &Mesh2D,
     ) {
-        self.triangles
-            .upload_direct_tiled(device, queue, &mesh.triangles, &mesh.triangle_tiles);
-        self.wide
-            .upload_direct_tiled(device, queue, &mesh.wide, &mesh.wide_tiles);
-        self.lines
-            .upload_direct_tiled(device, queue, &mesh.lines, &mesh.line_tiles);
-        self.triangle_picks
-            .upload_direct(device, queue, &mesh.triangle_pick_ids);
-        self.wide_picks
-            .upload_direct(device, queue, &mesh.wide_pick_ids);
-        self.line_picks
-            .upload_direct(device, queue, &mesh.line_pick_ids);
+        self.chunks.clear();
+        self.revision.mark_static();
+        self.triangles.upload_paired(
+            device,
+            queue,
+            &mesh.triangles,
+            &mesh.triangle_tiles,
+            &mesh.triangle_pick_ids,
+        );
+        self.wide.upload_paired(
+            device,
+            queue,
+            &mesh.wide,
+            &mesh.wide_tiles,
+            &mesh.wide_pick_ids,
+        );
+        self.lines.upload_paired(
+            device,
+            queue,
+            &mesh.lines,
+            &mesh.line_tiles,
+            &mesh.line_pick_ids,
+        );
     }
 
     /// Replaces the entire static 2D scene with `mesh` (queued for `UploadBudget`-throttled upload
     /// during `prepare`).
     pub fn set_static_mesh(&mut self, mesh: &Mesh2D) {
-        self.triangles.replace_all(&mesh.triangles);
-        self.wide.replace_all(&mesh.wide);
-        self.lines.replace_all(&mesh.lines);
-        self.triangle_picks.replace_all(&mesh.triangle_pick_ids);
-        self.wide_picks.replace_all(&mesh.wide_pick_ids);
-        self.line_picks.replace_all(&mesh.line_pick_ids);
+        self.chunks.clear();
+        self.revision.mark_static();
+        self.triangles
+            .replace_paired(&mesh.triangles, &mesh.triangle_pick_ids);
+        self.wide.replace_paired(&mesh.wide, &mesh.wide_pick_ids);
+        self.lines.replace_paired(&mesh.lines, &mesh.line_pick_ids);
     }
 
     /// Inserts an incremental static geometry chunk and returns its [`Chunk2DHandle`].
     pub fn insert_chunk(&mut self, mesh: &Mesh2D) -> Chunk2DHandle {
-        Chunk2DHandle {
-            lines: self.lines.insert(&mesh.lines),
-            triangles: self.triangles.insert(&mesh.triangles),
-            wide: self.wide.insert(&mesh.wide),
-            line_picks: self.line_picks.insert(&mesh.line_pick_ids),
-            triangle_picks: self.triangle_picks.insert(&mesh.triangle_pick_ids),
-            wide_picks: self.wide_picks.insert(&mesh.wide_pick_ids),
-        }
+        self.revision.mark_static();
+        let handle = Chunk2DHandle(NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed));
+        let slots = ChunkSlots {
+            lines: self.lines.insert_paired(&mesh.lines, &mesh.line_pick_ids),
+            triangles: self
+                .triangles
+                .insert_paired(&mesh.triangles, &mesh.triangle_pick_ids),
+            wide: self.wide.insert_paired(&mesh.wide, &mesh.wide_pick_ids),
+        };
+        self.chunks.insert(handle, slots);
+        handle
     }
 
-    /// Updates an existing incremental chunk in place (or reallocates individual pools if grown).
+    /// Updates an existing chunk, preserving its handle even if the GPU slots grow.
+    /// Handles from removed chunks or another scene are ignored.
     pub fn update_chunk(&mut self, handle: Chunk2DHandle, mesh: &Mesh2D) -> Chunk2DHandle {
-        let lines = match handle.lines {
-            Some(s) => self.lines.update(s, &mesh.lines),
-            None => self.lines.insert(&mesh.lines),
+        let Some(slots) = self.chunks.get_mut(&handle) else {
+            return handle;
         };
-        let triangles = match handle.triangles {
-            Some(s) => self.triangles.update(s, &mesh.triangles),
-            None => self.triangles.insert(&mesh.triangles),
+        self.revision.mark_static();
+        slots.lines = match slots.lines {
+            Some(slot) => self
+                .lines
+                .update_paired(slot, &mesh.lines, &mesh.line_pick_ids),
+            None => self.lines.insert_paired(&mesh.lines, &mesh.line_pick_ids),
         };
-        let wide = match handle.wide {
-            Some(s) => self.wide.update(s, &mesh.wide),
-            None => self.wide.insert(&mesh.wide),
+        slots.triangles = match slots.triangles {
+            Some(slot) => {
+                self.triangles
+                    .update_paired(slot, &mesh.triangles, &mesh.triangle_pick_ids)
+            }
+            None => self
+                .triangles
+                .insert_paired(&mesh.triangles, &mesh.triangle_pick_ids),
         };
-        let line_picks = match handle.line_picks {
-            Some(s) => self.line_picks.update(s, &mesh.line_pick_ids),
-            None => self.line_picks.insert(&mesh.line_pick_ids),
+        slots.wide = match slots.wide {
+            Some(slot) => self
+                .wide
+                .update_paired(slot, &mesh.wide, &mesh.wide_pick_ids),
+            None => self.wide.insert_paired(&mesh.wide, &mesh.wide_pick_ids),
         };
-        let triangle_picks = match handle.triangle_picks {
-            Some(s) => self.triangle_picks.update(s, &mesh.triangle_pick_ids),
-            None => self.triangle_picks.insert(&mesh.triangle_pick_ids),
-        };
-        let wide_picks = match handle.wide_picks {
-            Some(s) => self.wide_picks.update(s, &mesh.wide_pick_ids),
-            None => self.wide_picks.insert(&mesh.wide_pick_ids),
-        };
-        Chunk2DHandle {
-            lines,
-            triangles,
-            wide,
-            line_picks,
-            triangle_picks,
-            wide_picks,
-        }
+        handle
     }
 
     /// Removes an incremental chunk from the static scene without rebuilding other pages.
+    /// Handles from removed chunks or another scene are ignored.
     pub fn remove_chunk(&mut self, handle: Chunk2DHandle) {
-        if let Some(s) = handle.lines {
-            self.lines.remove(s);
+        let Some(slots) = self.chunks.remove(&handle) else {
+            return;
+        };
+        self.revision.mark_static();
+        if let Some(slot) = slots.lines {
+            self.lines.remove(slot);
         }
-        if let Some(s) = handle.triangles {
-            self.triangles.remove(s);
+        if let Some(slot) = slots.triangles {
+            self.triangles.remove(slot);
         }
-        if let Some(s) = handle.wide {
-            self.wide.remove(s);
-        }
-        if let Some(s) = handle.line_picks {
-            self.line_picks.remove(s);
-        }
-        if let Some(s) = handle.triangle_picks {
-            self.triangle_picks.remove(s);
-        }
-        if let Some(s) = handle.wide_picks {
-            self.wide_picks.remove(s);
+        if let Some(slot) = slots.wide {
+            self.wide.remove(slot);
         }
     }
 
     /// Zero-copy immediate upload of dynamic 2D overlay geometry.
     pub fn upload_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh2D) {
+        self.revision.mark_dynamic();
         self.overlay_triangles
             .upload_direct(device, queue, &mesh.triangles);
         self.overlay_wide.upload_direct(device, queue, &mesh.wide);
@@ -333,6 +341,7 @@ impl Scene2DLayer {
 
     /// Replaces the dynamic 2D overlay geometry (crosshair, snaps, selection box, highlights).
     pub fn set_overlay(&mut self, mesh: &Mesh2D) {
+        self.revision.mark_dynamic();
         self.overlay_triangles.replace_all(&mesh.triangles);
         self.overlay_wide.replace_all(&mesh.wide);
         self.overlay_lines.replace_all(&mesh.lines);
@@ -341,6 +350,7 @@ impl Scene2DLayer {
 
     /// Clears all dynamic overlay geometry.
     pub fn clear_overlay(&mut self) {
+        self.revision.mark_dynamic();
         self.overlay_triangles.clear();
         self.overlay_wide.clear();
         self.overlay_lines.clear();
@@ -527,10 +537,7 @@ impl<W> ViewportLayer<W> for Scene2DLayer {
 
     fn phases(&self) -> DrawPhaseMask {
         let mut mask = DrawPhaseMask::OPAQUE;
-        if !self.triangle_picks.is_empty()
-            || !self.wide_picks.is_empty()
-            || !self.line_picks.is_empty()
-        {
+        if self.triangles.has_picks() || self.wide.has_picks() || self.lines.has_picks() {
             mask = mask.union(DrawPhaseMask::PICKING);
         }
         if self.has_overlay {
@@ -539,27 +546,42 @@ impl<W> ViewportLayer<W> for Scene2DLayer {
         mask
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
         self.ensure_pipelines(ctx);
-        let mut pending = false;
-        pending |= self.triangles.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.wide.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.lines.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.triangle_picks.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.wide_picks.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.line_picks.flush(ctx.device, ctx.queue, ctx.budget);
-        let _ = self.overlay_triangles.flush(
-            ctx.device,
-            ctx.queue,
-            iletki_core::UploadBudget::UNLIMITED,
-        );
-        let _ =
-            self.overlay_wide
-                .flush(ctx.device, ctx.queue, iletki_core::UploadBudget::UNLIMITED);
-        let _ =
-            self.overlay_lines
-                .flush(ctx.device, ctx.queue, iletki_core::UploadBudget::UNLIMITED);
-        pending
+        let mut flush = |pool: &mut PagedBuffer<Vertex2D>| {
+            pool.flush_with(ctx.device, ctx.queue, &mut ctx.uploads)
+        };
+        let overlay_triangles = flush(&mut self.overlay_triangles);
+        let overlay_lines = flush(&mut self.overlay_lines);
+        let outline = self
+            .overlay_wide
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        if overlay_triangles.changed || overlay_lines.changed || outline.changed {
+            self.revision.mark_dynamic();
+        }
+
+        let triangles = self
+            .triangles
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        let wide = self
+            .wide
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        let lines = self
+            .lines
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        if triangles.changed || wide.changed || lines.changed {
+            self.revision.mark_static();
+        }
+        overlay_triangles.pending
+            || overlay_lines.pending
+            || outline.pending
+            || triangles.pending
+            || wide.pending
+            || lines.pending
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {
@@ -597,18 +619,17 @@ impl<W> ViewportLayer<W> for Scene2DLayer {
                 }
             }
             DrawPhase::Picking => {
-                if !self.triangle_picks.is_empty() {
+                if self.triangles.has_picks() {
                     pass.set_pipeline(&p.fill_pick);
-                    self.triangles
-                        .draw_all_with_pick(&self.triangle_picks, pass);
+                    self.triangles.draw_picking(pass);
                 }
-                if !self.wide_picks.is_empty() {
+                if self.wide.has_picks() {
                     pass.set_pipeline(&p.wide_pick);
-                    self.wide.draw_all_with_pick(&self.wide_picks, pass);
+                    self.wide.draw_picking(pass);
                 }
-                if !self.line_picks.is_empty() {
+                if self.lines.has_picks() {
                     pass.set_pipeline(&p.line_pick);
-                    self.lines.draw_all_with_pick(&self.line_picks, pass);
+                    self.lines.draw_picking(pass);
                 }
             }
             _ => {}

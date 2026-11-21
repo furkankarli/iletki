@@ -10,9 +10,10 @@ pub use iletki_core::*;
 pub use iletki_wgpu as gpu;
 #[cfg(feature = "wgpu")]
 pub use iletki_wgpu::{
-    CAMERA_WGSL, CameraUniformsGpu, DEPTH_FORMAT, FrameOutput, FrameStats, OUTLINE_MASK_FORMAT,
-    PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PrepareCtx, RgbaImage, ViewportConfig, ViewportError,
-    ViewportHost, ViewportLayer,
+    CAMERA_WGSL, CameraUniformsGpu, DEPTH_FORMAT, FrameOutput, FrameStats, LayerRevision,
+    OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PendingPick, PrepareCtx,
+    RgbaImage, UploadTracker, ViewportConfig, ViewportError, ViewportHost, ViewportLayer,
+    ViewportLifetime,
 };
 
 #[cfg(feature = "cad2d")]
