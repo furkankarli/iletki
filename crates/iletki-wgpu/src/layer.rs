@@ -2,6 +2,7 @@
 
 use iletki_core::{Camera, DrawPhase, DrawPhaseMask, UploadBudget, Vec2, ViewportId};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 static NEXT_LAYER_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -34,8 +35,21 @@ impl LayerRevision {
     }
 }
 
-/// Context handed to [`ViewportLayer::prepare`] once per frame before any render passes open.
+/// Weak reference to a viewport's lifetime, for caches stored inside shared layers.
+#[derive(Debug, Clone)]
+pub struct ViewportLifetime(pub(crate) Weak<()>);
+
+impl ViewportLifetime {
+    /// Returns whether the viewport still exists.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
+/// Context handed to [`ViewportLayer::prepare`] before drawing a frame or pick pass.
 pub struct PrepareCtx<'a, W = ()> {
+    pub(crate) viewport_lifetime: &'a Arc<()>,
     /// Unique identifier of the viewport being prepared (use as key for per-viewport GPU buffers
     /// when one scene is shared across multiple split viewports).
     pub viewport_id: ViewportId,
@@ -63,6 +77,14 @@ pub struct PrepareCtx<'a, W = ()> {
     pub depth_format: wgpu::TextureFormat,
     /// MSAA sample count for main scene/gizmo/overlay passes (`1` or `4`).
     pub msaa_samples: u32,
+}
+
+impl<W> PrepareCtx<'_, W> {
+    /// Returns a weak reference that lets a layer retire viewport-local GPU state after close.
+    #[must_use]
+    pub fn viewport_lifetime(&self) -> ViewportLifetime {
+        ViewportLifetime(Arc::downgrade(self.viewport_lifetime))
+    }
 }
 
 impl<W> std::fmt::Debug for PrepareCtx<'_, W> {

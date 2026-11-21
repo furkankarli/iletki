@@ -24,7 +24,7 @@ pub mod uniforms;
 
 pub use error::ViewportError;
 pub use host::{FrameOutput, FrameStats, PassTargetDesc, PendingPick, RgbaImage, ViewportHost};
-pub use layer::{LayerRevision, PaintCtx, PrepareCtx, ViewportLayer};
+pub use layer::{LayerRevision, PaintCtx, PrepareCtx, ViewportLayer, ViewportLifetime};
 pub use outline::OUTLINE_MASK_FORMAT;
 pub use target::{DEPTH_FORMAT, PICK_ID_FORMAT, ViewportConfig};
 pub use uniforms::{CAMERA_WGSL, CameraUniformsGpu};

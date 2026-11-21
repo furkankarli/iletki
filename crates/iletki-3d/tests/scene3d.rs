@@ -168,3 +168,43 @@ fn large_world_3d_cube_clip_plane_picking_grid_and_gizmo() {
         Some(GizmoAxis::Center)
     );
 }
+
+#[test]
+fn removed_and_foreign_chunk_ids_cannot_modify_a_live_chunk() {
+    let mut scene = Scene3DLayer::new(1);
+    let old = scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+    scene.remove(old);
+    let current = scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+    let mut other = Scene3DLayer::new(2);
+    let foreign = other.insert(Mesh3D::at_origin(Vec3::ZERO));
+
+    assert_ne!(old, current);
+    scene.set_selected(current, true);
+    scene.set_selected(old, false);
+    scene.remove(old);
+    scene.remove(foreign);
+    assert!(scene.is_selected(current));
+    assert!(!scene.is_selected(old));
+}
+
+#[test]
+fn shared_scene_releases_bindings_for_closed_viewports() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut scene = Scene3DLayer::new(1);
+    scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+    let mut active = ViewportHost::new(&device, ViewportConfig::default());
+    let mut closed = ViewportHost::new(&device, ViewportConfig::default());
+    let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut scene];
+    let mut encoder = device.create_command_encoder(&Default::default());
+    active.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+    closed.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+    queue.submit([encoder.finish()]);
+
+    drop(closed);
+    assert_eq!(scene.prune_closed_viewports(), 1);
+    assert_eq!(scene.prune_closed_viewports(), 0);
+    drop(active);
+    assert_eq!(scene.prune_closed_viewports(), 1);
+}

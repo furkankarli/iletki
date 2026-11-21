@@ -122,6 +122,7 @@ struct LayerState {
 /// cameras (e.g. CAD quad views or 2D plan + 3D perspective) with zero duplicated scene buffers.
 pub struct ViewportHost {
     id: ViewportId,
+    lifetime: Arc<()>,
     config: ViewportConfig,
     camera: Camera,
     dpi_scale: f32,
@@ -173,6 +174,7 @@ impl ViewportHost {
         let targets = TargetSet::new(device, &blit, config.initial_px, config.color_format, msaa);
         Self {
             id,
+            lifetime: Arc::new(()),
             config,
             camera: Camera::default(),
             dpi_scale,
@@ -539,6 +541,7 @@ impl ViewportHost {
         let size = self.targets.size();
         let logical = self.logical_size();
         let mut prep_ctx = PrepareCtx {
+            viewport_lifetime: &self.lifetime,
             viewport_id: self.id,
             device,
             queue,

@@ -11,10 +11,13 @@ use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds2, UploadBudget};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default maximum bytes per GPU vertex page (64 MiB, clamped further by device limits).
 const DEFAULT_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+static NEXT_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Handle to a vertex range allocated inside a [`PagedBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +26,7 @@ pub struct SlotHandle {
     offset: usize,
     capacity: usize,
     len: usize,
+    generation: u64,
 }
 
 impl SlotHandle {
@@ -52,6 +56,28 @@ struct Page {
     tiles: Vec<TileRange>,
     gpu: Option<wgpu::Buffer>,
     pick_gpu: Option<wgpu::Buffer>,
+    live_slots: HashMap<usize, u64>,
+}
+
+impl Page {
+    fn register_slot(
+        &mut self,
+        page: usize,
+        offset: usize,
+        capacity: usize,
+        len: usize,
+    ) -> SlotHandle {
+        let generation = NEXT_SLOT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.live_slots.insert(offset, generation);
+        self.tiles.clear();
+        SlotHandle {
+            page,
+            offset,
+            capacity,
+            len,
+            generation,
+        }
+    }
 }
 
 struct PendingWrite {
@@ -164,6 +190,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                 page.free.clear();
                 page.tiles.clear();
                 page.pick_gpu = None;
+                page.live_slots.clear();
             }
             return;
         }
@@ -245,6 +272,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                         queue.write_buffer(&buffer, 0, bytemuck::cast_slice(ids));
                         buffer
                     }),
+                live_slots: HashMap::new(),
             });
             page_base = page_end;
         }
@@ -278,6 +306,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                 tiles: Vec::new(),
                 gpu: None,
                 pick_gpu: None,
+                live_slots: HashMap::new(),
             });
             self.pending.push(PendingWrite {
                 page: page_idx,
@@ -315,12 +344,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
                         capacity: leftover,
                     });
                 }
-                let slot = SlotHandle {
-                    page: page_idx,
-                    offset: span.offset,
-                    capacity: needed,
-                    len,
-                };
+                let slot = page.register_slot(page_idx, span.offset, needed, len);
                 self.queue_slot_bytes(slot, data, picks);
                 return Some(slot);
             }
@@ -328,12 +352,7 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             if avail >= needed {
                 let offset = page.high_water_verts;
                 page.high_water_verts = offset.saturating_add(needed);
-                let slot = SlotHandle {
-                    page: page_idx,
-                    offset,
-                    capacity: needed,
-                    len,
-                };
+                let slot = page.register_slot(page_idx, offset, needed, len);
                 self.queue_slot_bytes(slot, data, picks);
                 return Some(slot);
             }
@@ -345,25 +364,23 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             return None;
         }
         let page_idx = self.pages.len();
-        self.pages.push(Page {
+        let mut page = Page {
             capacity_verts: page_cap,
             high_water_verts: needed,
             free: Vec::new(),
             tiles: Vec::new(),
             gpu: None,
             pick_gpu: None,
-        });
-        let slot = SlotHandle {
-            page: page_idx,
-            offset: 0,
-            capacity: needed,
-            len,
+            live_slots: HashMap::new(),
         };
+        let slot = page.register_slot(page_idx, 0, needed, len);
+        self.pages.push(page);
         self.queue_slot_bytes(slot, data, picks);
         Some(slot)
     }
 
     /// Updates an existing slot in place when `data` fits, or reallocates if it grew.
+    /// A request too large for a page leaves the existing slot intact.
     pub fn update(&mut self, slot: SlotHandle, data: &[V]) -> Option<SlotHandle> {
         self.update_paired(slot, data, &[])
     }
@@ -374,11 +391,15 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         data: &[V],
         picks: &[[u32; 2]],
     ) -> Option<SlotHandle> {
+        let page = self.pages.get(slot.page)?;
+        if page.live_slots.get(&slot.offset) != Some(&slot.generation) {
+            return None;
+        }
         if data.is_empty() {
             self.remove(slot);
             return None;
         }
-        if data.len() <= slot.capacity && slot.page < self.pages.len() {
+        if data.len() <= slot.capacity {
             let updated = SlotHandle {
                 len: data.len(),
                 ..slot
@@ -386,8 +407,11 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             self.queue_slot_bytes(updated, data, picks);
             return Some(updated);
         }
+        let Some(replacement) = self.insert_paired(data, picks) else {
+            return Some(slot);
+        };
         self.remove(slot);
-        self.insert_paired(data, picks)
+        Some(replacement)
     }
 
     /// Frees a slot by zeroing its vertices (turning primitives degenerate so they rasterize 0
@@ -396,6 +420,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         let Some(page) = self.pages.get_mut(slot.page) else {
             return;
         };
+        if page.live_slots.get(&slot.offset) != Some(&slot.generation) {
+            return;
+        }
+        page.live_slots.remove(&slot.offset);
         let zero_bytes = slot.capacity.saturating_mul(std::mem::size_of::<V>());
         self.pending.push(PendingWrite {
             page: slot.page,
@@ -647,5 +675,23 @@ mod tests {
         let c = pool.insert(&seg).unwrap();
         assert_eq!(c.offset, a.offset);
         assert_eq!(pool.page_count(), 1);
+    }
+
+    #[test]
+    fn stale_or_foreign_slot_handles_cannot_free_a_reused_span() {
+        let mut pool = PagedBuffer::<Vertex2D>::new("test", 2);
+        let mut other = PagedBuffer::<Vertex2D>::new("test", 2);
+        let segment = [Vertex2D::zeroed(); 2];
+        let removed = pool.insert(&segment).unwrap();
+        let foreign = other.insert(&segment).unwrap();
+        pool.remove(removed);
+        let current = pool.insert(&segment).unwrap();
+        assert_eq!(current.offset, removed.offset);
+        assert_ne!(current, removed);
+        pool.remove(removed);
+        pool.remove(foreign);
+        assert!(pool.update(removed, &segment).is_none());
+        assert!(pool.update(current, &segment).is_some());
+        assert_ne!(pool.insert(&segment).unwrap().offset, current.offset);
     }
 }

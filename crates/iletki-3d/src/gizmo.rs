@@ -8,6 +8,7 @@ use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
     CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    ViewportLifetime,
 };
 
 /// Sub-object axis identifier encoded in [`PickId::sub`] for [`TransformGizmoLayer`].
@@ -40,6 +41,7 @@ impl GizmoAxis {
 
 struct GizmoViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
@@ -321,6 +323,10 @@ impl<W> ViewportLayer<W> for TransformGizmoLayer {
     }
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.per_viewport
+                .retain(|binding| binding.lifetime.is_alive());
+        }
         let scale = (
             self.size_px.to_bits(),
             self.max_world_scale.map(f64::to_bits),
@@ -357,8 +363,12 @@ impl<W> ViewportLayer<W> for TransformGizmoLayer {
                     resource: buf.as_entire_binding(),
                 }],
             });
-            gpu.per_viewport
-                .push(GizmoViewportBinding { id: vp_id, buf, bg });
+            gpu.per_viewport.push(GizmoViewportBinding {
+                id: vp_id,
+                lifetime: ctx.viewport_lifetime(),
+                buf,
+                bg,
+            });
         }
         if let Some(binding) = gpu.per_viewport.iter().find(|b| b.id == vp_id) {
             let cam_pos = ctx.camera.position_3d();

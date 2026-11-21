@@ -9,8 +9,11 @@ use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
     CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx,
-    PrepareCtx, ViewportLayer,
+    PrepareCtx, ViewportLayer, ViewportLifetime,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -21,15 +24,20 @@ pub(crate) struct ObjectUniforms {
 
 /// Identifier of a 3D mesh chunk stored inside [`Scene3DLayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Chunk3DId(usize);
+pub struct Chunk3DId {
+    index: usize,
+    generation: u64,
+}
 
 struct ViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
 
 struct ChunkEntry {
+    generation: u64,
     origin: Vec3,
     local_bounds: Bounds3,
     visible: bool,
@@ -91,7 +99,9 @@ impl Scene3DLayer {
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
     pub fn insert(&mut self, mesh: Mesh3D) -> Chunk3DId {
         self.revision.mark_static();
+        let generation = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
         let entry = ChunkEntry {
+            generation,
             origin: mesh.origin,
             local_bounds: mesh.local_bounds,
             visible: true,
@@ -105,21 +115,24 @@ impl Scene3DLayer {
             has_picks: false,
             per_viewport: Vec::new(),
         };
-        if let Some(pos) = self.chunks.iter().position(Option::is_none) {
-            if let Some(slot) = self.chunks.get_mut(pos) {
-                *slot = Some(entry);
-            }
-            return Chunk3DId(pos);
+        if let Some((index, slot)) = self
+            .chunks
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(entry);
+            return Chunk3DId { index, generation };
         }
-        let idx = self.chunks.len();
+        let index = self.chunks.len();
         self.chunks.push(Some(entry));
-        Chunk3DId(idx)
+        Chunk3DId { index, generation }
     }
 
     /// Updates a chunk's world origin (for moving 3D objects without re-uploading vertices).
     pub fn set_origin(&mut self, id: Chunk3DId, origin: Vec3) {
         if origin.is_finite()
-            && let Some(Some(entry)) = self.chunks.get_mut(id.0)
+            && let Some(entry) = self.chunk_mut(id)
         {
             entry.origin = origin;
             self.revision.mark_static();
@@ -128,7 +141,7 @@ impl Scene3DLayer {
 
     /// Toggles visibility of a chunk.
     pub fn set_visible(&mut self, id: Chunk3DId, visible: bool) {
-        if let Some(Some(entry)) = self.chunks.get_mut(id.0) {
+        if let Some(entry) = self.chunk_mut(id) {
             entry.visible = visible;
             self.revision.mark_static();
         }
@@ -140,7 +153,7 @@ impl Scene3DLayer {
     /// [`DrawPhase::OutlineMask`] so [`iletki_wgpu::ViewportHost`] renders a crisp screen-space
     /// Jump-Flood silhouette outline around it.
     pub fn set_selected(&mut self, id: Chunk3DId, selected: bool) {
-        if let Some(Some(entry)) = self.chunks.get_mut(id.0) {
+        if let Some(entry) = self.chunk_mut(id) {
             entry.selected = selected;
             self.revision.mark_dynamic();
         }
@@ -150,9 +163,9 @@ impl Scene3DLayer {
     #[must_use]
     pub fn is_selected(&self, id: Chunk3DId) -> bool {
         self.chunks
-            .get(id.0)
+            .get(id.index)
             .and_then(|s| s.as_ref())
-            .is_some_and(|e| e.selected)
+            .is_some_and(|entry| entry.generation == id.generation && entry.selected)
     }
 
     /// Clears selection on all chunks.
@@ -165,10 +178,38 @@ impl Scene3DLayer {
 
     /// Removes a chunk and frees its GPU buffers.
     pub fn remove(&mut self, id: Chunk3DId) {
-        if let Some(slot) = self.chunks.get_mut(id.0) {
+        if let Some(slot) = self.chunks.get_mut(id.index)
+            && slot
+                .as_ref()
+                .is_some_and(|entry| entry.generation == id.generation)
+        {
             *slot = None;
             self.revision.mark_static();
         }
+    }
+
+    fn chunk_mut(&mut self, id: Chunk3DId) -> Option<&mut ChunkEntry> {
+        self.chunks
+            .get_mut(id.index)?
+            .as_mut()
+            .filter(|entry| entry.generation == id.generation)
+    }
+
+    /// Releases bindings for closed viewports and returns the number released.
+    ///
+    /// The layer also prunes closed bindings before preparing a viewport.
+    pub fn prune_closed_viewports(&mut self) -> usize {
+        self.chunks
+            .iter_mut()
+            .flatten()
+            .map(|chunk| {
+                let previous = chunk.per_viewport.len();
+                chunk
+                    .per_viewport
+                    .retain(|binding| binding.lifetime.is_alive());
+                previous - chunk.per_viewport.len()
+            })
+            .sum()
     }
 
     fn ensure_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
@@ -424,6 +465,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
     }
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        self.prune_closed_viewports();
         self.ensure_pipelines(ctx);
         let Some(p) = &self.pipelines else {
             return false;
@@ -495,9 +537,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         resource: buf.as_entire_binding(),
                     }],
                 });
-                chunk
-                    .per_viewport
-                    .push(ViewportBinding { id: vp_id, buf, bg });
+                chunk.per_viewport.push(ViewportBinding {
+                    id: vp_id,
+                    lifetime: ctx.viewport_lifetime(),
+                    buf,
+                    bg,
+                });
             }
 
             if let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) {

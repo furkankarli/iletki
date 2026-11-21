@@ -9,6 +9,11 @@ use iletki_wgpu::{
     wgpu,
 };
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
+
 /// CPU-side batch of compact split-precision 2D primitives ready to upload into a [`Scene2DLayer`].
 ///
 /// Parallel picking ID arrays are allocated lazily only when a primitive is pushed with a non-empty
@@ -143,8 +148,10 @@ impl Mesh2D {
 }
 
 /// Handle to an incrementally managed 2D geometry chunk inside [`Scene2DLayer`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Chunk2DHandle {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Chunk2DHandle(u64);
+
+struct ChunkSlots {
     lines: Option<SlotHandle>,
     triangles: Option<SlotHandle>,
     wide: Option<SlotHandle>,
@@ -167,6 +174,7 @@ struct Pipelines {
 pub struct Scene2DLayer {
     layer_id: u16,
     revision: LayerRevision,
+    chunks: HashMap<Chunk2DHandle, ChunkSlots>,
     pipelines: Option<Pipelines>,
     // Static scene paged pools
     triangles: PagedBuffer<Vertex2D>,
@@ -198,6 +206,7 @@ impl Scene2DLayer {
         Self {
             layer_id,
             revision: LayerRevision::new(),
+            chunks: HashMap::new(),
             pipelines: None,
             triangles: PagedBuffer::new("iletki-2d fills", 3),
             wide: PagedBuffer::new("iletki-2d wide", 6),
@@ -220,6 +229,7 @@ impl Scene2DLayer {
         queue: &wgpu::Queue,
         mesh: &Mesh2D,
     ) {
+        self.chunks.clear();
         self.revision.mark_static();
         self.triangles.upload_paired(
             device,
@@ -247,6 +257,7 @@ impl Scene2DLayer {
     /// Replaces the entire static 2D scene with `mesh` (queued for `UploadBudget`-throttled upload
     /// during `prepare`).
     pub fn set_static_mesh(&mut self, mesh: &Mesh2D) {
+        self.chunks.clear();
         self.revision.mark_static();
         self.triangles
             .replace_paired(&mesh.triangles, &mesh.triangle_pick_ids);
@@ -257,25 +268,32 @@ impl Scene2DLayer {
     /// Inserts an incremental static geometry chunk and returns its [`Chunk2DHandle`].
     pub fn insert_chunk(&mut self, mesh: &Mesh2D) -> Chunk2DHandle {
         self.revision.mark_static();
-        Chunk2DHandle {
+        let handle = Chunk2DHandle(NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed));
+        let slots = ChunkSlots {
             lines: self.lines.insert_paired(&mesh.lines, &mesh.line_pick_ids),
             triangles: self
                 .triangles
                 .insert_paired(&mesh.triangles, &mesh.triangle_pick_ids),
             wide: self.wide.insert_paired(&mesh.wide, &mesh.wide_pick_ids),
-        }
+        };
+        self.chunks.insert(handle, slots);
+        handle
     }
 
-    /// Updates an existing incremental chunk in place (or reallocates individual pools if grown).
+    /// Updates an existing chunk, preserving its handle even if the GPU slots grow.
+    /// Handles from removed chunks or another scene are ignored.
     pub fn update_chunk(&mut self, handle: Chunk2DHandle, mesh: &Mesh2D) -> Chunk2DHandle {
+        let Some(slots) = self.chunks.get_mut(&handle) else {
+            return handle;
+        };
         self.revision.mark_static();
-        let lines = match handle.lines {
+        slots.lines = match slots.lines {
             Some(slot) => self
                 .lines
                 .update_paired(slot, &mesh.lines, &mesh.line_pick_ids),
             None => self.lines.insert_paired(&mesh.lines, &mesh.line_pick_ids),
         };
-        let triangles = match handle.triangles {
+        slots.triangles = match slots.triangles {
             Some(slot) => {
                 self.triangles
                     .update_paired(slot, &mesh.triangles, &mesh.triangle_pick_ids)
@@ -284,29 +302,29 @@ impl Scene2DLayer {
                 .triangles
                 .insert_paired(&mesh.triangles, &mesh.triangle_pick_ids),
         };
-        let wide = match handle.wide {
+        slots.wide = match slots.wide {
             Some(slot) => self
                 .wide
                 .update_paired(slot, &mesh.wide, &mesh.wide_pick_ids),
             None => self.wide.insert_paired(&mesh.wide, &mesh.wide_pick_ids),
         };
-        Chunk2DHandle {
-            lines,
-            triangles,
-            wide,
-        }
+        handle
     }
 
     /// Removes an incremental chunk from the static scene without rebuilding other pages.
+    /// Handles from removed chunks or another scene are ignored.
     pub fn remove_chunk(&mut self, handle: Chunk2DHandle) {
+        let Some(slots) = self.chunks.remove(&handle) else {
+            return;
+        };
         self.revision.mark_static();
-        if let Some(slot) = handle.lines {
+        if let Some(slot) = slots.lines {
             self.lines.remove(slot);
         }
-        if let Some(slot) = handle.triangles {
+        if let Some(slot) = slots.triangles {
             self.triangles.remove(slot);
         }
-        if let Some(slot) = handle.wide {
+        if let Some(slot) = slots.wide {
             self.wide.remove(slot);
         }
     }

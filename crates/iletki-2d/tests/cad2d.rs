@@ -122,8 +122,17 @@ fn picking_matches_geometry_across_pages_and_unpickable_chunks() {
         Some(wanted)
     );
 
+    scene.remove_chunk(handle);
+    let replacement = scene.insert_chunk(&pickable);
+    assert_ne!(replacement, handle);
+    scene.remove_chunk(handle);
     pickable.triangle_pick_ids.clear();
     scene.update_chunk(handle, &pickable);
+    assert_eq!(
+        pick_center(&mut host, &mut scene).first().map(|hit| hit.id),
+        Some(wanted)
+    );
+    assert_eq!(scene.update_chunk(replacement, &pickable), replacement);
     assert!(pick_center(&mut host, &mut scene).is_empty());
 }
 

@@ -9,6 +9,7 @@ use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
     CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    ViewportLifetime,
 };
 
 #[repr(C)]
@@ -56,6 +57,7 @@ struct InstPipelines {
 
 struct ViewportBinding {
     id: ViewportId,
+    lifetime: ViewportLifetime,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
 }
@@ -295,6 +297,8 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
     }
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        self.per_viewport
+            .retain(|binding| binding.lifetime.is_alive());
         if self.prepared_origin != Some(self.origin) {
             self.prepared_origin = Some(self.origin);
             self.revision.mark_static();
@@ -350,8 +354,12 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
                     resource: buf.as_entire_binding(),
                 }],
             });
-            self.per_viewport
-                .push(ViewportBinding { id: vp_id, buf, bg });
+            self.per_viewport.push(ViewportBinding {
+                id: vp_id,
+                lifetime: ctx.viewport_lifetime(),
+                buf,
+                bg,
+            });
         }
 
         if let Some(binding) = self.per_viewport.iter().find(|b| b.id == vp_id) {
