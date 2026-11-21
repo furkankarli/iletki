@@ -64,9 +64,9 @@ struct GizmoGpu {
 /// of 3D geometry while properly depth-sorting its own 3 axes) and in [`DrawPhase::Picking`] with
 /// distinct [`GizmoAxis`] sub-IDs.
 ///
-/// Follows standard Blender / Unity / Godot viewport sizing: fixed logical pixel height
-/// ([`TransformGizmoLayer::size_px`], default `92.0` pt) regardless of window size or camera
-/// distance, with an optional [`TransformGizmoLayer::max_world_scale`] clamp.
+/// Each axis arrow has a fixed screen-space length in logical points
+/// ([`TransformGizmoLayer::size_px`], default `92.0` pt), with an optional
+/// [`TransformGizmoLayer::max_world_scale`] cap on its world-space size.
 pub struct TransformGizmoLayer {
     layer_id: u16,
     revision: LayerRevision,

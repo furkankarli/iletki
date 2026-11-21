@@ -11,7 +11,7 @@ use iletki_wgpu::{
 /// Ground plane orientation for [`InfiniteGrid3DLayer`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GridPlane {
-    /// Horizontal XY plane (`z = 0`, standard for CAD / BIM / Blender).
+    /// Horizontal XY plane (`z = 0`) for Z-up scenes.
     #[default]
     XyZUp,
     /// Horizontal XZ plane (`y = 0`, standard for Y-up game engines).

@@ -861,7 +861,7 @@ impl ApplicationHandler for DemoApp {
 fn build_arch_3d() -> (Scene3DLayer, Vec<ChunkMeta>) {
     let mut scene = Scene3DLayer::new(1);
     let mut meta = Vec::new();
-    // Translucent dark crease color blends cleanly with each surface's own hue (CAD/Fusion style).
+    // Use translucent dark edge lines so the surface colors show through.
     let edge = [12, 16, 24, 110];
 
     let mut add = |name: &'static str,

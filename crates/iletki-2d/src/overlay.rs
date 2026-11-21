@@ -62,7 +62,7 @@ pub fn adaptive_grid_step(zoom: f64, min_spacing_pt: f64) -> Option<f64> {
     step.is_finite().then_some(step)
 }
 
-/// Appends an AutoCAD-style adaptive 2D grid and origin axes covering `visible` into `mesh`.
+/// Appends an adaptive 2D CAD grid and origin axes covering `visible` into `mesh`.
 pub fn push_adaptive_grid(
     mesh: &mut Mesh2D,
     visible: Bounds2,
@@ -143,8 +143,8 @@ pub fn push_crosshair(
     );
 }
 
-/// Appends an AutoCAD-style selection rectangle (`window`: blue fill/outline if `crossing == false`,
-/// green if `crossing == true`).
+/// Appends a selection rectangle with a blue fill and outline for window selection
+/// (`crossing == false`) or green for crossing selection (`crossing == true`).
 pub fn push_selection_box(
     mesh: &mut Mesh2D,
     corner_a: Vec2,
