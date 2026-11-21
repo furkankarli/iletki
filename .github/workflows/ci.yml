@@ -79,6 +79,7 @@ jobs:
           SLINT_WGPU_CPU: '1'
           SLINT_SCALE_FACTOR: '2'
         run: |
+          cargo package --locked -p iletki-slint
           cargo fmt --manifest-path examples/slint/Cargo.toml --check
           cargo deny --manifest-path examples/slint/Cargo.toml --config examples/slint/deny.toml --locked check
           cargo clippy --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- -D warnings

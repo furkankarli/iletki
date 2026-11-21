@@ -10,6 +10,7 @@ below it, and core layers never pull in a UI or windowing framework.
 | 2 | `iletki-2d` | ready | High-precision 2D CAD/vector layer kit: split `hi/lo` compact 24-byte lines & fills, screen-space wide lines, 8×8 spatial tile frustum culling, paged incremental vertex pools (`PagedBuffer`), lazy parallel 64-bit picking, adaptive grids and overlays |
 | 2 | `iletki-3d` | ready | 3D editor helper kit: camera-relative Reversed-Z meshes, *Shaded with Edges* depth-offset wireframes, GPU instancing (`InstancedMesh3DLayer`, 100k+ objects in 1 draw call), 6 section clip planes, 3D frustum culling, per-`ViewportId` multi-viewport uniform buffers, infinite anti-aliased ground grid and screen-size-invariant transform gizmos with 64-bit sub-object picking |
 | 3 | `iletki-egui` | ready | Optional thin `egui` / `eframe` adapter (`ViewportPaintCallback`, input & command translation) |
+| 3 | `iletki-slint` | ready | Optional Slint adapter using an application-supplied image importer, with viewport sizing and picking in logical coordinates |
 | 3 | `iletki` | ready | Top-level facade re-exporting the workspace crates behind features (`wgpu`, `cad2d`, `cad3d`) plus headless visual/benchmark showcase (`examples/showcase.rs`) |
 | app | `iletki-demo` | ready | Standalone interactive desktop test app (`winit` + `wgpu`, unpublished) exercising 3D Arch, 4-Way Quad-View, 2D 500k UTM CAD, 100k 3D Instancing, Section Clips and 64-bit GPU Picking |
 

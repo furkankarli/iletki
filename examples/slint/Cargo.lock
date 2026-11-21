@@ -2031,8 +2031,6 @@ dependencies = [
 [[package]]
 name = "iletki"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b6594e888a2ffca9284b69b133bd07d59af1eac328e2add8a6b1897412bd8f3"
 dependencies = [
  "iletki-2d",
  "iletki-core",
@@ -2042,8 +2040,6 @@ dependencies = [
 [[package]]
 name = "iletki-2d"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca3b40aa49430a47641ea23e42b0054c7fb1c3565e0bd3a791235e7085a9da32"
 dependencies = [
  "bytemuck",
  "iletki-core",
@@ -2053,22 +2049,27 @@ dependencies = [
 [[package]]
 name = "iletki-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d5e28b60395e3ec28c3d6b1ecfee540ad284e5f41688da1023724afc120fbd"
+
+[[package]]
+name = "iletki-slint"
+version = "0.1.0"
+dependencies = [
+ "iletki-core",
+ "iletki-wgpu",
+]
 
 [[package]]
 name = "iletki-slint-example"
 version = "0.1.0"
 dependencies = [
  "iletki",
+ "iletki-slint",
  "slint",
 ]
 
 [[package]]
 name = "iletki-wgpu"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "177974b9aff5d18deda719d14c610eaed19604e9f7bde31e7a926b2f1a8b4f04"
 dependencies = [
  "bytemuck",
  "iletki-core",

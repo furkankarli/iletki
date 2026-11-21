@@ -792,6 +792,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "iletki-slint"
+version = "0.1.0"
+dependencies = [
+ "iletki-core",
+ "iletki-wgpu",
+]
+
+[[package]]
 name = "iletki-wgpu"
 version = "0.1.0"
 dependencies = [
