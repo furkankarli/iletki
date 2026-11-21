@@ -83,6 +83,9 @@ The [standalone egui example](examples/egui) shows how to render a viewport thro
 `egui_wgpu` callback and pick an object. It uses registry dependencies. From a checkout, the
 package verification command below runs it against locally built archives.
 
+The [Slint desktop example](examples/slint) imports the viewport texture on Slint's `wgpu 30`
+device and demonstrates panning, zooming, resizing, and picking.
+
 ## Which crate should I use?
 
 | Crate | Use it when |

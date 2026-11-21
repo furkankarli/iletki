@@ -24,3 +24,4 @@ Thumbs.db
 # Standalone example build output
 /examples/egui/target/
 /examples/egui/Cargo.lock
+/examples/slint/target/

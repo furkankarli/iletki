@@ -1,0 +1,22 @@
+[package]
+name = "iletki-slint-example"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+iletki = { version = "=0.1.0", default-features = false, features = ["cad2d"] }
+slint = { version = "~1.19", default-features = false, features = [
+    "backend-winit",
+    "compat-1-2",
+    "renderer-femtovg-wgpu",
+    "unstable-wgpu-30",
+] }
+
+[lints.rust]
+# Slint’s macro expands to its own FFI plumbing. Deny unsafe in the example code.
+unsafe_code = "deny"

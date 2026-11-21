@@ -56,7 +56,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libxkbcommon-x11-0 xauth xvfb
           lavapipe_icd=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
           test -n "$lavapipe_icd"
           echo "VK_DRIVER_FILES=$lavapipe_icd" >> "$GITHUB_ENV"
@@ -71,6 +71,18 @@ jobs:
       - name: Verify the release archives with the standalone egui example
         if: runner.os == 'Linux'
         run: python3 .github/scripts/package-smoke.py
+
+      - name: Verify the standalone Slint example
+        if: runner.os == 'Linux'
+        env:
+          SLINT_BACKEND: winit
+          SLINT_WGPU_CPU: '1'
+          SLINT_SCALE_FACTOR: '2'
+        run: |
+          cargo fmt --manifest-path examples/slint/Cargo.toml --check
+          cargo deny --manifest-path examples/slint/Cargo.toml --config examples/slint/deny.toml --locked check
+          cargo clippy --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- -D warnings
+          xvfb-run -a cargo run --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- --smoke
 
   webgpu:
     name: Browser WebGPU (headless Chrome)
