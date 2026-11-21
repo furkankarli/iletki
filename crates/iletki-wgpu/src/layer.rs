@@ -1,6 +1,38 @@
 //! Layer trait and render contexts connecting application scenes to [`crate::ViewportHost`].
 
 use iletki_core::{Camera, DrawPhase, DrawPhaseMask, UploadBudget, Vec2, ViewportId};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_LAYER_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// Revisions used by each viewport to invalidate its cached layer output independently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayerRevision {
+    pub(crate) static_scene: u64,
+    pub(crate) dynamic: u64,
+}
+
+impl LayerRevision {
+    /// Starts a tracked revision with a distinct identity for a newly created layer.
+    #[must_use]
+    pub fn new() -> Self {
+        let revision = NEXT_LAYER_REVISION.fetch_add(1, Ordering::Relaxed);
+        Self {
+            static_scene: revision,
+            dynamic: revision,
+        }
+    }
+
+    /// Invalidates opaque and transparent scene content.
+    pub fn mark_static(&mut self) {
+        self.static_scene = NEXT_LAYER_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Invalidates outline, gizmo and overlay content.
+    pub fn mark_dynamic(&mut self) {
+        self.dynamic = NEXT_LAYER_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Context handed to [`ViewportLayer::prepare`] once per frame before any render passes open.
 pub struct PrepareCtx<'a, W = ()> {
@@ -82,6 +114,14 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
 
     /// Declares which [`DrawPhase`]s this layer participates in. Unused phases are skipped cleanly.
     fn phases(&self) -> DrawPhaseMask;
+
+    /// Returns the revision of the layer's cached output after preparation.
+    ///
+    /// Layers that return the default revision can use [`crate::ViewportHost::mark_dirty`] for
+    /// content changes. The host always tracks layer order, membership and enabled phases.
+    fn revision(&self) -> LayerRevision {
+        LayerRevision::default()
+    }
 
     /// Updates GPU resources (pipelines, vertex buffers, instances) within `ctx.budget`.
     ///

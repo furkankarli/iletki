@@ -3,13 +3,13 @@
 
 use crate::blit::{BlitResources, DepthCopyPipeline};
 use crate::error::ViewportError;
-use crate::layer::{PaintCtx, PrepareCtx, ViewportLayer};
+use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, ViewportLayer};
 use crate::outline::OutlineEngine;
 use crate::target::{DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig};
 use crate::uniforms::CameraGpu;
 use iletki_core::{
-    Camera, CameraRig, DirtyFlags, DrawPhase, OutlineConfig, PickHit, PickId, TargetSize, Vec2,
-    ViewportCommand, ViewportId, ViewportInput, ViewportMode,
+    Camera, CameraRig, DirtyFlags, DrawPhase, DrawPhaseMask, OutlineConfig, PickHit, PickId,
+    TargetSize, Vec2, ViewportCommand, ViewportId, ViewportInput, ViewportMode,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -110,6 +110,12 @@ enum ActiveOutput {
     DynamicOutput,
 }
 
+struct LayerState {
+    id: u16,
+    phases: DrawPhaseMask,
+    revision: LayerRevision,
+}
+
 /// Independent GPU viewport instance sharing a host `wgpu::Device` and `wgpu::Queue`.
 ///
 /// Multiple [`ViewportHost`] instances can render the same application `World` from independent
@@ -129,6 +135,9 @@ pub struct ViewportHost {
     active_output: ActiveOutput,
     static_valid: bool,
     pending_reallocated: bool,
+    streaming_pending: bool,
+    cached_layers: Vec<LayerState>,
+    prepared_layers: Vec<LayerState>,
 }
 
 impl std::fmt::Debug for ViewportHost {
@@ -177,6 +186,9 @@ impl ViewportHost {
             active_output: ActiveOutput::StaticCache,
             static_valid: false,
             pending_reallocated: false,
+            streaming_pending: false,
+            cached_layers: Vec::new(),
+            prepared_layers: Vec::new(),
         }
     }
 
@@ -431,6 +443,13 @@ impl ViewportHost {
                 stats.streaming_pending = true;
             }
         }
+        let was_streaming = std::mem::replace(&mut self.streaming_pending, stats.streaming_pending);
+        if self.config.mode == ViewportMode::OnDemand {
+            self.update_layer_cache(layers);
+            if was_streaming || stats.streaming_pending {
+                self.dirty.insert(DirtyFlags::STATIC_SCENE);
+            }
+        }
 
         let has_outline_layers = layers
             .iter()
@@ -528,6 +547,50 @@ impl ViewportHost {
         }
 
         stats
+    }
+
+    fn update_layer_cache<W>(&mut self, layers: &[&mut dyn ViewportLayer<W>]) {
+        self.prepared_layers.clear();
+        self.prepared_layers
+            .extend(layers.iter().map(|layer| LayerState {
+                id: layer.id(),
+                phases: layer.phases(),
+                revision: layer.revision(),
+            }));
+
+        let static_phases = DrawPhaseMask::OPAQUE.union(DrawPhaseMask::TRANSPARENT);
+        let dynamic_phases = DrawPhaseMask::OUTLINE_MASK
+            .union(DrawPhaseMask::GIZMO)
+            .union(DrawPhaseMask::OVERLAY);
+        let static_layer = |state: &LayerState| {
+            let phases = state.phases.intersection(static_phases);
+            (phases != DrawPhaseMask::NONE).then_some((
+                state.id,
+                phases,
+                state.revision.static_scene,
+            ))
+        };
+        let dynamic_layer = |state: &LayerState| {
+            let phases = state.phases.intersection(dynamic_phases);
+            (phases != DrawPhaseMask::NONE).then_some((state.id, phases, state.revision.dynamic))
+        };
+        if self
+            .cached_layers
+            .iter()
+            .filter_map(static_layer)
+            .ne(self.prepared_layers.iter().filter_map(static_layer))
+        {
+            self.dirty.insert(DirtyFlags::STATIC_SCENE);
+        }
+        if self
+            .cached_layers
+            .iter()
+            .filter_map(dynamic_layer)
+            .ne(self.prepared_layers.iter().filter_map(dynamic_layer))
+        {
+            self.dirty.insert(DirtyFlags::OVERLAY);
+        }
+        std::mem::swap(&mut self.cached_layers, &mut self.prepared_layers);
     }
 
     #[allow(clippy::too_many_arguments)]

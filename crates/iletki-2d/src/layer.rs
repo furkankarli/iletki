@@ -5,7 +5,8 @@ use crate::spatial::{TileRange, bucket_plain, bucket_wide};
 use crate::vertex::{DrawStyle2D, Vertex2D, WideVertex2D, push_wide_segment};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Vec2};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+    wgpu,
 };
 
 /// CPU-side batch of compact split-precision 2D primitives ready to upload into a [`Scene2DLayer`].
@@ -168,6 +169,7 @@ struct Pipelines {
 /// 64-bit GPU picking.
 pub struct Scene2DLayer {
     layer_id: u16,
+    revision: LayerRevision,
     pipelines: Option<Pipelines>,
     // Static scene paged pools
     triangles: PagedBuffer<Vertex2D>,
@@ -202,6 +204,7 @@ impl Scene2DLayer {
     pub fn new(layer_id: u16) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
             pipelines: None,
             triangles: PagedBuffer::new("iletki-2d fills", 3),
             wide: PagedBuffer::new("iletki-2d wide", 6),
@@ -220,13 +223,14 @@ impl Scene2DLayer {
     /// existing GPU page buffers when capacity fits and attaching any spatial tiles computed by
     /// [`Mesh2D::optimize_spatial`].
     ///
-    /// Mark `DirtyFlags::STATIC_SCENE` on the hosting `ViewportHost`.
+    /// Every viewport using this layer refreshes its cached scene on the next frame.
     pub fn upload_static_mesh(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: &Mesh2D,
     ) {
+        self.revision.mark_static();
         self.triangles
             .upload_direct_tiled(device, queue, &mesh.triangles, &mesh.triangle_tiles);
         self.wide
@@ -244,6 +248,7 @@ impl Scene2DLayer {
     /// Replaces the entire static 2D scene with `mesh` (queued for `UploadBudget`-throttled upload
     /// during `prepare`).
     pub fn set_static_mesh(&mut self, mesh: &Mesh2D) {
+        self.revision.mark_static();
         self.triangles.replace_all(&mesh.triangles);
         self.wide.replace_all(&mesh.wide);
         self.lines.replace_all(&mesh.lines);
@@ -254,6 +259,7 @@ impl Scene2DLayer {
 
     /// Inserts an incremental static geometry chunk and returns its [`Chunk2DHandle`].
     pub fn insert_chunk(&mut self, mesh: &Mesh2D) -> Chunk2DHandle {
+        self.revision.mark_static();
         Chunk2DHandle {
             lines: self.lines.insert(&mesh.lines),
             triangles: self.triangles.insert(&mesh.triangles),
@@ -266,6 +272,7 @@ impl Scene2DLayer {
 
     /// Updates an existing incremental chunk in place (or reallocates individual pools if grown).
     pub fn update_chunk(&mut self, handle: Chunk2DHandle, mesh: &Mesh2D) -> Chunk2DHandle {
+        self.revision.mark_static();
         let lines = match handle.lines {
             Some(s) => self.lines.update(s, &mesh.lines),
             None => self.lines.insert(&mesh.lines),
@@ -302,6 +309,7 @@ impl Scene2DLayer {
 
     /// Removes an incremental chunk from the static scene without rebuilding other pages.
     pub fn remove_chunk(&mut self, handle: Chunk2DHandle) {
+        self.revision.mark_static();
         if let Some(s) = handle.lines {
             self.lines.remove(s);
         }
@@ -324,6 +332,7 @@ impl Scene2DLayer {
 
     /// Zero-copy immediate upload of dynamic 2D overlay geometry.
     pub fn upload_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh2D) {
+        self.revision.mark_dynamic();
         self.overlay_triangles
             .upload_direct(device, queue, &mesh.triangles);
         self.overlay_wide.upload_direct(device, queue, &mesh.wide);
@@ -333,6 +342,7 @@ impl Scene2DLayer {
 
     /// Replaces the dynamic 2D overlay geometry (crosshair, snaps, selection box, highlights).
     pub fn set_overlay(&mut self, mesh: &Mesh2D) {
+        self.revision.mark_dynamic();
         self.overlay_triangles.replace_all(&mesh.triangles);
         self.overlay_wide.replace_all(&mesh.wide);
         self.overlay_lines.replace_all(&mesh.lines);
@@ -341,6 +351,7 @@ impl Scene2DLayer {
 
     /// Clears all dynamic overlay geometry.
     pub fn clear_overlay(&mut self) {
+        self.revision.mark_dynamic();
         self.overlay_triangles.clear();
         self.overlay_wide.clear();
         self.overlay_lines.clear();
@@ -539,8 +550,18 @@ impl<W> ViewportLayer<W> for Scene2DLayer {
         mask
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
         self.ensure_pipelines(ctx);
+        if self.triangles.has_pending_uploads()
+            || self.wide.has_pending_uploads()
+            || self.lines.has_pending_uploads()
+        {
+            self.revision.mark_static();
+        }
         let mut pending = false;
         pending |= self.triangles.flush(ctx.device, ctx.queue, ctx.budget);
         pending |= self.wide.flush(ctx.device, ctx.queue, ctx.budget);

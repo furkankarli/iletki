@@ -160,6 +160,12 @@ impl DrawPhaseMask {
         Self(self.0 | other.0)
     }
 
+    /// Keeps only the phases present in both masks.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     /// Returns `true` if `phase` is enabled in this mask.
     #[must_use]
     pub const fn contains(self, phase: DrawPhase) -> bool {

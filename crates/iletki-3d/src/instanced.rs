@@ -7,7 +7,9 @@ use bytemuck::{Pod, Zeroable};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer};
+use iletki_wgpu::{
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportLayer,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -63,6 +65,8 @@ struct ViewportBinding {
 /// picking and simultaneous multi-viewport sharing.
 pub struct InstancedMesh3DLayer {
     layer_id: u16,
+    revision: LayerRevision,
+    prepared_origin: Option<Vec3>,
     /// Shared `f64` world origin of all instances in this batch.
     pub origin: Vec3,
     prototype: Option<Mesh3D>,
@@ -92,6 +96,8 @@ impl InstancedMesh3DLayer {
     pub fn new(layer_id: u16, origin: Vec3, prototype: Mesh3D) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
+            prepared_origin: None,
             origin: if origin.is_finite() {
                 origin
             } else {
@@ -111,6 +117,7 @@ impl InstancedMesh3DLayer {
     /// Replaces the instance list (uploaded on the next `prepare`).
     pub fn set_instances(&mut self, instances: Vec<Instance3D>) {
         self.pending_instances = Some(instances);
+        self.revision.mark_static();
     }
 
     /// Returns the number of uploaded instances.
@@ -283,7 +290,15 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
         }
     }
 
+    fn revision(&self) -> LayerRevision {
+        self.revision
+    }
+
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
+        if self.prepared_origin != Some(self.origin) {
+            self.prepared_origin = Some(self.origin);
+            self.revision.mark_static();
+        }
         self.ensure_pipelines(ctx);
         let Some(p) = &self.pipelines else {
             return false;

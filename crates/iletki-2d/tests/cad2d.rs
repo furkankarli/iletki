@@ -7,7 +7,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use iletki_2d::{DrawStyle2D, Mesh2D, Scene2DLayer, order_to_depth};
-use iletki_core::{Camera, DirtyFlags, PickId, Vec2, ViewportMode};
+use iletki_core::{Camera, PickId, UploadBudget, Vec2, ViewportMode};
 use iletki_wgpu::{ViewportConfig, ViewportHost, ViewportLayer, wgpu};
 use std::future::Future;
 use std::pin::Pin;
@@ -131,7 +131,6 @@ fn national_grid_2d_render_incremental_update_overlay_and_pick() {
         DrawStyle2D::new([255, 255, 0, 255], false, order_to_depth(0, 10), left_id),
     );
     let _left_handle = scene.update_chunk(left_handle, &left_yellow);
-    host.mark_dirty(DirtyFlags::STATIC_SCENE);
 
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
@@ -153,7 +152,6 @@ fn national_grid_2d_render_incremental_update_overlay_and_pick() {
         DrawStyle2D::new([255, 0, 0, 255], false, 0.995, PickId::NONE),
     );
     scene.set_overlay(&overlay);
-    host.mark_dirty(DirtyFlags::OVERLAY);
 
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     let overlay_stats = {
@@ -171,4 +169,68 @@ fn national_grid_2d_render_incremental_update_overlay_and_pick() {
     assert_eq!(img3.pixel(64, 64), Some([255, 0, 0, 255]));
     assert_eq!(img3.pixel(34, 50), Some([255, 255, 0, 255]));
     assert_eq!(img3.pixel(94, 50), Some([0, 0, 255, 255]));
+}
+
+#[test]
+fn progressive_uploads_refresh_every_viewport_cache() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let config = ViewportConfig {
+        initial_px: [128, 128],
+        msaa_samples: 1,
+        color_format: wgpu::TextureFormat::Rgba8Unorm,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        upload_budget: UploadBudget {
+            max_bytes_per_frame: 144,
+            ..UploadBudget::default()
+        },
+        ..ViewportConfig::default()
+    };
+    let mut first = ViewportHost::new(&device, config);
+    let mut second = ViewportHost::new(&device, config);
+    let mut scene = Scene2DLayer::new(1);
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene2DLayer| {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [scene];
+        let frame = host.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+        let stats = frame.stats;
+        queue.submit([encoder.finish()]);
+        stats
+    };
+    render(&mut first, &mut scene);
+    render(&mut second, &mut scene);
+
+    for x in [-30.0, 30.0] {
+        let mut mesh = Mesh2D::default();
+        mesh.push_rect_fill(
+            Vec2::new(x - 5.0, -5.0),
+            Vec2::new(x + 5.0, 5.0),
+            DrawStyle2D::new([255, 0, 0, 255], false, 0.5, PickId::NONE),
+        );
+        scene.insert_chunk(&mesh);
+    }
+    let partial = render(&mut first, &mut scene);
+    assert!(partial.streaming_pending && partial.static_rebuilt);
+    assert_eq!(
+        first
+            .readback_rgba_blocking(&device, &queue)
+            .unwrap()
+            .pixel(94, 64),
+        Some([0, 0, 0, 255])
+    );
+
+    let complete = render(&mut second, &mut scene);
+    assert!(!complete.streaming_pending && complete.static_rebuilt);
+    assert!(render(&mut first, &mut scene).static_rebuilt);
+    assert_eq!(
+        first
+            .readback_rgba_blocking(&device, &queue)
+            .unwrap()
+            .pixel(94, 64),
+        Some([255, 0, 0, 255])
+    );
+    assert!(!render(&mut first, &mut scene).static_rebuilt);
+    assert!(!render(&mut second, &mut scene).static_rebuilt);
 }

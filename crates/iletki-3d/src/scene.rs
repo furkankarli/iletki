@@ -8,8 +8,8 @@ use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx,
-    ViewportLayer,
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx,
+    PrepareCtx, ViewportLayer,
 };
 
 #[repr(C)]
@@ -62,6 +62,7 @@ struct Pipelines {
 /// simultaneous multi-viewport quad views in a single `CommandEncoder`.
 pub struct Scene3DLayer {
     layer_id: u16,
+    revision: LayerRevision,
     pipelines: Option<Pipelines>,
     chunks: Vec<Option<ChunkEntry>>,
 }
@@ -81,6 +82,7 @@ impl Scene3DLayer {
     pub fn new(layer_id: u16) -> Self {
         Self {
             layer_id,
+            revision: LayerRevision::new(),
             pipelines: None,
             chunks: Vec::new(),
         }
@@ -88,6 +90,7 @@ impl Scene3DLayer {
 
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
     pub fn insert(&mut self, mesh: Mesh3D) -> Chunk3DId {
+        self.revision.mark_static();
         let entry = ChunkEntry {
             origin: mesh.origin,
             local_bounds: mesh.local_bounds,
@@ -119,6 +122,7 @@ impl Scene3DLayer {
             && let Some(Some(entry)) = self.chunks.get_mut(id.0)
         {
             entry.origin = origin;
+            self.revision.mark_static();
         }
     }
 
@@ -126,6 +130,7 @@ impl Scene3DLayer {
     pub fn set_visible(&mut self, id: Chunk3DId, visible: bool) {
         if let Some(Some(entry)) = self.chunks.get_mut(id.0) {
             entry.visible = visible;
+            self.revision.mark_static();
         }
     }
 
@@ -137,6 +142,7 @@ impl Scene3DLayer {
     pub fn set_selected(&mut self, id: Chunk3DId, selected: bool) {
         if let Some(Some(entry)) = self.chunks.get_mut(id.0) {
             entry.selected = selected;
+            self.revision.mark_dynamic();
         }
     }
 
@@ -151,6 +157,7 @@ impl Scene3DLayer {
 
     /// Clears selection on all chunks.
     pub fn clear_selection(&mut self) {
+        self.revision.mark_dynamic();
         for chunk in self.chunks.iter_mut().flatten() {
             chunk.selected = false;
         }
@@ -160,6 +167,7 @@ impl Scene3DLayer {
     pub fn remove(&mut self, id: Chunk3DId) {
         if let Some(slot) = self.chunks.get_mut(id.0) {
             *slot = None;
+            self.revision.mark_static();
         }
     }
 
@@ -409,6 +417,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             mask = mask.union(DrawPhaseMask::OUTLINE_MASK);
         }
         mask
+    }
+
+    fn revision(&self) -> LayerRevision {
+        self.revision
     }
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
