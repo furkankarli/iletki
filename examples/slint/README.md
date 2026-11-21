@@ -1,6 +1,7 @@
 # iletki in Slint
 
 Run from the repository root on a desktop with a `wgpu` adapter.
+On Ubuntu, install `libfontconfig-dev` for the Slint build.
 
 ```sh
 cargo run --locked --manifest-path examples/slint/Cargo.toml
