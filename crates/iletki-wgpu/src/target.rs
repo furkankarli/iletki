@@ -111,9 +111,9 @@ impl TargetSet {
         format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) -> Self {
-        let sizing = BlockSizing::new(initial_px);
-        let [w, h] = sizing.current().allocated_px;
-        Self::allocate(device, blit, sizing, [w, h], format, msaa_samples)
+        let sizing =
+            BlockSizing::with_max_dimension(initial_px, device.limits().max_texture_dimension_2d);
+        Self::allocate(device, blit, sizing, format, msaa_samples)
     }
 
     /// Updates active size and reallocates backing textures only when crossing a 256 px block or
@@ -127,15 +127,7 @@ impl TargetSet {
         if !self.sizing.request(requested_px) {
             return false;
         }
-        let alloc = self.sizing.current().allocated_px;
-        *self = Self::allocate(
-            device,
-            blit,
-            self.sizing,
-            alloc,
-            self.format,
-            self.msaa_samples,
-        );
+        *self = Self::allocate(device, blit, self.sizing, self.format, self.msaa_samples);
         true
     }
 
@@ -143,13 +135,10 @@ impl TargetSet {
         device: &wgpu::Device,
         blit: &BlitResources,
         sizing: BlockSizing,
-        [width, height]: [u32; 2],
         format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) -> Self {
-        let max_dim = device.limits().max_texture_dimension_2d.max(1);
-        let width = width.clamp(1, max_dim);
-        let height = height.clamp(1, max_dim);
+        let [width, height] = sizing.current().allocated_px;
         let size = wgpu::Extent3d {
             width,
             height,

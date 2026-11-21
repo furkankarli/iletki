@@ -18,7 +18,7 @@ const SHRINK_HYSTERESIS_FRAMES: u32 = 60;
 pub struct TargetSize {
     /// Active viewport extent in physical pixels (always `>= 1`).
     pub active_px: [u32; 2],
-    /// Backing GPU texture extent in physical pixels (aligned up to [`BLOCK_ALIGN_PX`]).
+    /// Backing GPU texture extent in physical pixels (block-aligned up to the configured limit).
     pub allocated_px: [u32; 2],
     /// Normalized texture coordinate ceiling `(active / allocated)` for zero-copy UV cropping.
     pub uv_max: [f32; 2],
@@ -29,6 +29,7 @@ pub struct TargetSize {
 pub struct BlockSizing {
     active: [u32; 2],
     allocated: [u32; 2],
+    max_dimension: u32,
     shrink_countdown: u32,
 }
 
@@ -42,11 +43,21 @@ impl BlockSizing {
     /// Creates a new sizing tracker initialized for `initial_px`.
     #[must_use]
     pub fn new(initial_px: [u32; 2]) -> Self {
-        let [aw, ah] = clamp_active(initial_px);
-        let allocated = [align_up(aw), align_up(ah)];
+        Self::with_max_dimension(initial_px, MAX_TARGET_DIM)
+    }
+
+    /// Creates a sizing tracker capped at a GPU's maximum texture dimension.
+    ///
+    /// A limit smaller than a block or between blocks takes precedence over alignment.
+    #[must_use]
+    pub fn with_max_dimension(initial_px: [u32; 2], max_dimension: u32) -> Self {
+        let max_dimension = max_dimension.clamp(1, MAX_TARGET_DIM);
+        let active = initial_px.map(|px| px.clamp(1, max_dimension));
+        let allocated = active.map(|px| align_up(px, max_dimension));
         Self {
-            active: [aw, ah],
+            active,
             allocated,
+            max_dimension,
             shrink_countdown: 0,
         }
     }
@@ -67,9 +78,8 @@ impl BlockSizing {
     ///
     /// Returns `true` if the backing GPU texture must be reallocated.
     pub fn request(&mut self, requested_px: [u32; 2]) -> bool {
-        let [aw, ah] = clamp_active(requested_px);
-        self.active = [aw, ah];
-        let [nw, nh] = [align_up(aw), align_up(ah)];
+        self.active = requested_px.map(|px| px.clamp(1, self.max_dimension));
+        let [nw, nh] = self.active.map(|px| align_up(px, self.max_dimension));
         let [bw, bh] = self.allocated;
 
         if nw > bw || nh > bh {
@@ -92,18 +102,8 @@ impl BlockSizing {
     }
 }
 
-fn clamp_active([w, h]: [u32; 2]) -> [u32; 2] {
-    [w.clamp(1, MAX_TARGET_DIM), h.clamp(1, MAX_TARGET_DIM)]
-}
-
-fn align_up(px: u32) -> u32 {
-    let rem = px % BLOCK_ALIGN_PX;
-    let aligned = if rem == 0 {
-        px
-    } else {
-        px.saturating_add(BLOCK_ALIGN_PX - rem)
-    };
-    aligned.clamp(BLOCK_ALIGN_PX, MAX_TARGET_DIM)
+fn align_up(px: u32, max_dimension: u32) -> u32 {
+    (px.div_ceil(BLOCK_ALIGN_PX) * BLOCK_ALIGN_PX).min(max_dimension)
 }
 
 #[cfg(test)]
@@ -151,6 +151,21 @@ mod tests {
         assert_eq!(
             sizing.current().allocated_px,
             [MAX_TARGET_DIM, MAX_TARGET_DIM]
+        );
+    }
+
+    #[test]
+    fn device_limit_takes_precedence_over_block_alignment() {
+        let mut sizing = BlockSizing::with_max_dimension([1, 5], 500);
+        assert!(sizing.request([501, 5]));
+        assert_eq!(sizing.current().active_px, [500, 5]);
+        assert_eq!(sizing.current().allocated_px, [500, 256]);
+        assert!(!sizing.request([u32::MAX, 5]));
+        assert_eq!(
+            BlockSizing::with_max_dimension([u32::MAX, 1], 64)
+                .current()
+                .allocated_px,
+            [64, 64],
         );
     }
 }

@@ -269,7 +269,8 @@ impl ViewportHost {
         Vec2::new(f64::from(w) * inv, f64::from(h) * inv)
     }
 
-    /// Updates physical pixel dimensions and DPI scale.
+    /// Updates physical pixel dimensions and DPI scale. The physical size is capped at the
+    /// device's maximum texture dimension, which is reflected in [`Self::size`].
     ///
     /// Reallocates backing GPU textures only when crossing a 256 px block boundary or after the
     /// shrink hysteresis window.
@@ -897,8 +898,9 @@ impl ViewportHost {
             return Err(ViewportError::ZeroSize);
         }
 
-        let id_layout = StagingLayout::compute(w, h, 8)?;
-        let depth_layout = StagingLayout::compute(w, h, 4)?;
+        let max_buffer_size = device.limits().max_buffer_size;
+        let id_layout = StagingLayout::compute(w, h, 8, max_buffer_size)?;
+        let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
 
         let logical = self.logical_size();
         self.camera_gpu
@@ -999,7 +1001,12 @@ struct StagingLayout {
 }
 
 impl StagingLayout {
-    fn compute(width: u32, height: u32, bytes_per_pixel: u32) -> Result<Self, ViewportError> {
+    fn compute(
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        max_buffer_size: u64,
+    ) -> Result<Self, ViewportError> {
         if width == 0 || height == 0 {
             return Err(ViewportError::ZeroSize);
         }
@@ -1014,7 +1021,7 @@ impl StagingLayout {
         let total_bytes = (padded_row as usize)
             .checked_mul(height as usize)
             .ok_or(ViewportError::RegionTooLarge)?;
-        if total_bytes > MAX_READBACK_BYTES {
+        if total_bytes > MAX_READBACK_BYTES || total_bytes as u64 > max_buffer_size {
             return Err(ViewportError::RegionTooLarge);
         }
         Ok(Self {
@@ -1253,7 +1260,12 @@ fn readback_texture_2d_blocking(
     bytes_per_pixel: u32,
 ) -> Result<Vec<u8>, ViewportError> {
     let [_, _, width, height] = rect;
-    let layout = StagingLayout::compute(width, height, bytes_per_pixel)?;
+    let layout = StagingLayout::compute(
+        width,
+        height,
+        bytes_per_pixel,
+        device.limits().max_buffer_size,
+    )?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("iletki readback copy"),
     });
