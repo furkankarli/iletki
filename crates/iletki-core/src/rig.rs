@@ -156,7 +156,7 @@ impl CameraRig for Cad2DRig {
 /// Rotation style for [`OrbitRig`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OrbitMode {
-    /// Turntable orbit around a fixed world up axis (Blender / Rhino / CAD default).
+    /// Turntable orbit around a fixed world up axis.
     #[default]
     Turntable,
     /// Free trackball orbit without a locked up axis.
@@ -370,7 +370,7 @@ impl CameraRig for OrbitRig {
     }
 }
 
-/// First-person 3D fly controller (Unreal / architectural walkthrough style).
+/// First-person camera controller for free flight through a 3D scene.
 ///
 /// Hold secondary (right) mouse button to look around and fly with `W/A/S/D/Q/E`; scroll adjusts
 /// movement speed.

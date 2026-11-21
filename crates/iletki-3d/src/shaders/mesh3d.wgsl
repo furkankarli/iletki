@@ -96,8 +96,8 @@ fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) v
     // darker so cutaway cavities read cleanly like professional CAD/BIM viewports.
     let n = select(-n_raw, n_raw, is_front);
     let view_dir = normalize(-in.pos_rel);
-    // Studio / Blender Workbench style 3-point + hemisphere + subtle headlight shading so every
-    // face stays crisp and readable from any orbit angle.
+    // Combine key and fill lights, hemispherical ambient light, and a view-aligned light
+    // to keep faces readable as the camera orbits.
     let key_dir = normalize(vec3<f32>(0.45, 0.35, 0.82));
     let fill_dir = normalize(vec3<f32>(-0.6, -0.5, 0.3));
     let hemi = mix(0.22, 0.36, n.z * 0.5 + 0.5);
