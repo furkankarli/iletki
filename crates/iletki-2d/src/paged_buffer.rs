@@ -9,8 +9,8 @@
 use crate::spatial::TileRange;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds2, UploadBudget};
-use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
+use iletki_wgpu::{UploadTracker, wgpu};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +85,11 @@ struct PendingWrite {
     offset_verts: usize,
     bytes: Vec<u8>,
     picks: Option<Vec<[u32; 2]>>,
+}
+
+pub(crate) struct FlushOutcome {
+    pub(crate) pending: bool,
+    pub(crate) changed: bool,
 }
 
 /// Paged GPU vertex buffer supporting both zero-copy bulk loads and incremental slot updates under
@@ -466,53 +471,83 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
         queue: &wgpu::Queue,
         budget: UploadBudget,
     ) -> bool {
-        let stride = std::mem::size_of::<V>().max(1) as u64;
-        for page in &mut self.pages {
-            if page.gpu.is_none() && page.capacity_verts > 0 {
-                let size = (page.capacity_verts as u64)
-                    .saturating_mul(stride)
-                    .min(device.limits().max_buffer_size);
-                page.gpu = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(self.label),
-                    size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-        }
+        self.flush_with(device, queue, &mut UploadTracker::new(budget))
+            .pending
+    }
 
-        let mut uploaded = 0usize;
-        let mut remaining = Vec::new();
-        for write in self.pending.drain(..) {
-            if uploaded > 0
-                && uploaded.saturating_add(write.bytes.len()) > budget.max_bytes_per_frame
+    pub(crate) fn flush_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        budget: &mut UploadTracker,
+    ) -> FlushOutcome {
+        let stride = size_of::<V>();
+        if stride == 0 {
+            self.pending.clear();
+            return FlushOutcome {
+                pending: false,
+                changed: false,
+            };
+        }
+        let max_buffer_size = device.limits().max_buffer_size;
+        let mut pending = std::mem::take(&mut self.pending).into_iter();
+        let mut changed = false;
+        while let Some(write) = pending.next() {
+            let Some(page) = self.pages.get_mut(write.page) else {
+                continue;
+            };
+            let capacity_bytes = (page.capacity_verts as u64)
+                .saturating_mul(stride as u64)
+                .min(max_buffer_size);
+            let byte_offset = (write.offset_verts as u64).saturating_mul(stride as u64);
+            let end = byte_offset.saturating_add(write.bytes.len() as u64);
+            if end > capacity_bytes
+                || !byte_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                || !(write.bytes.len() as u64).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
             {
-                remaining.push(write);
                 continue;
             }
-            if let Some(page) = self.pages.get_mut(write.page)
-                && let Some(buf) = &page.gpu
-            {
-                let byte_offset = (write.offset_verts as u64).saturating_mul(stride);
-                let end = byte_offset.saturating_add(write.bytes.len() as u64);
-                if end <= buf.size() {
-                    queue.write_buffer(buf, byte_offset, &write.bytes);
-                    if write.picks.is_some() && page.pick_gpu.is_none() {
-                        let capacity = usize::try_from(buf.size() / stride).unwrap_or(0);
-                        page.pick_gpu = Some(create_pick_buffer(device, capacity));
-                    }
-                    if let Some(pick_buffer) = &page.pick_gpu {
-                        let count = write.bytes.len() / stride as usize;
-                        let ids = write.picks.unwrap_or_else(|| vec![[0; 2]; count]);
-                        let offset = write.offset_verts as u64 * PICK_ID_BYTES;
-                        queue.write_buffer(pick_buffer, offset, bytemuck::cast_slice(&ids));
-                    }
-                    uploaded = uploaded.saturating_add(write.bytes.len());
-                }
+
+            let count = write.bytes.len() / stride;
+            let has_picks = write.picks.is_some() || page.pick_gpu.is_some();
+            let pick_bytes = if has_picks {
+                count.saturating_mul(size_of::<[u32; 2]>())
+            } else {
+                0
+            };
+            if !budget.reserve(write.bytes.len().saturating_add(pick_bytes)) {
+                self.pending.push(write);
+                self.pending.extend(pending);
+                break;
             }
+
+            let buf = page.gpu.get_or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(self.label),
+                    size: capacity_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            queue.write_buffer(buf, byte_offset, &write.bytes);
+            if has_picks {
+                let pick_buffer = page.pick_gpu.get_or_insert_with(|| {
+                    create_pick_buffer(
+                        device,
+                        usize::try_from(buf.size() / stride as u64).unwrap_or(0),
+                    )
+                });
+                let ids = write.picks.unwrap_or_else(|| vec![[0; 2]; count]);
+                let offset = write.offset_verts as u64 * PICK_ID_BYTES;
+                queue.write_buffer(pick_buffer, offset, bytemuck::cast_slice(&ids));
+            }
+            budget.finish_upload();
+            changed = true;
         }
-        self.pending = remaining;
-        !self.pending.is_empty()
+        FlushOutcome {
+            pending: !self.pending.is_empty(),
+            changed,
+        }
     }
 
     /// Issues draw calls for all allocated pages into `pass` (binding slot 0).
@@ -528,7 +563,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             let Some(buf) = &page.gpu else {
                 continue;
             };
-            let Ok(count) = u32::try_from(page.high_water_verts) else {
+            let stride = size_of::<V>().max(1) as u64;
+            let available = usize::try_from(buf.size() / stride).unwrap_or(usize::MAX);
+            let drawable = page.high_water_verts.min(available);
+            let Ok(count) = u32::try_from(drawable) else {
                 continue;
             };
             if count == 0 {
@@ -631,7 +669,10 @@ impl<V: Pod + Zeroable> PagedBuffer<V> {
             let (Some(vertices), Some(picks)) = (&page.gpu, &page.pick_gpu) else {
                 continue;
             };
-            let Ok(count) = u32::try_from(page.high_water_verts) else {
+            let stride = size_of::<V>().max(1) as u64;
+            let available = (vertices.size() / stride).min(picks.size() / PICK_ID_BYTES);
+            let drawable = (page.high_water_verts as u64).min(available);
+            let Ok(count) = u32::try_from(drawable) else {
                 continue;
             };
             if count > 0 {

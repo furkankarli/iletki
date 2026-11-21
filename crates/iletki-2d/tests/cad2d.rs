@@ -322,3 +322,49 @@ fn progressive_uploads_refresh_every_viewport_cache() {
     assert!(!render(&mut first, &mut scene).static_rebuilt);
     assert!(!render(&mut second, &mut scene).static_rebuilt);
 }
+
+#[test]
+fn upload_budget_is_shared_by_multiple_layers() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            initial_px: [64, 64],
+            msaa_samples: 1,
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            upload_budget: UploadBudget {
+                max_bytes_per_frame: 144,
+                max_time_ms: f32::INFINITY,
+            },
+            ..ViewportConfig::default()
+        },
+    );
+    let layer_with_box = |id, x| {
+        let mut layer = Scene2DLayer::new(id);
+        let mut mesh = Mesh2D::default();
+        mesh.push_rect_fill(
+            Vec2::new(x - 5.0, -5.0),
+            Vec2::new(x + 5.0, 5.0),
+            DrawStyle2D::new([255, 0, 0, 255], false, 0.5, PickId::NONE),
+        );
+        layer.insert_chunk(&mesh);
+        layer
+    };
+    let mut left = layer_with_box(1, -15.0);
+    let mut right = layer_with_box(2, 15.0);
+    let mut layers: [&mut dyn ViewportLayer<()>; 2] = [&mut left, &mut right];
+    for expected in [true, false] {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let frame = host.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);
+        assert_eq!(frame.stats.streaming_pending, expected);
+        queue.submit([encoder.finish()]);
+        let pixel = host
+            .readback_rgba_blocking(&device, &queue)
+            .unwrap()
+            .pixel(47, 32);
+        assert_eq!(pixel, Some([if expected { 0 } else { 255 }, 0, 0, 255]));
+    }
+}

@@ -308,7 +308,13 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             return false;
         };
 
+        if let Some(proto) = &self.prototype
+            && !ctx.uploads.reserve(size_of_val(proto.vertices.as_slice()))
+        {
+            return true;
+        }
         if let Some(proto) = self.prototype.take() {
+            self.revision.mark_static();
             self.vertex_count = u32::try_from(proto.vertices.len()).unwrap_or(0);
             if self.vertex_count > 0 {
                 self.vertex_buf = Some(ctx.device.create_buffer_init(
@@ -319,9 +325,15 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
                     },
                 ));
             }
+            ctx.uploads.finish_upload();
         }
 
-        if let Some(insts) = self.pending_instances.take() {
+        let pending = self
+            .pending_instances
+            .as_ref()
+            .is_some_and(|instances| !ctx.uploads.reserve(size_of_val(instances.as_slice())));
+        if !pending && let Some(insts) = self.pending_instances.take() {
+            self.revision.mark_static();
             self.instance_count = u32::try_from(insts.len()).unwrap_or(0);
             if self.instance_count > 0 {
                 self.instance_buf = Some(ctx.device.create_buffer_init(
@@ -334,6 +346,7 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             } else {
                 self.instance_buf = None;
             }
+            ctx.uploads.finish_upload();
         }
 
         // Per-ViewportId uniform buffer so 4-way quad views never clobber each other!
@@ -371,7 +384,7 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             ctx.queue
                 .write_buffer(&binding.buf, 0, bytemuck::bytes_of(&u));
         }
-        false
+        pending
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {

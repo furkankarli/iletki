@@ -3,7 +3,7 @@
 
 use crate::blit::{BlitResources, DepthCopyPipeline};
 use crate::error::ViewportError;
-use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, ViewportLayer};
+use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer};
 use crate::outline::OutlineEngine;
 use crate::target::{DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig};
 use crate::uniforms::CameraGpu;
@@ -137,6 +137,7 @@ pub struct ViewportHost {
     static_valid: bool,
     pending_reallocated: bool,
     streaming_pending: bool,
+    upload_clock: Option<fn() -> f64>,
     cached_layers: Vec<LayerState>,
     prepared_layers: Vec<LayerState>,
 }
@@ -189,6 +190,7 @@ impl ViewportHost {
             static_valid: false,
             pending_reallocated: false,
             streaming_pending: false,
+            upload_clock: None,
             cached_layers: Vec::new(),
             prepared_layers: Vec::new(),
         }
@@ -210,6 +212,12 @@ impl ViewportHost {
     #[must_use]
     pub fn config(&self) -> ViewportConfig {
         self.config
+    }
+
+    /// Sets a monotonic, millisecond clock supplied by the host. Web callers can supply their
+    /// browser clock to enforce the soft upload time limit alongside the byte limit.
+    pub fn set_upload_clock(&mut self, clock: Option<fn() -> f64>) {
+        self.upload_clock = clock;
     }
 
     /// Returns the active [`ViewportMode`].
@@ -424,11 +432,12 @@ impl ViewportHost {
         }
         self.camera_gpu.write(queue, cam_data);
 
-        stats.streaming_pending = self.prepare_layers(device, queue, world, layers);
-        let was_streaming = std::mem::replace(&mut self.streaming_pending, stats.streaming_pending);
+        let (pending, untracked_pending) = self.prepare_layers(device, queue, world, layers);
+        stats.streaming_pending = pending;
+        let was_streaming = std::mem::replace(&mut self.streaming_pending, untracked_pending);
         if self.config.mode == ViewportMode::OnDemand {
             self.update_layer_cache(layers);
-            if was_streaming || stats.streaming_pending {
+            if was_streaming || untracked_pending {
                 self.dirty.insert(DirtyFlags::STATIC_SCENE);
             }
         }
@@ -537,7 +546,7 @@ impl ViewportHost {
         queue: &wgpu::Queue,
         world: &W,
         layers: &mut [&mut dyn ViewportLayer<W>],
-    ) -> bool {
+    ) -> (bool, bool) {
         let size = self.targets.size();
         let logical = self.logical_size();
         let mut prep_ctx = PrepareCtx {
@@ -552,15 +561,20 @@ impl ViewportHost {
             logical_size: logical,
             dpi_scale: self.dpi_scale,
             budget: self.config.upload_budget,
+            uploads: UploadTracker::with_clock(self.config.upload_budget, self.upload_clock),
             color_format: self.targets.format(),
             depth_format: DEPTH_FORMAT,
             msaa_samples: self.targets.msaa_samples(),
         };
         let mut pending = false;
+        let mut untracked_pending = false;
         for layer in layers {
-            pending |= layer.prepare(&mut prep_ctx);
+            if layer.prepare(&mut prep_ctx) {
+                pending = true;
+                untracked_pending |= layer.revision() == LayerRevision::default();
+            }
         }
-        pending
+        (pending, untracked_pending)
     }
 
     fn update_layer_cache<W>(&mut self, layers: &[&mut dyn ViewportLayer<W>]) {
@@ -997,7 +1011,7 @@ impl ViewportHost {
         let id_layout = StagingLayout::compute(w, h, 8, max_buffer_size)?;
         let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
 
-        self.streaming_pending |= self.prepare_layers(device, queue, world, layers);
+        self.streaming_pending |= self.prepare_layers(device, queue, world, layers).1;
 
         let logical = self.logical_size();
         self.camera_gpu

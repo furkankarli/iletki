@@ -472,9 +472,22 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         };
         let cam_pos = ctx.camera.position_3d();
         let vp_id = ctx.viewport_id;
+        let mut pending = false;
 
         for chunk in self.chunks.iter_mut().flatten() {
+            if let Some(mesh) = &chunk.pending_mesh {
+                let mut bytes = size_of_val(mesh.vertices.as_slice())
+                    .saturating_add(size_of_val(mesh.edges.as_slice()));
+                if mesh.pick_ids.len() == mesh.vertices.len() {
+                    bytes = bytes.saturating_add(size_of_val(mesh.pick_ids.as_slice()));
+                }
+                if !ctx.uploads.reserve(bytes) {
+                    pending = true;
+                    continue;
+                }
+            }
             if let Some(mesh) = chunk.pending_mesh.take() {
+                self.revision.mark_static();
                 if mesh.vertices.is_empty() {
                     chunk.vertex_buf = None;
                     chunk.vertex_count = 0;
@@ -516,6 +529,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         },
                     ));
                 }
+                ctx.uploads.finish_upload();
             }
 
             if !chunk.per_viewport.iter().any(|b| b.id == vp_id) {
@@ -555,7 +569,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     .write_buffer(&binding.buf, 0, bytemuck::bytes_of(&u));
             }
         }
-        false
+        pending
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {

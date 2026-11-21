@@ -552,28 +552,36 @@ impl<W> ViewportLayer<W> for Scene2DLayer {
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
         self.ensure_pipelines(ctx);
-        if self.triangles.has_pending_uploads()
-            || self.wide.has_pending_uploads()
-            || self.lines.has_pending_uploads()
-        {
+        let mut flush = |pool: &mut PagedBuffer<Vertex2D>| {
+            pool.flush_with(ctx.device, ctx.queue, &mut ctx.uploads)
+        };
+        let overlay_triangles = flush(&mut self.overlay_triangles);
+        let overlay_lines = flush(&mut self.overlay_lines);
+        let outline = self
+            .overlay_wide
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        if overlay_triangles.changed || overlay_lines.changed || outline.changed {
+            self.revision.mark_dynamic();
+        }
+
+        let triangles = self
+            .triangles
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        let wide = self
+            .wide
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        let lines = self
+            .lines
+            .flush_with(ctx.device, ctx.queue, &mut ctx.uploads);
+        if triangles.changed || wide.changed || lines.changed {
             self.revision.mark_static();
         }
-        let mut pending = false;
-        pending |= self.triangles.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.wide.flush(ctx.device, ctx.queue, ctx.budget);
-        pending |= self.lines.flush(ctx.device, ctx.queue, ctx.budget);
-        let _ = self.overlay_triangles.flush(
-            ctx.device,
-            ctx.queue,
-            iletki_core::UploadBudget::UNLIMITED,
-        );
-        let _ =
-            self.overlay_wide
-                .flush(ctx.device, ctx.queue, iletki_core::UploadBudget::UNLIMITED);
-        let _ =
-            self.overlay_lines
-                .flush(ctx.device, ctx.queue, iletki_core::UploadBudget::UNLIMITED);
-        pending
+        overlay_triangles.pending
+            || overlay_lines.pending
+            || outline.pending
+            || triangles.pending
+            || wide.pending
+            || lines.pending
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {

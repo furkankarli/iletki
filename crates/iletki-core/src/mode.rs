@@ -176,7 +176,7 @@ impl DrawPhaseMask {
 /// Per-frame GPU staging budget for progressive streaming of large scenes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UploadBudget {
-    /// Maximum bytes uploaded to the GPU in a single frame.
+    /// Byte allowance for scene uploads in a frame. The first indivisible upload may exceed it.
     pub max_bytes_per_frame: usize,
     /// Soft CPU time cap (milliseconds) spent preparing uploads in a single frame.
     pub max_time_ms: f32,

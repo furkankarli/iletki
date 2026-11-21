@@ -47,6 +47,79 @@ impl ViewportLifetime {
     }
 }
 
+/// Shared byte and CPU time allowance for a preparation pass.
+#[derive(Debug)]
+pub struct UploadTracker {
+    budget: UploadBudget,
+    uploaded: usize,
+    upload_ms: f64,
+    started_upload: Option<f64>,
+    clock: Option<(fn() -> f64, f64)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    started: std::time::Instant,
+}
+
+impl UploadTracker {
+    /// Starts a budget using a native monotonic clock when available.
+    #[must_use]
+    pub fn new(budget: UploadBudget) -> Self {
+        Self::with_clock(budget, None)
+    }
+
+    pub(crate) fn with_clock(budget: UploadBudget, clock: Option<fn() -> f64>) -> Self {
+        let clock = clock.and_then(|clock| {
+            let started = clock();
+            started.is_finite().then_some((clock, started))
+        });
+        Self {
+            budget,
+            uploaded: 0,
+            upload_ms: 0.0,
+            started_upload: None,
+            clock,
+            #[cfg(not(target_arch = "wasm32"))]
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Reserves bytes for the next indivisible upload. One upload can exceed the allowance to
+    /// guarantee progress. Subsequent uploads must fit both the remaining bytes and time.
+    pub fn reserve(&mut self, bytes: usize) -> bool {
+        self.finish_upload();
+        if bytes == 0 {
+            return true;
+        }
+        let total = self.uploaded.saturating_add(bytes);
+        if self.uploaded > 0
+            && (total > self.budget.max_bytes_per_frame
+                || self.upload_ms >= f64::from(self.budget.max_time_ms))
+        {
+            return false;
+        }
+        self.uploaded = total;
+        self.started_upload = Some(self.elapsed_ms());
+        true
+    }
+
+    /// Accounts for CPU time spent staging the reserved upload. Call immediately after staging so
+    /// unrelated work, such as pipeline creation, does not consume the upload time allowance.
+    pub fn finish_upload(&mut self) {
+        if let Some(started) = self.started_upload.take() {
+            self.upload_ms += (self.elapsed_ms() - started).max(0.0);
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        if let Some((clock, start)) = self.clock {
+            return (clock() - start).max(0.0);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(target_arch = "wasm32")]
+        0.0
+    }
+}
+
 /// Context handed to [`ViewportLayer::prepare`] before drawing a frame or pick pass.
 pub struct PrepareCtx<'a, W = ()> {
     pub(crate) viewport_lifetime: &'a Arc<()>,
@@ -71,6 +144,8 @@ pub struct PrepareCtx<'a, W = ()> {
     pub dpi_scale: f32,
     /// Per-frame GPU upload budget for progressive streaming.
     pub budget: UploadBudget,
+    /// Shared allowance for scene uploads. Reserve bytes here before staging geometry.
+    pub uploads: UploadTracker,
     /// Target color texture format.
     pub color_format: wgpu::TextureFormat,
     /// Target depth texture format (`Depth32Float`).
@@ -145,7 +220,7 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
         LayerRevision::default()
     }
 
-    /// Updates GPU resources (pipelines, vertex buffers, instances) within `ctx.budget`.
+    /// Updates GPU resources (pipelines, vertex buffers, instances) within `ctx.uploads`.
     ///
     /// Return `true` if more streaming uploads remain for subsequent frames.
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool;
@@ -155,4 +230,28 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
     /// `@group(0)` is already bound to `ctx.camera_bind_group` and the viewport/scissor is already
     /// constrained to the active sub-rectangle.
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_tracker_enforces_shared_bytes_and_elapsed_time() {
+        static TIME_MS: AtomicU64 = AtomicU64::new(0);
+        fn clock() -> f64 {
+            TIME_MS.load(Ordering::Relaxed) as f64
+        }
+
+        let budget = UploadBudget {
+            max_bytes_per_frame: 100,
+            max_time_ms: 4.0,
+        };
+        let mut tracker = UploadTracker::with_clock(budget, Some(clock));
+        assert!(tracker.reserve(60));
+        assert!(!tracker.reserve(41));
+        assert!(tracker.reserve(39));
+        TIME_MS.store(4, Ordering::Relaxed);
+        assert!(!tracker.reserve(1));
+    }
 }
