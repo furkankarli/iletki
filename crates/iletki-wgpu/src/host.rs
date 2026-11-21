@@ -422,27 +422,7 @@ impl ViewportHost {
         }
         self.camera_gpu.write(queue, cam_data);
 
-        // Let each layer prepare its GPU resources within the per-frame budget.
-        let mut prep_ctx = PrepareCtx {
-            viewport_id: self.id,
-            device,
-            queue,
-            camera: &self.camera,
-            camera_bind_group_layout: self.camera_gpu.layout(),
-            world,
-            active_px: size.active_px,
-            logical_size: logical,
-            dpi_scale: self.dpi_scale,
-            budget: self.config.upload_budget,
-            color_format: self.targets.format(),
-            depth_format: DEPTH_FORMAT,
-            msaa_samples: self.targets.msaa_samples(),
-        };
-        for layer in layers.iter_mut() {
-            if layer.prepare(&mut prep_ctx) {
-                stats.streaming_pending = true;
-            }
-        }
+        stats.streaming_pending = self.prepare_layers(device, queue, world, layers);
         let was_streaming = std::mem::replace(&mut self.streaming_pending, stats.streaming_pending);
         if self.config.mode == ViewportMode::OnDemand {
             self.update_layer_cache(layers);
@@ -547,6 +527,37 @@ impl ViewportHost {
         }
 
         stats
+    }
+
+    fn prepare_layers<W>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &W,
+        layers: &mut [&mut dyn ViewportLayer<W>],
+    ) -> bool {
+        let size = self.targets.size();
+        let logical = self.logical_size();
+        let mut prep_ctx = PrepareCtx {
+            viewport_id: self.id,
+            device,
+            queue,
+            camera: &self.camera,
+            camera_bind_group_layout: self.camera_gpu.layout(),
+            world,
+            active_px: size.active_px,
+            logical_size: logical,
+            dpi_scale: self.dpi_scale,
+            budget: self.config.upload_budget,
+            color_format: self.targets.format(),
+            depth_format: DEPTH_FORMAT,
+            msaa_samples: self.targets.msaa_samples(),
+        };
+        let mut pending = false;
+        for layer in layers {
+            pending |= layer.prepare(&mut prep_ctx);
+        }
+        pending
     }
 
     fn update_layer_cache<W>(&mut self, layers: &[&mut dyn ViewportLayer<W>]) {
@@ -891,9 +902,36 @@ impl ViewportHost {
         })
     }
 
-    /// Executes an on-demand 64-bit ID + Reversed-Z depth picking pass over `rect_px`
-    /// (`[x, y, width, height]` in physical pixels) and returns unique [`PickHit`] results sorted
-    /// nearest-first. Works on both native and `wasm32` / WebGPU targets.
+    /// Prepares the current layers and submits a 64-bit pick over `[x, y, width, height]`
+    /// in physical pixels. The returned request owns its camera snapshot and GPU readback.
+    ///
+    /// Submit any previously encoded frames for this host before calling. On native, drive the
+    /// request with [`PendingPick::try_read`] in the host loop or poll the device while awaiting it.
+    /// WebGPU drives mapping callbacks automatically.
+    pub fn begin_pick_rect<W>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &W,
+        layers: &mut [&mut dyn ViewportLayer<W>],
+        rect_px: [u32; 4],
+    ) -> Result<PendingPick, ViewportError> {
+        let staged = self.submit_pick_rect(device, queue, world, layers, rect_px)?;
+        Ok(PendingPick {
+            #[cfg(not(target_arch = "wasm32"))]
+            device: device.clone(),
+            camera: self.camera.clone(),
+            dpi_scale: self.dpi_scale,
+            id_map: request_staging_map(&staged.id_buf),
+            depth_map: request_staging_map(&staged.depth_buf),
+            staged: Some(staged),
+        })
+    }
+
+    /// Awaits the same request as [`Self::begin_pick_rect`], returning hits nearest-first.
+    ///
+    /// Native callers must keep driving `wgpu` polling while awaiting. For an event loop that
+    /// sleeps between frames, use [`Self::begin_pick_rect`] and schedule [`PendingPick::try_read`].
     pub async fn pick_rect_async<W>(
         &mut self,
         device: &wgpu::Device,
@@ -902,17 +940,8 @@ impl ViewportHost {
         layers: &mut [&mut dyn ViewportLayer<W>],
         rect_px: [u32; 4],
     ) -> Result<Vec<PickHit>, ViewportError> {
-        let staged = self.submit_pick_rect(device, queue, world, layers, rect_px)?;
-        let id_bytes = map_staging_async(device, &staged.id_buf, staged.id_layout).await?;
-        let depth_bytes = map_staging_async(device, &staged.depth_buf, staged.depth_layout).await?;
-        Ok(decode_pick_hits(
-            &self.camera,
-            staged.logical,
-            self.dpi_scale,
-            staged.rect,
-            &id_bytes,
-            &depth_bytes,
-        ))
+        self.begin_pick_rect(device, queue, world, layers, rect_px)?
+            .await
     }
 
     /// Executes an on-demand 64-bit ID + Reversed-Z depth picking pass over `rect_px`
@@ -964,6 +993,8 @@ impl ViewportHost {
         let max_buffer_size = device.limits().max_buffer_size;
         let id_layout = StagingLayout::compute(w, h, 8, max_buffer_size)?;
         let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
+
+        self.streaming_pending |= self.prepare_layers(device, queue, world, layers);
 
         let logical = self.logical_size();
         self.camera_gpu
@@ -1173,40 +1204,98 @@ struct MapState {
     waker: Option<Waker>,
 }
 
-struct MapFuture<'a> {
+/// An in-flight GPU pick. The viewport and its layers can be reused while this request completes.
+pub struct PendingPick {
     #[cfg(not(target_arch = "wasm32"))]
-    device: &'a wgpu::Device,
-    #[cfg(target_arch = "wasm32")]
-    _marker: std::marker::PhantomData<&'a ()>,
-    state: Arc<Mutex<MapState>>,
+    device: wgpu::Device,
+    camera: Camera,
+    dpi_scale: f32,
+    id_map: Arc<Mutex<MapState>>,
+    depth_map: Arc<Mutex<MapState>>,
+    staged: Option<StagedPick>,
 }
 
-impl Future for MapFuture<'_> {
-    type Output = Result<(), ViewportError>;
+impl std::fmt::Debug for PendingPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPick")
+            .field("region", &self.staged.as_ref().map(|staged| staged.rect))
+            .finish()
+    }
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+impl PendingPick {
+    /// Checks for a completed pick, driving one nonblocking GPU poll on native devices.
+    ///
+    /// While this returns `Poll::Pending`, the host can schedule another check without holding
+    /// a borrow of the viewport. A ready result is consumed by this call.
+    pub fn try_read(&mut self) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        self.poll_completion(None)
+    }
+
+    fn poll_completion(
+        &mut self,
+        wake: Option<&Waker>,
+    ) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        let result = self.poll_staged(wake);
+        if result.is_ready() {
+            self.staged = None;
+        }
+        result
+    }
+
+    fn poll_staged(&mut self, wake: Option<&Waker>) -> Poll<Result<Vec<PickHit>, ViewportError>> {
+        if self.staged.is_none() {
+            return Poll::Ready(Err(ViewportError::PickAlreadyRead));
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|_| ViewportError::BufferMapFailed)?;
 
-        let Ok(mut guard) = self.state.lock() else {
-            return Poll::Ready(Err(ViewportError::BufferMapFailed));
-        };
-        if let Some(res) = guard.result.take() {
-            Poll::Ready(res.map_err(|_| ViewportError::BufferMapFailed))
-        } else {
-            guard.waker = Some(cx.waker().clone());
-            Poll::Pending
+        let id_ready = map_is_ready(&self.id_map, wake)?;
+        let depth_ready = map_is_ready(&self.depth_map, wake)?;
+        if !id_ready || !depth_ready {
+            return Poll::Pending;
+        }
+
+        let staged = self.staged.take().ok_or(ViewportError::PickAlreadyRead)?;
+        let id_bytes = extract_mapped_rows(&staged.id_buf, staged.id_layout)?;
+        let depth_bytes = extract_mapped_rows(&staged.depth_buf, staged.depth_layout)?;
+        Poll::Ready(Ok(decode_pick_hits(
+            &self.camera,
+            staged.logical,
+            self.dpi_scale,
+            staged.rect,
+            &id_bytes,
+            &depth_bytes,
+        )))
+    }
+}
+
+impl Future for PendingPick {
+    type Output = Result<Vec<PickHit>, ViewportError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_completion(Some(cx.waker()))
+    }
+}
+
+fn map_is_ready(state: &Mutex<MapState>, wake: Option<&Waker>) -> Result<bool, ViewportError> {
+    let mut guard = state.lock().map_err(|_| ViewportError::BufferMapFailed)?;
+    match &guard.result {
+        Some(Ok(())) => Ok(true),
+        Some(Err(_)) => Err(ViewportError::BufferMapFailed),
+        None => {
+            if let Some(waker) = wake {
+                guard.waker = Some(waker.clone());
+            }
+            Ok(false)
         }
     }
 }
 
-async fn map_staging_async(
-    device: &wgpu::Device,
-    staging: &wgpu::Buffer,
-    layout: StagingLayout,
-) -> Result<Vec<u8>, ViewportError> {
-    #[cfg(target_arch = "wasm32")]
-    let _ = device;
+fn request_staging_map(staging: &wgpu::Buffer) -> Arc<Mutex<MapState>> {
     let state = Arc::new(Mutex::new(MapState {
         result: None,
         waker: None,
@@ -1214,23 +1303,16 @@ async fn map_staging_async(
     let cb_state = Arc::clone(&state);
     staging
         .slice(..)
-        .map_async(wgpu::MapMode::Read, move |res| {
-            if let Ok(mut guard) = cb_state.lock() {
-                guard.result = Some(res);
-                if let Some(waker) = guard.waker.take() {
-                    waker.wake();
-                }
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let wake = cb_state.lock().ok().and_then(|mut guard| {
+                guard.result = Some(result);
+                guard.waker.take()
+            });
+            if let Some(waker) = wake {
+                waker.wake();
             }
         });
-    MapFuture {
-        #[cfg(not(target_arch = "wasm32"))]
-        device,
-        #[cfg(target_arch = "wasm32")]
-        _marker: std::marker::PhantomData,
-        state,
-    }
-    .await?;
-    extract_mapped_rows(staging, layout)
+    state
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1244,7 +1326,9 @@ fn map_staging_blocking(
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|_| ViewportError::BufferMapFailed)?;
     rx.recv()
         .map_err(|_| ViewportError::BufferMapFailed)?
         .map_err(|_| ViewportError::BufferMapFailed)?;

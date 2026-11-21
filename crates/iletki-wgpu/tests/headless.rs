@@ -360,3 +360,34 @@ fn on_demand_caches_static_scene_and_picks_64bit_id() {
     assert_eq!(async_hits[0].id, expected_id);
     assert!((async_hits[0].depth - 0.5).abs() < 1e-4);
 }
+
+#[test]
+fn pick_can_start_before_render_and_outlive_the_viewport() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            msaa_samples: 1,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    );
+    let id = PickId::new(7, 98, 3);
+    let mut layer = SolidQuadLayer::new(id);
+    let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut layer];
+    let mut request = host
+        .begin_pick_rect(&device, &queue, &(), &mut layers, [60, 60, 9, 9])
+        .unwrap();
+    host.resize(&device, [512, 384], 2.0);
+    drop(host);
+    drop(layer);
+
+    let hits = block_on(std::future::poll_fn(|_| request.try_read())).unwrap();
+    assert_eq!(hits.first().map(|hit| hit.id), Some(id));
+    assert_eq!(
+        request.try_read(),
+        Poll::Ready(Err(ViewportError::PickAlreadyRead))
+    );
+}

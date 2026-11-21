@@ -13,6 +13,8 @@ pub enum ViewportError {
     UnsupportedReadbackFormat,
     /// Requested readback or pick region exceeds safe byte limits.
     RegionTooLarge,
+    /// This pick request's result has already been consumed.
+    PickAlreadyRead,
 }
 
 impl fmt::Display for ViewportError {
@@ -24,6 +26,7 @@ impl fmt::Display for ViewportError {
                 f.write_str("readback requires an 8-bit 4-channel RGBA or BGRA texture format")
             }
             Self::RegionTooLarge => f.write_str("requested GPU readback region exceeds size limit"),
+            Self::PickAlreadyRead => f.write_str("pick result has already been read"),
         }
     }
 }
