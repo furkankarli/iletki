@@ -33,39 +33,49 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 fn create_headless_device_with_limits(
     required_limits: wgpu::Limits,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let expected = std::env::var_os("ILETKI_EXPECT_BACKEND");
+    let result = request_headless_device(required_limits, expected.as_deref());
+    assert!(
+        expected.is_none() || result.is_ok(),
+        "could not use the expected {expected:?} backend: {:?}",
+        result.as_ref().err()
+    );
+    result.ok()
+}
+
+#[allow(clippy::print_stderr)] // Include the selected adapter in the CI smoke test output.
+fn request_headless_device(
+    required_limits: wgpu::Limits,
+    expected: Option<&std::ffi::OsStr>,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let options = wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
-        compatible_surface: None,
-        force_fallback_adapter: false,
         ..wgpu::RequestAdapterOptions::default()
-    }))
-    .or_else(|_| {
-        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-            ..wgpu::RequestAdapterOptions::default()
-        }))
-    })
-    .ok()?;
+    };
+    let adapter = block_on(instance.request_adapter(&options))
+        .or_else(|_| {
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                force_fallback_adapter: true,
+                ..options
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let info = adapter.get_info();
+    if let Some(expected) = expected {
+        assert_eq!(info.backend.to_str(), expected, "unexpected GPU backend");
+        eprintln!(
+            "Backend {} using {} ({:?})",
+            info.backend, info.name, info.device_type
+        );
+    }
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki test device"),
         required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
-    .ok()
-}
-
-#[test]
-fn required_headless_backend_is_available() {
-    if std::env::var_os("ILETKI_REQUIRE_GPU_TESTS").is_some() {
-        assert!(
-            create_headless_device().is_some(),
-            "no headless GPU adapter available"
-        );
-    }
+    .map_err(|error| error.to_string())
 }
 
 #[test]

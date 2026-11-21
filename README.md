@@ -92,6 +92,13 @@ Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to crea
 archives and run the standalone egui example from their extracted contents. The example needs a
 working `wgpu` adapter.
 
+## Platform tests
+
+The [CI workflow](.github/workflows/ci.yml) checks rendered pixels and 64-bit picking on
+Linux/Vulkan (Mesa lavapipe), Windows/DX12, macOS/Metal, and Chrome/WebGPU (SwiftShader).
+Each job requires its named backend. These headless tests cover offscreen rendering and picking.
+The standalone egui example also checks compositing into an egui render pass.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or

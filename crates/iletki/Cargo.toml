@@ -15,6 +15,10 @@ wgpu = ["dep:iletki-wgpu"]
 cad2d = ["wgpu", "dep:iletki-2d"]
 cad3d = ["wgpu", "dep:iletki-3d"]
 
+[[example]]
+name = "webgpu_smoke"
+required-features = ["cad2d"]
+
 [dependencies]
 iletki-core.workspace = true
 iletki-wgpu = { workspace = true, optional = true }
