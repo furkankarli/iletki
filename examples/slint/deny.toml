@@ -1,0 +1,89 @@
+# Dependency policy for the standalone Slint desktop demo.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# These are unmaintained notices for dependency paths fixed by Slint 1.19.0.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "Slint core enables chrono for its desktop runtime" },
+    { id = "RUSTSEC-2026-0441", reason = "Slint's compiler macro uses spin_on, which requires pin-utils" },
+    { id = "RUSTSEC-2026-0192", reason = "Slint's winit Wayland decorations use the legacy font parser" },
+    { id = "RUSTSEC-2026-0370", reason = "Slint's Linux backend requires the zbus 5 D-Bus graph" },
+    { id = "RUSTSEC-2026-0371", reason = "Slint's Linux backend requires the zbus 5 D-Bus graph" },
+    { id = "RUSTSEC-2026-0372", reason = "Slint's Linux backend requires the zbus 5 D-Bus graph" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The list is the policy; not every allowed license has to be in use.
+unused-allowed-license = "allow"
+
+# The desktop demo qualifies under Slint’s attribution license. See its README.
+[[licenses.exceptions]]
+crate = "slint@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "slint-macros@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-backend-selector@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-backend-winit@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-common@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-compiler@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-core@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-core-macros@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[[licenses.exceptions]]
+crate = "i-slint-renderer-femtovg@=1.19.0"
+allow = ["LicenseRef-Slint-Royalty-free-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
