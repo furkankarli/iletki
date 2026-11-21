@@ -33,7 +33,8 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 fn create_headless_device_with_limits(
     required_limits: wgpu::Limits,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
         compatible_surface: None,
@@ -55,6 +56,16 @@ fn create_headless_device_with_limits(
         ..wgpu::DeviceDescriptor::default()
     }))
     .ok()
+}
+
+#[test]
+fn required_headless_backend_is_available() {
+    if std::env::var_os("ILETKI_REQUIRE_GPU_TESTS").is_some() {
+        assert!(
+            create_headless_device().is_some(),
+            "no headless GPU adapter available"
+        );
+    }
 }
 
 #[test]
