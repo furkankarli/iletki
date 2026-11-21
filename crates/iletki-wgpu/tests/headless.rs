@@ -8,8 +8,8 @@
 
 use iletki_core::{DirtyFlags, DrawPhase, DrawPhaseMask, PickId, ViewportMode};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportError,
-    ViewportHost, ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PrepareCtx,
+    ViewportConfig, ViewportError, ViewportHost, ViewportLayer, wgpu,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -69,6 +69,74 @@ fn required_headless_backend_is_available() {
 }
 
 #[test]
+fn gpu_configuration_returns_errors_before_creating_pipelines() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let format = wgpu::TextureFormat::Rgba8Uint;
+    let invalid_color = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: format,
+            ..ViewportConfig::default()
+        },
+    );
+    assert_eq!(
+        invalid_color.unwrap_err(),
+        ViewportError::UnsupportedColorFormat(format)
+    );
+
+    let config = ViewportConfig::default();
+    let invalid_samples = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            msaa_samples: 2,
+            ..config
+        },
+    );
+    assert_eq!(
+        invalid_samples.unwrap_err(),
+        ViewportError::UnsupportedSampleCount {
+            format: config.color_format,
+            sample_count: 2,
+        }
+    );
+
+    let mut host = ViewportHost::new(&device, config).unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let pass = PassTargetDesc {
+        format: config.color_format,
+        sample_count: 1,
+        depth_format: Some(format),
+        blend_alpha: false,
+    };
+    assert_eq!(
+        host.prepare_for_pass(&device, &queue, &mut encoder, &(), &mut [], pass),
+        Err(ViewportError::UnsupportedDepthFormat(format)),
+    );
+    assert_eq!(
+        host.prepare_for_pass(
+            &device,
+            &queue,
+            &mut encoder,
+            &(),
+            &mut [],
+            PassTargetDesc {
+                sample_count: 0,
+                depth_format: None,
+                ..pass
+            }
+        ),
+        Err(ViewportError::UnsupportedSampleCount {
+            format: pass.format,
+            sample_count: 0
+        }),
+    );
+    assert!(block_on(scope.pop()).is_none());
+}
+
+#[test]
 fn target_sizing_and_readback_respect_device_limits() {
     let Some((device, queue)) = create_headless_device_with_limits(wgpu::Limits {
         max_texture_dimension_2d: 500,
@@ -83,7 +151,8 @@ fn target_sizing_and_readback_respect_device_limits() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     host.resize(&device, [513, 128], 1.0);
     assert_eq!(host.size().active_px, [500, 128]);
     assert_eq!(host.size().allocated_px, [500, 256]);
@@ -290,7 +359,8 @@ fn on_demand_caches_static_scene_and_picks_64bit_id() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let expected_id = PickId::new(7, 42_001, 19);
     let mut layer = SolidQuadLayer::new(expected_id);
 
@@ -384,7 +454,8 @@ fn pick_can_start_before_render_and_outlive_the_viewport() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let id = PickId::new(7, 98, 3);
     let mut layer = SolidQuadLayer::new(id);
     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut layer];

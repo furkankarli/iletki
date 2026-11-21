@@ -1,5 +1,6 @@
 //! Over-allocated offscreen MSAA, depth, static-cache and picking render targets.
 
+use crate::ViewportError;
 use crate::blit::BlitResources;
 use iletki_core::{BlockSizing, OutlineConfig, TargetSize, UploadBudget, ViewportMode};
 
@@ -11,11 +12,13 @@ pub const PICK_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Configuration for creating a [`crate::ViewportHost`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportConfig {
-    /// Color format of the viewport's offscreen targets (default `Rgba8UnormSrgb`).
+    /// Filterable, blendable floating-point or normalized color attachment with render, sampling
+    /// and copy-source usage. For portable RGBA/BGRA output, use the 8-bit unorm or sRGB formats.
+    /// The default is `Rgba8UnormSrgb`.
     pub color_format: wgpu::TextureFormat,
     /// Multisample anti-aliasing count (`1` or `4`; default `4`).
     pub msaa_samples: u32,
-    /// Background clear color `[r, g, b, a]` in linear space.
+    /// Background clear color `[r, g, b, a]`. RGB is interpreted as sRGB when the target is sRGB.
     pub clear_color: [f64; 4],
     /// Initial scheduling mode (`OnDemand` for CAD/editors, `Continuous` for games/animation).
     pub mode: ViewportMode,
@@ -45,15 +48,34 @@ impl Default for ViewportConfig {
 }
 
 impl ViewportConfig {
-    /// Sanitizes MSAA sample count to a WebGPU-valid value (`1` or `4`).
-    pub(crate) fn sanitized_msaa(&self) -> u32 {
-        if self.msaa_samples >= 4 { 4 } else { 1 }
+    pub(crate) fn validate(&self, device: &wgpu::Device) -> Result<(), ViewportError> {
+        use wgpu::{TextureFormatFeatureFlags as Flags, TextureUsages as Usage};
+
+        let features = color_attachment_features(device, self.color_format, true)?;
+        if !features
+            .allowed_usages
+            .contains(Usage::TEXTURE_BINDING | Usage::COPY_SRC)
+            || !features.flags.contains(Flags::FILTERABLE)
+        {
+            return Err(ViewportError::UnsupportedColorFormat(self.color_format));
+        }
+        validate_samples(self.color_format, features.flags, self.msaa_samples)?;
+        if self.msaa_samples > 1 && !features.flags.contains(Flags::MULTISAMPLE_RESOLVE) {
+            return Err(ViewportError::UnsupportedSampleCount {
+                format: self.color_format,
+                sample_count: self.msaa_samples,
+            });
+        }
+        validate_depth_attachment(device, DEPTH_FORMAT, self.msaa_samples)
     }
 
     /// Returns `wgpu::Color` from sRGB `clear_color`, converting to linear when targeting an sRGB
     /// texture format so colors stay perceptually identical across linear and sRGB targets.
     pub(crate) fn wgpu_clear_color(&self) -> wgpu::Color {
-        let [r, g, b, a] = self.clear_color;
+        let [r, g, b, a] = self
+            .clear_color
+            .map(|channel| if channel.is_finite() { channel } else { 0.0 });
+        let a = a.clamp(0.0, 1.0);
         if self.color_format.is_srgb() {
             let lin = |c: f64| {
                 let c = c.clamp(0.0, 1.0);
@@ -73,6 +95,69 @@ impl ViewportConfig {
             wgpu::Color { r, g, b, a }
         }
     }
+}
+
+pub(crate) fn color_attachment_features(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    blend: bool,
+) -> Result<wgpu::TextureFormatFeatures, ViewportError> {
+    let enabled = device.features();
+    let features = format.guaranteed_format_features(enabled);
+    let fits_color_limit = format
+        .target_pixel_byte_cost()
+        .is_some_and(|bytes| bytes <= device.limits().max_color_attachment_bytes_per_sample);
+    if enabled.contains(format.required_features())
+        && fits_color_limit
+        && matches!(
+            format.sample_type(None, Some(enabled)),
+            Some(wgpu::TextureSampleType::Float { .. })
+        )
+        && features
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        && (!blend
+            || features
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE))
+    {
+        Ok(features)
+    } else {
+        Err(ViewportError::UnsupportedColorFormat(format))
+    }
+}
+
+pub(crate) fn validate_samples(
+    format: wgpu::TextureFormat,
+    flags: wgpu::TextureFormatFeatureFlags,
+    sample_count: u32,
+) -> Result<(), ViewportError> {
+    if matches!(sample_count, 1 | 4) && flags.sample_count_supported(sample_count) {
+        Ok(())
+    } else {
+        Err(ViewportError::UnsupportedSampleCount {
+            format,
+            sample_count,
+        })
+    }
+}
+
+pub(crate) fn validate_depth_attachment(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> Result<(), ViewportError> {
+    let enabled = device.features();
+    let features = format.guaranteed_format_features(enabled);
+    if !format.has_depth_aspect()
+        || !enabled.contains(format.required_features())
+        || !features
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+    {
+        return Err(ViewportError::UnsupportedDepthFormat(format));
+    }
+    validate_samples(format, features.flags, sample_count)
 }
 
 /// Backing textures for a single viewport instance.

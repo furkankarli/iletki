@@ -173,10 +173,13 @@ impl GpuState {
             )
         };
 
-        let vp_main = make_vp([width, height]);
-        let vp_top = make_vp([(width / 2).max(1), (height / 2).max(1)]);
-        let vp_front = make_vp([(width / 2).max(1), (height / 2).max(1)]);
-        let vp_right = make_vp([(width / 2).max(1), (height / 2).max(1)]);
+        let vp_main = make_vp([width, height]).map_err(|e| e.to_string())?;
+        let vp_top =
+            make_vp([(width / 2).max(1), (height / 2).max(1)]).map_err(|e| e.to_string())?;
+        let vp_front =
+            make_vp([(width / 2).max(1), (height / 2).max(1)]).map_err(|e| e.to_string())?;
+        let vp_right =
+            make_vp([(width / 2).max(1), (height / 2).max(1)]).map_err(|e| e.to_string())?;
 
         let (scene_3d, chunks_3d) = build_arch_3d();
         let grid_3d = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
@@ -491,7 +494,7 @@ impl GpuState {
         self.last_frame_time = Instant::now();
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
         let dt = self.last_frame_time.elapsed().as_secs_f64().min(0.1);
         self.last_frame_time = frame_start;
@@ -506,11 +509,11 @@ impl GpuState {
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return,
+            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
         };
         let view = output
             .texture
@@ -535,7 +538,7 @@ impl GpuState {
                     &(),
                     &mut layers,
                     self.pass_desc,
-                );
+                )?;
                 self.vp_main.prepare_for_pass(
                     &self.device,
                     &self.queue,
@@ -543,7 +546,7 @@ impl GpuState {
                     &(),
                     &mut layers,
                     self.pass_desc,
-                );
+                )?;
                 self.vp_front.prepare_for_pass(
                     &self.device,
                     &self.queue,
@@ -551,7 +554,7 @@ impl GpuState {
                     &(),
                     &mut layers,
                     self.pass_desc,
-                );
+                )?;
                 self.vp_right.prepare_for_pass(
                     &self.device,
                     &self.queue,
@@ -559,7 +562,7 @@ impl GpuState {
                     &(),
                     &mut layers,
                     self.pass_desc,
-                );
+                )?;
             }
             let qw = (w / 2) as f32;
             let qh = (h / 2) as f32;
@@ -601,7 +604,7 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    );
+                    )?;
                 }
                 DemoScene::Cad2D => {
                     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.scene_2d];
@@ -612,7 +615,7 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    );
+                    )?;
                 }
                 DemoScene::Instanced100k => {
                     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.instanced_3d];
@@ -623,7 +626,7 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    );
+                    )?;
                 }
             }
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -663,6 +666,7 @@ impl GpuState {
         if self.vp_main.mode() == ViewportMode::Continuous || self.transition.is_active() {
             self.window.request_redraw();
         }
+        Ok(())
     }
 }
 
@@ -843,7 +847,12 @@ impl ApplicationHandler for DemoApp {
                 }
                 s.window.request_redraw();
             }
-            WindowEvent::RedrawRequested => s.render(),
+            WindowEvent::RedrawRequested => {
+                if let Err(error) = s.render() {
+                    eprintln!("viewport rendering failed: {error}");
+                    event_loop.exit();
+                }
+            }
             _ => {}
         }
     }

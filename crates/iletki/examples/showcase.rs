@@ -263,7 +263,8 @@ fn bench_2d_national_grid(
             initial_px: [1024, 768],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .map_err(|e| e.to_string())?;
     *host.camera_mut() = Camera::ortho_2d(origin + Vec2::new(250.0, 250.0), 3.0);
 
     let mut scene = Scene2DLayer::new(1);
@@ -393,7 +394,7 @@ fn render_quad_view_showcase(
     out_dir: &std::path::Path,
 ) -> Result<(), String> {
     println!("\n=== Scenario 2: 4-Way 3D CAD Quad-View (Single CommandEncoder, 4x MSAA) ===");
-    let make_host = |cam: Camera| {
+    let make_host = |cam: Camera| -> Result<ViewportHost, String> {
         let mut h = ViewportHost::new(
             device,
             ViewportConfig {
@@ -408,9 +409,10 @@ fn render_quad_view_showcase(
                 },
                 ..ViewportConfig::default()
             },
-        );
+        )
+        .map_err(|e| e.to_string())?;
         *h.camera_mut() = cam;
-        h
+        Ok(h)
     };
 
     let mut vp_top = make_host(Camera::ortho_3d(
@@ -420,7 +422,7 @@ fn render_quad_view_showcase(
         14.0,
         0.1,
         100.0,
-    ));
+    ))?;
     let mut vp_front = make_host(Camera::ortho_3d(
         Vec3::new(0.0, -20.0, 2.0),
         Vec3::new(0.0, 0.0, 2.0),
@@ -428,7 +430,7 @@ fn render_quad_view_showcase(
         12.0,
         0.1,
         100.0,
-    ));
+    ))?;
     let mut vp_right = make_host(Camera::ortho_3d(
         Vec3::new(20.0, 0.0, 2.0),
         Vec3::new(0.0, 0.0, 2.0),
@@ -436,14 +438,14 @@ fn render_quad_view_showcase(
         12.0,
         0.1,
         100.0,
-    ));
+    ))?;
     let mut vp_persp = make_host(Camera::perspective_3d(
         Vec3::new(9.5, -10.5, 7.5),
         Vec3::new(0.0, 0.0, 1.8),
         Vec3::Z,
         std::f64::consts::FRAC_PI_4,
         0.05,
-    ));
+    ))?;
     // Apply an architectural section plane ONLY on the Right viewport (slices y < 0 away!).
     if let Some(clip) = Plane::from_normal_point(Vec3::Y, Vec3::ZERO) {
         vp_right.camera_mut().set_clip_planes(&[clip]);
@@ -576,7 +578,8 @@ fn bench_instanced_100k(
             initial_px: [800, 600],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     let mut proto = Mesh3D::at_origin(Vec3::ZERO);
     proto.push_box(
@@ -674,7 +677,8 @@ fn bench_resize_hysteresis(device: &wgpu::Device, queue: &wgpu::Queue) -> Result
             initial_px: [600, 480],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .map_err(|e| e.to_string())?;
     let mut reallocs = 0u32;
     let mut last_submission = None;
     let t0 = Instant::now();

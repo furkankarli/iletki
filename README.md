@@ -24,7 +24,7 @@ use iletki::{
 };
 
 // 1. Create a viewport sharing your existing wgpu::Device
-let mut host = ViewportHost::new(&device, ViewportConfig::default());
+let mut host = ViewportHost::new(&device, ViewportConfig::default())?;
 
 // 2. Build a 3D scene anchored at f64 world coordinates
 let mut scene = Scene3DLayer::new(1);
