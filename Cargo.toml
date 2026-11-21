@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.95"
 authors = ["iletki contributors"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/furkankarli/iletki"
 
 [workspace.dependencies]
 # internal

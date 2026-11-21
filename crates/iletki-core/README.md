@@ -7,4 +7,7 @@ picking IDs. This crate has no external runtime dependencies.
 
 [API documentation](https://docs.rs/iletki-core)
 
-Licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.
+[Project and demos](https://github.com/furkankarli/iletki) · [Support iletki](https://github.com/sponsors/furkankarli)
+
+Licensed under either [MIT](https://github.com/furkankarli/iletki/blob/main/LICENSE-MIT) or
+[Apache 2.0](https://github.com/furkankarli/iletki/blob/main/LICENSE-APACHE) at your option.

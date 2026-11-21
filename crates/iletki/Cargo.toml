@@ -1,13 +1,16 @@
 [package]
 name = "iletki"
-description = "Fast, framework-agnostic wgpu viewport for 2D/3D CAD, game editors and visualization"
+description = "Embeddable wgpu viewport for 2D and 3D CAD, GIS, and Rust editors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/iletki"
+keywords = ["viewport", "wgpu", "cad", "gis", "picking"]
+categories = ["graphics", "rendering"]
 
 [features]
 default = ["wgpu", "cad2d", "cad3d"]
