@@ -9,9 +9,9 @@ cargo run --locked --manifest-path examples/slint/Cargo.toml
 Drag with the middle button to pan, scroll to zoom, and click a rectangle to display its 64-bit
 picking ID. Resizing the window updates the offscreen viewport in physical pixels.
 
-Slint 1.19 uses its experimental `unstable-wgpu-30` API to provide the device and queue to
-`ViewportHost`. The demo imports iletki's resolved GPU texture as a Slint `Image` and clips it to
-the active extent. Picking reads back only the selected pixel and completes asynchronously.
+Slint 1.19 uses its experimental `unstable-wgpu-30` API to provide the device and queue to the
+[`iletki-slint` adapter](../../crates/iletki-slint). The adapter handles texture import, resize and
+pixel coordinates for picking. The Slint image clips to the active viewport extent.
 
 ## Check the integration
 
@@ -30,7 +30,8 @@ cargo deny --manifest-path examples/slint/Cargo.toml --config examples/slint/den
 
 ## Licensing
 
-This standalone example uses the published iletki crate. The example source is MIT OR Apache-2.0.
+This standalone example uses iletki and the Slint adapter from this checkout. The example source
+is MIT OR Apache-2.0.
 Slint is used under its Royalty-free Desktop, Mobile, and Web Applications License, which has
 attribution and distribution conditions. The example's dependency policy accepts that license
 for the pinned Slint crates and records maintenance-only advisories for their current

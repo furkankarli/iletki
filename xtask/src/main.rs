@@ -8,13 +8,14 @@ use std::process::{Command, ExitCode};
 type Result<T = ()> = std::result::Result<T, String>;
 
 /// The crates published to crates.io; they must also build for the web.
-const LIBRARIES: [&str; 6] = [
+const LIBRARIES: [&str; 7] = [
     "iletki",
     "iletki-core",
     "iletki-wgpu",
     "iletki-2d",
     "iletki-3d",
     "iletki-egui",
+    "iletki-slint",
 ];
 
 const USAGE: &str = "\

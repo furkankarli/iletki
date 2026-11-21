@@ -83,8 +83,8 @@ The [standalone egui example](examples/egui) shows how to render a viewport thro
 `egui_wgpu` callback and pick an object. It uses registry dependencies. From a checkout, the
 package verification command below runs it against locally built archives.
 
-The [Slint desktop example](examples/slint) imports the viewport texture on Slint's `wgpu 30`
-device and demonstrates panning, zooming, resizing, and picking.
+The [Slint desktop example](examples/slint) uses the `iletki-slint` adapter to display a shared
+`wgpu 30` texture and demonstrate panning, zooming, resizing, and picking.
 
 ## Which crate should I use?
 
@@ -96,6 +96,7 @@ device and demonstrates panning, zooming, resizing, and picking.
 | [`iletki-2d`](crates/iletki-2d) | You need split-precision lines and fills, spatial culling, grids, or overlays for 2D drawings. |
 | [`iletki-3d`](crates/iletki-3d) | You need 3D meshes, instancing, selection outlines, section planes, or transform gizmos. |
 | [`iletki-egui`](crates/iletki-egui) | You use `egui` or `eframe` and want a paint callback and input translation for your viewport. |
+| [`iletki-slint`](crates/iletki-slint) | You use Slint and want GPU texture import, image cropping, DPI handling, and picking. |
 
 The workspace also contains the unpublished `iletki-demo` desktop app and `xtask` development tool.
 See the [architecture guide](docs/architecture.md) for crate layering and renderer integration.
@@ -112,9 +113,10 @@ cargo install --locked cargo-deny
 cargo xtask ci
 ```
 
-Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to create all six crate
-archives and run the standalone egui example from their extracted contents. The example needs a
-working `wgpu` adapter.
+Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to build the archives used
+by the standalone egui example and run it from their extracted contents. The example needs a
+working `wgpu` adapter. Run `cargo package --locked -p iletki-slint` to verify the Slint adapter
+archive against the published iletki dependencies.
 
 ## Platform tests
 

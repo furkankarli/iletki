@@ -10,8 +10,9 @@ use std::task::Poll;
 use iletki::gpu::wgpu;
 use iletki::{
     Cad2DRig, DrawStyle2D, Mesh2D, Modifiers, PendingPick, PickId, PointerButton, Scene2DLayer,
-    ScrollUnit, Vec2, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
+    ScrollUnit, Vec2, ViewportConfig, ViewportInput, ViewportLayer,
 };
+use iletki_slint::SlintViewport;
 use slint::{ComponentHandle, GraphicsAPI, RenderingState};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -99,17 +100,16 @@ slint::slint! {
 }
 
 struct Viewport {
-    host: ViewportHost,
+    viewport: SlintViewport,
     scene: Scene2DLayer,
     rig: Cad2DRig,
     cursor: Option<Vec2>,
-    imported_texture: Option<wgpu::Texture>,
     pick_pos: Option<Vec2>,
     pending_pick: Option<PendingPick>,
 }
 
 impl Viewport {
-    fn new(device: &wgpu::Device) -> Result<Self> {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
         let mut mesh = Mesh2D::default();
         let grid_style = DrawStyle2D::new([41, 57, 79, 255], false, 0.15, PickId::NONE);
         for index in -28..=28 {
@@ -139,8 +139,9 @@ impl Viewport {
         }
         let mut scene = Scene2DLayer::new(1);
         scene.set_static_mesh(&mesh);
-        let host = ViewportHost::new(
+        let viewport = SlintViewport::new(
             device,
+            queue,
             ViewportConfig {
                 color_format: wgpu::TextureFormat::Rgba8Unorm,
                 clear_color: [0.067, 0.098, 0.153, 1.0],
@@ -148,69 +149,41 @@ impl Viewport {
             },
         )?;
         Ok(Self {
-            host,
+            viewport,
             scene,
             rig: Cad2DRig::default(),
             cursor: None,
-            imported_texture: None,
             pick_pos: None,
             pending_pick: None,
         })
     }
 
-    fn render(&mut self, app: &Demo, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    fn render(&mut self, app: &Demo) -> Result<()> {
         let window = app.window();
         let size = window.size();
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
-        let scale = window.scale_factor();
-        self.host.resize(device, [size.width, size.height], scale);
-        let mut encoder = device.create_command_encoder(&Default::default());
+        self.viewport
+            .resize([size.width, size.height], window.scale_factor());
         let layers: &mut [&mut dyn ViewportLayer<()>] = &mut [&mut self.scene];
-        let frame = self
-            .host
-            .render_to_texture(device, queue, &mut encoder, &(), layers);
-        let [width, height] = frame.active_px;
-        let streaming_pending = frame.stats.streaming_pending;
-        let texture = frame.texture_view.texture();
-        let new_image = if self.imported_texture.as_ref() == Some(texture) {
-            None
-        } else {
-            let image = slint::Image::try_from(texture.clone())?;
-            self.imported_texture = Some(texture.clone());
-            Some(image)
-        };
-        queue.submit([encoder.finish()]);
-
-        // Slint samples the active area of iletki's padded allocation.
-        let [width_i32, height_i32] = [i32::try_from(width)?, i32::try_from(height)?];
-        if app.get_frame_width() != width_i32 {
-            app.set_frame_width(width_i32);
+        let frame = self.viewport.render(&(), layers, slint::Image::try_from)?;
+        let [width, height] = frame.source_size;
+        if app.get_frame_width() != width {
+            app.set_frame_width(width);
         }
-        if app.get_frame_height() != height_i32 {
-            app.set_frame_height(height_i32);
+        if app.get_frame_height() != height {
+            app.set_frame_height(height);
         }
-        if let Some(image) = new_image {
+        if let Some(image) = frame.new_image {
             app.set_frame(image);
         }
 
         if let Some(pos) = self.pick_pos.take() {
-            let x = pos.x * f64::from(scale);
-            let y = pos.y * f64::from(scale);
-            self.pending_pick =
-                if x >= 0.0 && x < f64::from(width) && y >= 0.0 && y < f64::from(height) {
-                    Some(self.host.begin_pick_rect(
-                        device,
-                        queue,
-                        &(),
-                        layers,
-                        [x as u32, y as u32, 1, 1],
-                    )?)
-                } else {
-                    app.set_status("No object selected".into());
-                    None
-                };
+            self.pending_pick = self.viewport.begin_pick(&(), layers, pos)?;
+            if self.pending_pick.is_none() {
+                app.set_status("No object selected".into());
+            }
         }
         if let Some(pick) = self.pending_pick.as_mut() {
             match pick.try_read() {
@@ -233,14 +206,19 @@ impl Viewport {
                 }
             }
         }
-        if streaming_pending {
+        if frame.stats.streaming_pending {
             window.request_redraw();
         }
         Ok(())
     }
 
     fn input(&mut self, app: &Demo, input: ViewportInput) {
-        if self.host.handle_input(&input, &mut self.rig).camera_changed {
+        if self
+            .viewport
+            .host_mut()
+            .handle_input(&input, &mut self.rig)
+            .camera_changed
+        {
             app.window().request_redraw();
         }
     }
@@ -357,11 +335,9 @@ fn main() -> Result<()> {
         };
         let result = match phase {
             RenderingState::RenderingSetup => {
-                Viewport::new(device).map(|viewport| *state = Some(viewport))
+                Viewport::new(device, queue).map(|viewport| *state = Some(viewport))
             }
-            RenderingState::BeforeRendering => state
-                .as_mut()
-                .map_or(Ok(()), |v| v.render(&app, device, queue)),
+            RenderingState::BeforeRendering => state.as_mut().map_or(Ok(()), |v| v.render(&app)),
             RenderingState::RenderingTeardown => {
                 app.set_frame(slint::Image::default());
                 *state = None;
