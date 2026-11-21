@@ -7,8 +7,11 @@
 # Local test captures and snapshots
 /out/
 
-# Local agent settings
+# Local agent and cloud settings
+/.agents/
 /.claude/
+/.codex/
+/.aws/
 
 # Editors and OS files
 .idea/
@@ -17,3 +20,7 @@
 *~
 .DS_Store
 Thumbs.db
+
+# Standalone example build output
+/examples/egui/target/
+/examples/egui/Cargo.lock

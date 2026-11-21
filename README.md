@@ -58,6 +58,9 @@ let frame = host.render_to_texture(&device, &queue, &mut encoder, &(), &mut laye
 
 For native asynchronous picking in an event-driven UI, submit the frame, call `begin_pick_rect`, and schedule checks with `PendingPick::try_read` until the result is ready. WebGPU drives its mapping callbacks asynchronously. See the [`ViewportHost` API](crates/iletki-wgpu/src/host.rs).
 
+The [standalone egui example](examples/egui) shows how to render a viewport through an
+`egui_wgpu` callback and pick an object. It uses versioned dependencies.
+
 ## Workspace layout
 
 See [docs/architecture.md](docs/architecture.md) for the crate layering rules.
@@ -84,6 +87,10 @@ rustup target add wasm32-unknown-unknown
 cargo install --locked cargo-deny
 cargo xtask ci
 ```
+
+Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to create all six crate
+archives and run the standalone egui example from their extracted contents. The example needs a
+working `wgpu` adapter.
 
 ## License
 

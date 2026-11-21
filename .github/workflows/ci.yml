@@ -52,3 +52,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - run: cargo xtask ci
+
+      - name: Verify the release archives with the standalone egui example
+        if: runner.os == 'Linux'
+        run: python3 .github/scripts/package-smoke.py
