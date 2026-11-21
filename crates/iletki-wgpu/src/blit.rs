@@ -176,7 +176,7 @@ impl BlitResources {
     ) {
         let key = PipelineKey {
             format,
-            sample_count: sample_count.max(1),
+            sample_count,
             depth_format,
             blend_premultiplied,
         };
@@ -234,7 +234,7 @@ impl BlitResources {
     ) -> Option<&wgpu::RenderPipeline> {
         let key = PipelineKey {
             format,
-            sample_count: sample_count.max(1),
+            sample_count,
             depth_format,
             blend_premultiplied,
         };

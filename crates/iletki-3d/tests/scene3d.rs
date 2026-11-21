@@ -71,7 +71,8 @@ fn large_world_3d_cube_clip_plane_picking_grid_and_gizmo() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     *host.camera_mut() =
         Camera::perspective_3d(eye, origin, Vec3::Z, std::f64::consts::FRAC_PI_3, 0.05);
 
@@ -195,8 +196,8 @@ fn shared_scene_releases_bindings_for_closed_viewports() {
     };
     let mut scene = Scene3DLayer::new(1);
     scene.insert(Mesh3D::at_origin(Vec3::ZERO));
-    let mut active = ViewportHost::new(&device, ViewportConfig::default());
-    let mut closed = ViewportHost::new(&device, ViewportConfig::default());
+    let mut active = ViewportHost::new(&device, ViewportConfig::default()).unwrap();
+    let mut closed = ViewportHost::new(&device, ViewportConfig::default()).unwrap();
     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut scene];
     let mut encoder = device.create_command_encoder(&Default::default());
     active.render_to_texture(&device, &queue, &mut encoder, &(), &mut layers);

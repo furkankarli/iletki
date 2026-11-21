@@ -6,13 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/iletki"
 
 [features]
 default = ["wgpu", "cad2d", "cad3d"]
 wgpu = ["dep:iletki-wgpu"]
 cad2d = ["wgpu", "dep:iletki-2d"]
 cad3d = ["wgpu", "dep:iletki-3d"]
+
+[[example]]
+name = "webgpu_smoke"
+required-features = ["cad2d"]
 
 [dependencies]
 iletki-core.workspace = true

@@ -5,7 +5,10 @@ use crate::blit::{BlitResources, DepthCopyPipeline};
 use crate::error::ViewportError;
 use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer};
 use crate::outline::OutlineEngine;
-use crate::target::{DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig};
+use crate::target::{
+    DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig, color_attachment_features,
+    validate_depth_attachment, validate_samples,
+};
 use crate::uniforms::CameraGpu;
 use iletki_core::{
     Camera, CameraRig, DirtyFlags, DrawPhase, DrawPhaseMask, OutlineConfig, PickHit, PickId,
@@ -159,10 +162,11 @@ impl std::fmt::Debug for ViewportHost {
 
 impl ViewportHost {
     /// Creates a new viewport host on an existing `wgpu::Device`.
-    #[must_use]
-    pub fn new(device: &wgpu::Device, config: ViewportConfig) -> Self {
+    /// Returns an error for unsupported color, depth or multisample attachments.
+    pub fn new(device: &wgpu::Device, config: ViewportConfig) -> Result<Self, ViewportError> {
+        config.validate(device)?;
         let id = ViewportId(NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed));
-        let msaa = config.sanitized_msaa();
+        let msaa = config.msaa_samples;
         let dpi_scale = if config.dpi_scale.is_finite() && config.dpi_scale > 0.0 {
             config.dpi_scale
         } else {
@@ -173,7 +177,7 @@ impl ViewportHost {
         // Pre-create the internal blit pipeline used when copying static_cache into output target.
         blit.ensure_pipeline(device, config.color_format, msaa, Some(DEPTH_FORMAT), false);
         let targets = TargetSet::new(device, &blit, config.initial_px, config.color_format, msaa);
-        Self {
+        Ok(Self {
             id,
             lifetime: Arc::new(()),
             config,
@@ -193,7 +197,7 @@ impl ViewportHost {
             upload_clock: None,
             cached_layers: Vec::new(),
             prepared_layers: Vec::new(),
-        }
+        })
     }
 
     /// Returns this viewport's unique [`ViewportId`].
@@ -370,7 +374,8 @@ impl ViewportHost {
     }
 
     /// Path B (`BorrowedPass`, step 1): prepares offscreen targets and ensures a blit pipeline
-    /// compatible with the host's [`PassTargetDesc`] exists.
+    /// compatible with the host's [`PassTargetDesc`] exists. Unsupported descriptors return an
+    /// error before the viewport records a frame.
     pub fn prepare_for_pass<W>(
         &mut self,
         device: &wgpu::Device,
@@ -379,18 +384,30 @@ impl ViewportHost {
         world: &W,
         layers: &mut [&mut dyn ViewportLayer<W>],
         pass_target: PassTargetDesc,
-    ) -> FrameStats {
-        self.blit.ensure_pipeline(
-            device,
+    ) -> Result<FrameStats, ViewportError> {
+        let (format, samples, depth, blend) = (
             pass_target.format,
             pass_target.sample_count,
             pass_target.depth_format,
             pass_target.blend_alpha,
         );
+        if self
+            .blit
+            .get_pipeline(format, samples, depth, blend)
+            .is_none()
+        {
+            let features = color_attachment_features(device, format, blend)?;
+            validate_samples(format, features.flags, samples)?;
+            if let Some(depth_format) = depth {
+                validate_depth_attachment(device, depth_format, samples)?;
+            }
+            self.blit
+                .ensure_pipeline(device, format, samples, depth, blend);
+        }
         let stats = self.execute_frame(device, queue, encoder, world, layers);
         self.blit
             .write_crop_uv_max(queue, self.targets.size().uv_max);
-        stats
+        Ok(stats)
     }
 
     /// Path B (`BorrowedPass`, step 2): composites the resolved offscreen color into the host's

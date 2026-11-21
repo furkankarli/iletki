@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,14 +19,26 @@ env:
 
 jobs:
   ci:
-    name: xtask ci (${{ matrix.os }})
+    name: Native CI (${{ matrix.os }}, ${{ matrix.backend }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            backend: vulkan
+          - os: windows-2025
+            backend: dx12
+          - os: macos-26
+            backend: metal
     runs-on: ${{ matrix.os }}
+    env:
+      WGPU_BACKEND: ${{ matrix.backend }}
+      ILETKI_EXPECT_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,10 +59,57 @@ jobs:
           sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
           lavapipe_icd=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
           test -n "$lavapipe_icd"
-          {
-            echo "VK_DRIVER_FILES=$lavapipe_icd"
-            echo 'WGPU_BACKEND=vulkan'
-            echo 'ILETKI_REQUIRE_GPU_TESTS=1'
-          } >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$lavapipe_icd" >> "$GITHUB_ENV"
+
+      - name: Verify rendered pixels and 64-bit picking
+        run: >-
+          cargo test --locked --workspace --all-features --test headless
+          on_demand_caches_static_scene_and_picks_64bit_id -- --exact --nocapture
 
       - run: cargo xtask ci
+
+      - name: Verify the release archives with the standalone egui example
+        if: runner.os == 'Linux'
+        run: python3 .github/scripts/package-smoke.py
+
+  webgpu:
+    name: Browser WebGPU (headless Chrome)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read the locked wasm-bindgen version
+        id: bindgen
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("Cargo.lock", "rb") as lock:
+              packages = tomllib.load(lock)["package"]
+          versions = {pkg["version"] for pkg in packages if pkg["name"] == "wasm-bindgen"}
+          version, = versions
+          print(f"version={version}")
+          PY
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+
+      - name: Build the WebGPU smoke example
+        run: |
+          cargo build --locked -p iletki --example webgpu_smoke --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-name smoke --out-dir target/webgpu-smoke \
+            target/wasm32-unknown-unknown/debug/examples/webgpu_smoke.wasm
+
+      - name: Verify the rendered pixel and asynchronous 64-bit picking
+        run: |
+          google-chrome --version
+          node .github/scripts/webgpu-smoke.mjs

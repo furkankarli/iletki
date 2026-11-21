@@ -76,7 +76,8 @@ fn jump_flood_selection_outline_renders_exterior_halo_in_both_modes() {
                 },
                 ..ViewportConfig::default()
             },
-        );
+        )
+        .unwrap();
         *host.camera_mut() = Camera::perspective_3d(
             Vec3::new(0.0, -7.0, 0.0),
             Vec3::ZERO,
@@ -151,7 +152,8 @@ fn instanced_100k_3d_boxes_single_draw_call_and_pick() {
             initial_px: [256, 256],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     *host.camera_mut() = Camera::perspective_3d(
         Vec3::new(0.0, -6.0, 0.0),
         Vec3::ZERO,
@@ -250,7 +252,8 @@ fn quad_view_four_viewports_share_one_scene_in_single_encoder() {
                 initial_px: [128, 128],
                 ..ViewportConfig::default()
             },
-        );
+        )
+        .unwrap();
         *h.camera_mut() = cam;
         h
     };
@@ -392,7 +395,8 @@ fn shaded_with_edges_depth_offset_and_clip_plane() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     // Look at the cube diagonally so a vertical front edge runs right through the middle column!
     *host.camera_mut() = Camera::perspective_3d(
         Vec3::new(4.0, -4.0, 2.0),
@@ -480,7 +484,8 @@ fn coplanar_clip_plane_has_zero_striping_and_srgb_target_has_no_double_gamma() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     *host.camera_mut() = Camera::perspective_3d(
         Vec3::new(0.0, -5.0, 0.0),
         Vec3::ZERO,

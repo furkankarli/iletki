@@ -8,8 +8,8 @@
 
 use iletki_core::{DirtyFlags, DrawPhase, DrawPhaseMask, PickId, ViewportMode};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportError,
-    ViewportHost, ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PrepareCtx,
+    ViewportConfig, ViewportError, ViewportHost, ViewportLayer, wgpu,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -33,39 +33,117 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 fn create_headless_device_with_limits(
     required_limits: wgpu::Limits,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let expected = std::env::var_os("ILETKI_EXPECT_BACKEND");
+    let result = request_headless_device(required_limits, expected.as_deref());
+    assert!(
+        expected.is_none() || result.is_ok(),
+        "could not use the expected {expected:?} backend: {:?}",
+        result.as_ref().err()
+    );
+    result.ok()
+}
+
+#[allow(clippy::print_stderr)] // Include the selected adapter in the CI smoke test output.
+fn request_headless_device(
+    required_limits: wgpu::Limits,
+    expected: Option<&std::ffi::OsStr>,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let options = wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
-        compatible_surface: None,
-        force_fallback_adapter: false,
         ..wgpu::RequestAdapterOptions::default()
-    }))
-    .or_else(|_| {
-        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-            ..wgpu::RequestAdapterOptions::default()
-        }))
-    })
-    .ok()?;
+    };
+    let adapter = block_on(instance.request_adapter(&options))
+        .or_else(|_| {
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                force_fallback_adapter: true,
+                ..options
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let info = adapter.get_info();
+    if let Some(expected) = expected {
+        assert_eq!(info.backend.to_str(), expected, "unexpected GPU backend");
+        eprintln!(
+            "Backend {} using {} ({:?})",
+            info.backend, info.name, info.device_type
+        );
+    }
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki test device"),
         required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
-    .ok()
+    .map_err(|error| error.to_string())
 }
 
 #[test]
-fn required_headless_backend_is_available() {
-    if std::env::var_os("ILETKI_REQUIRE_GPU_TESTS").is_some() {
-        assert!(
-            create_headless_device().is_some(),
-            "no headless GPU adapter available"
-        );
-    }
+fn gpu_configuration_returns_errors_before_creating_pipelines() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let format = wgpu::TextureFormat::Rgba8Uint;
+    let invalid_color = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: format,
+            ..ViewportConfig::default()
+        },
+    );
+    assert_eq!(
+        invalid_color.unwrap_err(),
+        ViewportError::UnsupportedColorFormat(format)
+    );
+
+    let config = ViewportConfig::default();
+    let invalid_samples = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            msaa_samples: 2,
+            ..config
+        },
+    );
+    assert_eq!(
+        invalid_samples.unwrap_err(),
+        ViewportError::UnsupportedSampleCount {
+            format: config.color_format,
+            sample_count: 2,
+        }
+    );
+
+    let mut host = ViewportHost::new(&device, config).unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let pass = PassTargetDesc {
+        format: config.color_format,
+        sample_count: 1,
+        depth_format: Some(format),
+        blend_alpha: false,
+    };
+    assert_eq!(
+        host.prepare_for_pass(&device, &queue, &mut encoder, &(), &mut [], pass),
+        Err(ViewportError::UnsupportedDepthFormat(format)),
+    );
+    assert_eq!(
+        host.prepare_for_pass(
+            &device,
+            &queue,
+            &mut encoder,
+            &(),
+            &mut [],
+            PassTargetDesc {
+                sample_count: 0,
+                depth_format: None,
+                ..pass
+            }
+        ),
+        Err(ViewportError::UnsupportedSampleCount {
+            format: pass.format,
+            sample_count: 0
+        }),
+    );
+    assert!(block_on(scope.pop()).is_none());
 }
 
 #[test]
@@ -83,7 +161,8 @@ fn target_sizing_and_readback_respect_device_limits() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     host.resize(&device, [513, 128], 1.0);
     assert_eq!(host.size().active_px, [500, 128]);
     assert_eq!(host.size().allocated_px, [500, 256]);
@@ -290,7 +369,8 @@ fn on_demand_caches_static_scene_and_picks_64bit_id() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let expected_id = PickId::new(7, 42_001, 19);
     let mut layer = SolidQuadLayer::new(expected_id);
 
@@ -384,7 +464,8 @@ fn pick_can_start_before_render_and_outlive_the_viewport() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let id = PickId::new(7, 98, 3);
     let mut layer = SolidQuadLayer::new(id);
     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut layer];

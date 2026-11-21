@@ -71,7 +71,8 @@ fn picking_matches_geometry_across_pages_and_unpickable_chunks() {
             msaa_samples: 1,
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let wanted = PickId::new(1, 77, 2);
     let mut scene = Scene2DLayer::new(1);
     let mut mesh = Mesh2D::default();
@@ -156,7 +157,8 @@ fn national_grid_2d_render_incremental_update_overlay_and_pick() {
             initial_px: [128, 128],
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     *host.camera_mut() = Camera::ortho_2d(origin, 10.0);
 
     let mut scene = Scene2DLayer::new(1);
@@ -276,8 +278,8 @@ fn progressive_uploads_refresh_every_viewport_cache() {
         },
         ..ViewportConfig::default()
     };
-    let mut first = ViewportHost::new(&device, config);
-    let mut second = ViewportHost::new(&device, config);
+    let mut first = ViewportHost::new(&device, config).unwrap();
+    let mut second = ViewportHost::new(&device, config).unwrap();
     let mut scene = Scene2DLayer::new(1);
 
     let render = |host: &mut ViewportHost, scene: &mut Scene2DLayer| {
@@ -342,7 +344,8 @@ fn upload_budget_is_shared_by_multiple_layers() {
             },
             ..ViewportConfig::default()
         },
-    );
+    )
+    .unwrap();
     let layer_with_box = |id, x| {
         let mut layer = Scene2DLayer::new(id);
         let mut mesh = Mesh2D::default();

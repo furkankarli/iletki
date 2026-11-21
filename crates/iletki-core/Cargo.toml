@@ -6,7 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/iletki-core"
 
 [dependencies]
 
