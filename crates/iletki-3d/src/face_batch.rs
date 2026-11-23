@@ -11,16 +11,163 @@ const MAX_VERTICES: usize = 65_536;
 const MAX_SECTION_GAP_VERTICES: u32 = 256;
 const UNIFORM_BLOCK_BYTES: usize = 1024 * 1024;
 pub(crate) const OBJECT_BYTES: u64 = (OBJECTS * size_of::<ObjectUniforms>()) as u64;
+const POSITION: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+
+#[derive(Clone, Copy)]
+pub(crate) enum VertexLayout {
+    Interleaved,
+    Separate,
+}
+
+impl VertexLayout {
+    pub(crate) fn for_device(device: &wgpu::Device) -> Self {
+        // Packed color draws use three attribute streams and one object-slot stream.
+        if device.limits().max_vertex_buffers >= 4 {
+            Self::Separate
+        } else {
+            Self::Interleaved
+        }
+    }
+
+    pub(crate) fn buffers(self) -> Vec<Option<wgpu::VertexBufferLayout<'static>>> {
+        use wgpu::{VertexBufferLayout, VertexStepMode::Vertex};
+        const INTERLEAVED: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4];
+        const NORMAL: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![1 => Float32x3];
+        const COLOR: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Unorm8x4];
+        match self {
+            Self::Interleaved => vec![Some(VertexBufferLayout {
+                array_stride: size_of::<Vertex3D>() as u64,
+                step_mode: Vertex,
+                attributes: &INTERLEAVED,
+            })],
+            Self::Separate => vec![
+                Some(VertexBufferLayout {
+                    array_stride: size_of::<[f32; 3]>() as u64,
+                    step_mode: Vertex,
+                    attributes: &POSITION,
+                }),
+                Some(VertexBufferLayout {
+                    array_stride: size_of::<[f32; 3]>() as u64,
+                    step_mode: Vertex,
+                    attributes: &NORMAL,
+                }),
+                Some(VertexBufferLayout {
+                    array_stride: size_of::<[u8; 4]>() as u64,
+                    step_mode: Vertex,
+                    attributes: &COLOR,
+                }),
+            ],
+        }
+    }
+
+    pub(crate) fn position(self) -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: self.position_stride(),
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &POSITION,
+        }
+    }
+
+    fn position_stride(self) -> u64 {
+        match self {
+            Self::Interleaved => size_of::<Vertex3D>() as u64,
+            Self::Separate => size_of::<[f32; 3]>() as u64,
+        }
+    }
+}
+
+pub(crate) enum VertexBuffers {
+    Interleaved(wgpu::Buffer),
+    Separate([wgpu::Buffer; 3]),
+}
+
+impl VertexBuffers {
+    pub(crate) fn upload(
+        device: &wgpu::Device,
+        layout: VertexLayout,
+        vertices: &[Vertex3D],
+    ) -> Self {
+        let buffer = |label, contents| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        };
+        match layout {
+            VertexLayout::Interleaved => Self::Interleaved(buffer(
+                "iletki-3d mesh vertices",
+                bytemuck::cast_slice(vertices),
+            )),
+            VertexLayout::Separate => {
+                let mut positions = Vec::with_capacity(vertices.len());
+                let mut normals = Vec::with_capacity(vertices.len());
+                let mut colors = Vec::with_capacity(vertices.len());
+                for vertex in vertices {
+                    positions.push(vertex.position);
+                    normals.push(vertex.normal);
+                    colors.push(vertex.color);
+                }
+                Self::Separate([
+                    buffer("iletki-3d positions", bytemuck::cast_slice(&positions)),
+                    buffer("iletki-3d normals", bytemuck::cast_slice(&normals)),
+                    buffer("iletki-3d colors", bytemuck::cast_slice(&colors)),
+                ])
+            }
+        }
+    }
+
+    fn bind_position(&self, pass: &mut wgpu::RenderPass<'_>, vertices: Option<&Range<u32>>) {
+        let (buffer, layout) = match self {
+            Self::Interleaved(buffer) => (buffer, VertexLayout::Interleaved),
+            Self::Separate(buffers) => {
+                let [positions, ..] = buffers;
+                (positions, VertexLayout::Separate)
+            }
+        };
+        bind_vertices(pass, 0, buffer, layout.position_stride(), vertices);
+    }
+
+    /// Binds mesh attributes and returns the next available binding.
+    fn bind(&self, pass: &mut wgpu::RenderPass<'_>, vertices: Option<&Range<u32>>) -> u32 {
+        self.bind_position(pass, vertices);
+        match self {
+            Self::Interleaved(_) => 1,
+            Self::Separate(buffers) => {
+                let [_, normals, colors] = buffers;
+                bind_vertices(pass, 1, normals, size_of::<[f32; 3]>() as u64, vertices);
+                bind_vertices(pass, 2, colors, size_of::<[u8; 4]>() as u64, vertices);
+                3
+            }
+        }
+    }
+}
+
+fn bind_vertices(
+    pass: &mut wgpu::RenderPass<'_>,
+    slot: u32,
+    buffer: &wgpu::Buffer,
+    stride: u64,
+    vertices: Option<&Range<u32>>,
+) {
+    let slice = match vertices {
+        Some(range) => buffer.slice(u64::from(range.start) * stride..u64::from(range.end) * stride),
+        None => buffer.slice(..),
+    };
+    pass.set_vertex_buffer(slot, slice);
+}
 
 pub(crate) struct GeometryPage {
-    vertices: wgpu::Buffer,
+    vertices: VertexBuffers,
     slots: wgpu::Buffer,
     picks: Option<wgpu::Buffer>,
     repeated_vertices: u32,
 }
 
 pub(crate) enum VertexRange {
-    Direct(wgpu::Buffer),
+    // Keep buffer handles out of the chunk table that visibility scans every frame.
+    Direct(Box<VertexBuffers>),
     Packed {
         page: Arc<GeometryPage>,
         vertices: Range<u32>,
@@ -33,13 +180,18 @@ impl VertexRange {
         matches!(self, Self::Packed { page, .. } if page.repeated_vertices != 0)
     }
 
-    pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
+    pub(crate) fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
         match self {
-            Self::Direct(buffer) => buffer.slice(..),
+            Self::Direct(buffers) => buffers.bind(pass, None),
+            Self::Packed { page, vertices, .. } => page.vertices.bind(pass, Some(vertices)),
+        };
+    }
+
+    pub(crate) fn bind_position(&self, pass: &mut wgpu::RenderPass<'_>) {
+        match self {
+            Self::Direct(buffers) => buffers.bind_position(pass, None),
             Self::Packed { page, vertices, .. } => {
-                let stride = size_of::<Vertex3D>() as u64;
-                page.vertices
-                    .slice((u64::from(vertices.start) * stride)..(u64::from(vertices.end) * stride))
+                page.vertices.bind_position(pass, Some(vertices))
             }
         }
     }
@@ -57,20 +209,24 @@ impl VertexRange {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct PageBuilder {
     vertices: Vec<Vertex3D>,
     slots: Vec<u32>,
     picks: Vec<[u32; 2]>,
     objects: Vec<(usize, Range<u32>)>,
     repeatable: bool,
+    layout: VertexLayout,
 }
 
 impl PageBuilder {
-    pub(crate) fn new(repeatable: bool) -> Self {
+    pub(crate) fn new(layout: VertexLayout, repeatable: bool) -> Self {
         Self {
+            vertices: Vec::new(),
+            slots: Vec::new(),
+            picks: Vec::new(),
+            objects: Vec::new(),
             repeatable,
-            ..Self::default()
+            layout,
         }
     }
 
@@ -147,10 +303,7 @@ impl PageBuilder {
             })
         };
         let page = Arc::new(GeometryPage {
-            vertices: make_buffer(
-                "iletki-3d geometry page",
-                bytemuck::cast_slice(&self.vertices),
-            ),
+            vertices: VertexBuffers::upload(device, self.layout, &self.vertices),
             slots: make_buffer(
                 "iletki-3d geometry slots",
                 bytemuck::cast_slice(&self.slots),
@@ -518,16 +671,23 @@ impl PackedDraws {
                         let Some(block) = self.buffers.get(*uniforms / pages_per_buffer) else {
                             continue;
                         };
-                        if *instances != 0 {
+                        let slots = if *instances != 0 {
                             let Some((pipeline, slots)) = repeated else {
                                 continue;
                             };
                             pass.set_pipeline(pipeline);
-                            pass.set_vertex_buffer(1, slots.slice(..));
+                            slots
                         } else {
                             pass.set_pipeline(pipeline);
-                            pass.set_vertex_buffer(1, geometry.slots.slice(..));
-                        }
+                            &geometry.slots
+                        };
+                        let slot_binding = if picking {
+                            geometry.vertices.bind_position(pass, None);
+                            1
+                        } else {
+                            geometry.vertices.bind(pass, None)
+                        };
+                        pass.set_vertex_buffer(slot_binding, slots.slice(..));
                         let offset = [((*uniforms % pages_per_buffer) * self.stride) as u32];
                         let offsets = if self.dynamic_offsets {
                             offset.as_slice()
@@ -535,12 +695,11 @@ impl PackedDraws {
                             &[]
                         };
                         pass.set_bind_group(1, &block.binding, offsets);
-                        pass.set_vertex_buffer(0, geometry.vertices.slice(..));
                         if picking {
                             let Some(picks) = &geometry.picks else {
                                 continue;
                             };
-                            pass.set_vertex_buffer(2, picks.slice(..));
+                            pass.set_vertex_buffer(slot_binding + 1, picks.slice(..));
                         }
                         bound = Some(*uniforms);
                     }

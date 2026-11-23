@@ -27,6 +27,10 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    create_device_with_limits(wgpu::Limits::default())
+}
+
+fn create_device_with_limits(limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -46,9 +50,65 @@ fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()?;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki-3d test device"),
+        required_limits: limits,
         ..wgpu::DeviceDescriptor::default()
     }))
     .ok()
+}
+
+#[test]
+fn separate_vertex_streams_match_the_interleaved_fallback() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let (fallback_device, fallback_queue) = create_device_with_limits(wgpu::Limits {
+        max_vertex_buffers: 3,
+        ..wgpu::Limits::default()
+    })
+    .unwrap();
+    let render = |device: &wgpu::Device, queue: &wgpu::Queue| {
+        let mut host = ViewportHost::new(
+            device,
+            ViewportConfig {
+                initial_px: [192, 192],
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        let origin = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+        *host.camera_mut() =
+            Camera::ortho_3d(origin + Vec3::Z * 40.0, origin, Vec3::Y, 27.0, 0.05, 100.0);
+        let mut scene = Scene3DLayer::new(1);
+        for index in 0..144 {
+            let offset = Vec3::new(
+                f64::from(index % 12) * 2.0 - 11.0,
+                f64::from(index / 12) * 2.0 - 11.0,
+                0.0,
+            );
+            let mut mesh = Mesh3D::at_origin(origin + offset);
+            mesh.push_box(
+                Vec3::new(-0.6, -0.6, -0.5),
+                Vec3::new(0.6, 0.6, 0.5),
+                [90, 110, 230, 255],
+                PickId::new(1, index + 1, 3),
+                true,
+            );
+            scene.insert(mesh);
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        host.render_to_texture(device, queue, &mut encoder, &(), &mut [&mut scene]);
+        queue.submit([encoder.finish()]);
+        let pixels = host.readback_rgba_blocking(device, queue).unwrap().pixels;
+        let hits = host
+            .pick_rect_blocking(device, queue, &(), &mut [&mut scene], [0, 0, 192, 192])
+            .unwrap();
+        assert_eq!(hits.len(), 144);
+        (pixels, hits)
+    };
+    assert_eq!(
+        render(&device, &queue),
+        render(&fallback_device, &fallback_queue)
+    );
 }
 
 #[test]
@@ -409,56 +469,4 @@ fn shared_scene_releases_bindings_for_closed_viewports() {
     assert_eq!(scene.prune_closed_viewports(), 0);
     drop(active);
     assert_eq!(scene.prune_closed_viewports(), 1);
-}
-
-#[test]
-fn interactive_lod_preserves_near_views_pick_geometry_and_idle_image() {
-    let Some((device, queue)) = create_headless_device() else {
-        return;
-    };
-    let mut host = ViewportHost::new(
-        &device,
-        ViewportConfig {
-            initial_px: [128, 128],
-            ..ViewportConfig::default()
-        },
-    )
-    .unwrap();
-    let id = PickId::new(1, 29, 7);
-    let [a, b, c, d] = [
-        Vec3::new(-1.0, -1.0, 0.0),
-        Vec3::new(1.0, -1.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(-1.0, 1.0, 0.0),
-    ];
-    let mut full = Mesh3D::at_origin(Vec3::ZERO);
-    full.push_quad(a, b, c, d, [30, 235, 70, 255], id);
-    full.push_quad(a, b, c, d, [30, 235, 70, 255], id);
-    let mut coarse = Mesh3D::at_origin(Vec3::ZERO);
-    coarse.push_quad(a, b, c, d, [210, 50, 30, 255], PickId::NONE);
-    let mut scene = Scene3DLayer::new(1);
-    scene.insert_with_lod(full, coarse, 0.1);
-    let camera = |span| Camera::ortho_3d(Vec3::Z * 10.0, Vec3::ZERO, Vec3::Y, span, 0.05, 100.0);
-    let render = |scene: &mut Scene3DLayer, host: &mut ViewportHost, span| {
-        *host.camera_mut() = camera(span);
-        let mut encoder = device.create_command_encoder(&Default::default());
-        host.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
-        queue.submit([encoder.finish()]);
-        host.readback_rgba_blocking(&device, &queue).unwrap().pixels
-    };
-    let pick = |scene: &mut Scene3DLayer, host: &mut ViewportHost| {
-        host.pick_rect_blocking(&device, &queue, &(), &mut [scene], [62, 62, 5, 5])
-            .unwrap()
-    };
-
-    let near = render(&mut scene, &mut host, 4.0);
-    let far = render(&mut scene, &mut host, 64.0);
-    let hits = pick(&mut scene, &mut host);
-    assert_eq!(hits.first().unwrap().id, id);
-    scene.set_interactive_lod(Some(0.5));
-    assert_eq!(near, render(&mut scene, &mut host, 4.0));
-    assert_ne!(far, render(&mut scene, &mut host, 64.0));
-    assert_eq!(hits, pick(&mut scene, &mut host));
-    scene.set_interactive_lod(None);
-    assert_eq!(far, render(&mut scene, &mut host, 64.0));
 }

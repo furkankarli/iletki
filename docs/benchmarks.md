@@ -305,29 +305,19 @@ Set `ILETKI_ASSEMBLY_CASE=100000/wide` and unset `ILETKI_ASSEMBLY_MESH` to run t
 mesh and inserting it. Match flags, fixture checksums, resolution, adapter and
 sample counts when comparing revisions.
 
+Set `ILETKI_ASSEMBLY_MODEL_CLOSE=1` to use a horizontal orbit radius of 0.85 times
+the model's bounding radius. The default uses 2.6 times the bounding radius. Set
+`ILETKI_ASSEMBLY_SPLIT=1` to include an orthographic second view. Record the
+camera distance and view count with each measurement.
+
 Keep the CSVs in frame order and run several repetitions. When comparing renderers, fix the GPU,
 driver, visible geometry, camera, lighting, MSAA and output format. Measure initial setup,
 steady-state rendering, cache hits and presentation as separate workloads. Use enough samples for
 any tail percentiles you publish. Large-world precision requires a measured coordinate or
 projection error over a camera path.
 
-### Interactive geometry detail
-
-The optional coarse fixture keeps each chunk's object ID and origin. The converter
-reports a world-space error bound to pass explicitly to the benchmark. It retains
-collapsed triangles whose snapped point or edge has no support in the coarse mesh.
-The renderer uses coarse faces only under the active half-pixel budget and checks
-the error separately for each viewport. Edges, outlines, and picking use full geometry.
-
-```sh
-python3 docs/benchmarks/repro/convert-model.py lod out/hospital/hospital-lod.iltmesh \
-  out/hospital/hospital.iltmesh --cell-size 0.05
-```
-
-Use `ILETKI_ASSEMBLY_LOD` and `ILETKI_ASSEMBLY_LOD_ERROR` for the headless benchmark.
-Set `ILETKI_ASSEMBLY_IMAGES=1` to save row-major RGBA8 frames at three orbit
-positions for each viewport after timing. The image filenames include their dimensions.
-For the window benchmark, pass `--scene` with the full fixture alongside
-`--lod-fixture` and `--lod-world-error`. The demo switches back to full geometry
-when the drag ends or after 120 ms without camera motion. Report the LOD and
-full-geometry measurements separately. The opted-in scene holds both representations.
+Set `ILETKI_ASSEMBLY_SIGNATURES=1` to hash a full orbit outside the timed samples.
+A moving section can leave individual reference frames empty. The model still
+has to be visible in at least one validated reference frame. Set
+`ILETKI_ASSEMBLY_IMAGES=1` to save three row-major RGBA8 frames per viewport from
+that orbit. The filenames include the output size.

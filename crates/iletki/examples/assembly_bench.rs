@@ -426,6 +426,7 @@ mod native {
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
             let overlap = std::env::var_os("ILETKI_ASSEMBLY_OVERLAP").is_some();
             let trace_end = WARMUP + samples + traces;
+            let mut model_seen = false;
             for frame in 0..trace_end + if signatures { ORBIT_PERIOD } else { 0 } {
                 let start = Instant::now();
                 let edited = (edit_scene || edit_visibility) && frame % 6 == 0;
@@ -484,16 +485,15 @@ mod native {
                     };
                     let signature = if reference_frame {
                         let image = main.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
-                        if case.model.is_some()
-                            && let Some(background) = image.pixels.get(..4)
-                            && image
-                                .pixels
-                                .as_chunks::<4>()
-                                .0
-                                .iter()
-                                .all(|pixel| pixel == background)
-                        {
-                            return Err("the model produced a uniform reference image".into());
+                        if case.model.is_some() && !model_seen {
+                            model_seen = image.pixels.get(..4).is_some_and(|background| {
+                                image
+                                    .pixels
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .any(|pixel| pixel != background)
+                            });
                         }
                         let phase = frame.saturating_sub(trace_end);
                         self.record_image(case, phase, "main", &image)?;
@@ -524,6 +524,9 @@ mod native {
                         }
                     }
                 }
+            }
+            if case.model.is_some() && !model_seen {
+                return Err("the model produced only uniform reference images".into());
             }
             Ok(())
         }
@@ -705,22 +708,15 @@ mod native {
         if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
             let started = Instant::now();
             let fixture = crate::assembly_fixture::load(Path::new(&path))?;
-            let lod = std::env::var_os("ILETKI_ASSEMBLY_LOD")
-                .map(|path| crate::assembly_fixture::load_lod(Path::new(&path), &fixture))
-                .transpose()?;
-            let lod_error = if lod.is_some() {
-                let error: f64 = std::env::var("ILETKI_ASSEMBLY_LOD_ERROR")?.parse()?;
-                if !error.is_finite() || error < 0.0 {
-                    return Err("LOD error must be finite and nonnegative".into());
-                }
-                error
-            } else {
-                0.0
-            };
             let decoded_ms = elapsed_ms(started);
             let chunks = u32::try_from(fixture.meshes.len())?;
             let focus = fixture.bounds.center().ok_or("model has no bounds")?;
-            let radius = fixture.bounds.radius() * 2.6;
+            let orbit_scale = if std::env::var_os("ILETKI_ASSEMBLY_MODEL_CLOSE").is_some() {
+                0.85
+            } else {
+                2.6
+            };
+            let radius = fixture.bounds.radius() * orbit_scale;
             if !focus.is_finite() || !radius.is_finite() || radius <= 0.0 {
                 return Err("invalid model camera bounds".into());
             }
@@ -739,18 +735,10 @@ mod native {
             let insert_started = Instant::now();
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_geometry(pack);
-            if lod.is_some() {
-                scene.set_interactive_lod(Some(0.5));
-            }
-            let mut lod = lod.map(Vec::into_iter);
             let mut edits = Vec::new();
             for (index, mesh) in fixture.meshes.into_iter().enumerate() {
                 let origin = mesh.origin;
-                let id = if let Some(proxy) = lod.as_mut().and_then(Iterator::next) {
-                    scene.insert_with_lod(mesh, proxy, lod_error)
-                } else {
-                    scene.insert(mesh)
-                };
+                let id = scene.insert(mesh);
                 if index % 100 == 0 {
                     edits.push((id, origin));
                 }

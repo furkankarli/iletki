@@ -2,15 +2,14 @@
 //! planes, *Shaded with Edges* depth-offset wireframe overlays, Jump-Flood selection outline masks,
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
-use crate::face_batch::{self, PageBuilder, VertexRange};
-use crate::lod::LodProjection;
+use crate::face_batch::{self, PageBuilder, VertexBuffers, VertexLayout, VertexRange};
 use crate::objects::{
     PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume, ViewObjects,
     bounds_cover_vertices,
 };
 use crate::outline_bounds::OutlineUpdate;
 use crate::section::SectionAa;
-use crate::vertex::{Mesh3D, Vertex3D};
+use crate::vertex::Mesh3D;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3};
 use iletki_wgpu::wgpu;
@@ -50,43 +49,22 @@ struct ChunkEntry {
     local_bounds: Bounds3,
     visible: bool,
     selected: bool,
-    pending_mesh: Option<Mesh3D>,
+    pending_mesh: Option<Box<Mesh3D>>,
     vertex_buf: Option<VertexRange>,
     vertex_count: u32,
     edge_buf: Option<VertexRange>,
     edge_count: u32,
-    pick_buf: Option<wgpu::Buffer>,
+    pick_buf: Option<Box<wgpu::Buffer>>,
     has_picks: bool,
     pick_bounds_trusted: bool,
     section_bounds_trusted: bool,
     small_packed: bool,
-    lod: Option<Box<ChunkLod>>,
-}
-
-struct ChunkLod {
-    pending: Vec<Vertex3D>,
-    vertex_buf: Option<VertexRange>,
-    vertex_count: u32,
-    max_world_error: f64,
-}
-
-impl ChunkEntry {
-    fn color_faces(&self, use_lod: bool) -> Option<(&VertexRange, u32)> {
-        if use_lod
-            && let Some(lod) = &self.lod
-            && let Some(vertices) = &lod.vertex_buf
-        {
-            return Some((vertices, lod.vertex_count));
-        }
-        self.vertex_buf
-            .as_ref()
-            .map(|vertices| (vertices, self.vertex_count))
-    }
 }
 
 struct Pipelines {
     format: wgpu::TextureFormat,
     msaa: u32,
+    vertex_layout: VertexLayout,
     object_layout: wgpu::BindGroupLayout,
     dynamic_uniforms: bool,
     lit: wgpu::RenderPipeline,
@@ -211,18 +189,16 @@ impl PackedPipelines {
         }
     }
 
-    fn ensure_repeated<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
+    fn ensure_repeated<W>(&mut self, ctx: &PrepareCtx<'_, W>, vertex_layout: VertexLayout) {
         if self.repeated.is_some() {
             return;
         }
-        let buffers = [
-            Some(mesh_vertex_layout()),
-            Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<u32>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![3 => Uint32],
-            }),
-        ];
+        let mut buffers = vertex_layout.buffers();
+        buffers.push(Some(wgpu::VertexBufferLayout {
+            array_stride: size_of::<u32>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![3 => Uint32],
+        }));
         let color =
             |shader, section| Self::color(ctx, shader, &self.pipeline_layout, &buffers, section);
         let slots = (0..face_batch::OBJECTS as u32).collect::<Vec<_>>();
@@ -240,16 +216,6 @@ impl PackedPipelines {
                     usage: wgpu::BufferUsages::VERTEX,
                 }),
         });
-    }
-}
-
-fn mesh_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4];
-    wgpu::VertexBufferLayout {
-        array_stride: size_of::<Vertex3D>() as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &ATTRIBUTES,
     }
 }
 
@@ -276,7 +242,6 @@ pub struct Scene3DLayer {
     selected_slots: BTreeSet<usize>,
     pending_meshes: usize,
     has_repeated_pages: bool,
-    interactive_lod: Option<f64>,
     section_groups: Vec<Option<SectionGroup>>,
     section_relations: Vec<(SectionRelation, bool)>,
     views: Vec<ViewObjects>,
@@ -319,7 +284,6 @@ impl Scene3DLayer {
             selected_slots: BTreeSet::new(),
             pending_meshes: 0,
             has_repeated_pages: false,
-            interactive_lod: None,
             section_groups: Vec::new(),
             section_relations: Vec::new(),
             views: Vec::new(),
@@ -409,7 +373,7 @@ impl Scene3DLayer {
             local_bounds: mesh.local_bounds,
             visible: true,
             selected: false,
-            pending_mesh: Some(mesh),
+            pending_mesh: Some(Box::new(mesh)),
             vertex_buf: None,
             vertex_count: 0,
             edge_buf: None,
@@ -419,7 +383,6 @@ impl Scene3DLayer {
             pick_bounds_trusted: false,
             section_bounds_trusted: false,
             small_packed: false,
-            lod: None,
         };
         // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
         if let Some(Reverse(index)) = self.free_chunks.pop()
@@ -431,53 +394,6 @@ impl Scene3DLayer {
         let index = self.chunks.len();
         self.chunks.push(Some(entry));
         Chunk3DId { index, generation }
-    }
-
-    /// Inserts a mesh with an optional lower-detail copy for interactive color rendering.
-    ///
-    /// Supply a conservative bound on the geometric error in world units. The coarse mesh
-    /// must share the full mesh's origin and stay inside its bounds. Its faces are used only
-    /// while an interactive pixel-error budget is active. Edges, outlines and picking use
-    /// the original mesh. Invalid or non-reducing coarse meshes fall back to the original.
-    pub fn insert_with_lod(
-        &mut self,
-        mesh: Mesh3D,
-        coarse: Mesh3D,
-        max_world_error: f64,
-    ) -> Chunk3DId {
-        let compatible = max_world_error.is_finite()
-            && max_world_error >= 0.0
-            && mesh.origin == coarse.origin
-            && coarse.vertices.len() < mesh.vertices.len()
-            && !coarse.vertices.is_empty()
-            && coarse.vertices.len().is_multiple_of(3)
-            && bounds_cover_vertices(mesh.local_bounds, &coarse.vertices);
-        let id = self.insert(mesh);
-        if compatible
-            && let Ok(vertex_count) = u32::try_from(coarse.vertices.len())
-            && let Some(chunk) = self.chunk_mut(id)
-        {
-            chunk.lod = Some(Box::new(ChunkLod {
-                pending: coarse.vertices,
-                vertex_buf: None,
-                vertex_count,
-                max_world_error,
-            }));
-        }
-        id
-    }
-
-    /// Sets the maximum projected error in physical pixels while the camera is moving.
-    ///
-    /// Pass `None` when movement stops to restore the full geometry on the next redraw.
-    /// All viewports sharing this scene evaluate the budget with their own camera and size.
-    /// The default is full geometry.
-    pub fn set_interactive_lod(&mut self, max_pixel_error: Option<f64>) {
-        let budget = max_pixel_error.filter(|value| value.is_finite() && *value > 0.0);
-        if self.interactive_lod != budget {
-            self.interactive_lod = budget;
-            self.revision.mark_static();
-        }
     }
 
     /// Updates a chunk's world origin (for moving 3D objects without re-uploading vertices).
@@ -633,7 +549,7 @@ impl Scene3DLayer {
                 bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&object_layout)],
                 immediate_size: 0,
             });
-        let vert_layout = mesh_vertex_layout();
+        let vertex_layout = VertexLayout::for_device(ctx.device);
         let pick_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<[u32; 2]>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -648,7 +564,7 @@ impl Scene3DLayer {
                           edges| {
             color_pipeline(ctx, shader, vertex, fragment, layout, buffers, edges)
         };
-        let face_layout = [Some(vert_layout.clone())];
+        let face_layout = vertex_layout.buffers();
         let lit = make_color(
             &shader,
             "vs_mesh",
@@ -706,12 +622,8 @@ impl Scene3DLayer {
                     cache: None,
                 })
         };
-        let pick = make_pick(
-            &shader,
-            "vs_mesh_pick",
-            &pipeline_layout,
-            &[Some(vert_layout.clone()), Some(pick_layout)],
-        );
+        let pick_buffers = [Some(vertex_layout.position()), Some(pick_layout)];
+        let pick = make_pick(&shader, "vs_mesh_pick", &pipeline_layout, &pick_buffers);
         let make_mask = |shader: &wgpu::ShaderModule,
                          vertex,
                          fragment,
@@ -773,7 +685,8 @@ impl Scene3DLayer {
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &wgpu::vertex_attr_array![3 => Uint32],
             };
-            let buffers = [Some(vert_layout.clone()), Some(slot_layout.clone())];
+            let mut buffers = face_layout.clone();
+            buffers.push(Some(slot_layout.clone()));
             let base = PackedPipelines::color(ctx, &shader, &pipeline_layout, &buffers, None);
             let mask = make_mask(
                 &shader,
@@ -819,20 +732,17 @@ impl Scene3DLayer {
             let limits = ctx.device.limits();
             let pick =
                 (limits.max_vertex_buffers >= 3 && limits.max_vertex_attributes >= 5).then(|| {
-                    make_pick(
-                        &shader,
-                        "vs_pick_batched",
-                        &pipeline_layout,
-                        &[
-                            Some(vert_layout.clone()),
-                            Some(slot_layout),
-                            Some(wgpu::VertexBufferLayout {
-                                array_stride: size_of::<[u32; 2]>() as u64,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &wgpu::vertex_attr_array![4 => Uint32x2],
-                            }),
-                        ],
-                    )
+                    let id_layout = wgpu::VertexBufferLayout {
+                        array_stride: size_of::<[u32; 2]>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![4 => Uint32x2],
+                    };
+                    let pick_buffers = [
+                        Some(vertex_layout.position()),
+                        Some(slot_layout),
+                        Some(id_layout),
+                    ];
+                    make_pick(&shader, "vs_pick_batched", &pipeline_layout, &pick_buffers)
                 });
             PackedPipelines {
                 pick,
@@ -935,6 +845,7 @@ impl Scene3DLayer {
         self.pipelines = Some(Pipelines {
             format: ctx.color_format,
             msaa: ctx.msaa_samples,
+            vertex_layout,
             object_layout,
             dynamic_uniforms,
             lit,
@@ -999,7 +910,7 @@ impl Scene3DLayer {
                 && let Some(vertices) = &chunk.vertex_buf
                 && view.bind(pass, index, p.dynamic_uniforms)
             {
-                pass.set_vertex_buffer(0, vertices.slice());
+                vertices.bind(pass);
                 pass.draw(0..chunk.vertex_count, 0..1);
             }
         };
@@ -1068,12 +979,11 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let repeat_pages = pack_geometry;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let repeat_pages = repeat_pages && self.profile_repeated_pages;
-        let mut builder = PageBuilder::new(repeat_pages);
+        let vertex_layout = p.vertex_layout;
+        let mut builder = PageBuilder::new(vertex_layout, repeat_pages);
         let mut uploaded_faces = Vec::new();
-        let mut edge_builder = PageBuilder::new(repeat_pages);
+        let mut edge_builder = PageBuilder::new(vertex_layout, repeat_pages);
         let mut uploaded_edges = Vec::new();
-        let mut lod_builder = PageBuilder::new(false);
-        let mut uploaded_lods = Vec::new();
 
         let upload_slots = if self.pending_meshes == 0 {
             0
@@ -1101,13 +1011,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     // A shared face page can contain both pickable and unpickable chunks.
                     bytes = bytes
                         .saturating_add(mesh.vertices.len().saturating_mul(size_of::<[u32; 2]>()));
-                }
-                if let Some(lod) = &chunk.lod {
-                    bytes = bytes.saturating_add(
-                        lod.pending
-                            .len()
-                            .saturating_mul(size_of::<Vertex3D>() + size_of::<u32>()),
-                    );
                 }
                 if !ctx.uploads.reserve(bytes) {
                     pending = true;
@@ -1149,22 +1052,19 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             &mut uploaded_faces,
                         );
                     } else {
-                        chunk.vertex_buf = Some(VertexRange::Direct(
-                            ctx.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("iletki-3d vertices"),
-                                    contents: bytemuck::cast_slice(&mesh.vertices),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                }),
-                        ));
+                        chunk.vertex_buf = Some(VertexRange::Direct(Box::new(
+                            VertexBuffers::upload(ctx.device, vertex_layout, &mesh.vertices),
+                        )));
                     }
                     chunk.pick_buf = picks.filter(|_| !pack).map(|ids| {
-                        ctx.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("iletki-3d pick ids"),
-                                contents: bytemuck::cast_slice(ids),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            })
+                        Box::new(
+                            ctx.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("iletki-3d pick ids"),
+                                    contents: bytemuck::cast_slice(ids),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                }),
+                        )
                     });
                     chunk.has_picks = picks.is_some();
                 }
@@ -1182,34 +1082,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             &mut uploaded_edges,
                         );
                     } else {
-                        chunk.edge_buf = Some(VertexRange::Direct(ctx.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("iletki-3d edges"),
-                                contents: bytemuck::cast_slice(&mesh.edges),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        )));
-                    }
-                }
-                if let Some(lod) = &mut chunk.lod {
-                    let vertices = std::mem::take(&mut lod.pending);
-                    if pack_geometry && PageBuilder::can_pack(&vertices, 3) {
-                        lod_builder.push(
-                            chunk_index,
-                            &vertices,
-                            None,
-                            ctx.device,
-                            &mut uploaded_lods,
-                        );
-                    } else if (size_of_val(vertices.as_slice()) as u64)
-                        <= ctx.device.limits().max_buffer_size
-                    {
-                        lod.vertex_buf = Some(VertexRange::Direct(ctx.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("iletki-3d coarse vertices"),
-                                contents: bytemuck::cast_slice(&vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
+                        chunk.edge_buf = Some(VertexRange::Direct(Box::new(
+                            VertexBuffers::upload(ctx.device, vertex_layout, &mesh.edges),
                         )));
                     }
                 }
@@ -1231,19 +1105,11 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 chunk.edge_buf = Some(edges);
             }
         }
-        lod_builder.flush(ctx.device, &mut uploaded_lods);
-        for (index, vertices) in uploaded_lods {
-            if let Some(Some(chunk)) = self.chunks.get_mut(index)
-                && let Some(lod) = &mut chunk.lod
-            {
-                lod.vertex_buf = Some(vertices);
-            }
-        }
 
         if self.has_repeated_pages
             && let Some(packed) = self.pipelines.as_mut().and_then(|p| p.packed.as_mut())
         {
-            packed.ensure_repeated(ctx);
+            packed.ensure_repeated(ctx, vertex_layout);
         }
         let Some(p) = self.pipelines.as_ref() else {
             return pending;
@@ -1310,12 +1176,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let visibility = iletki_wgpu::profiling::scope("scene.visibility");
         let projection = ctx.camera.view_proj_relative(ctx.logical_size);
-        let lod_projection = if picking.is_none() {
-            self.interactive_lod
-                .map(|error| LodProjection::new(projection, ctx.active_px, error))
-        } else {
-            None
-        };
         let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
         let cull_sections = !ctx.camera.clip_planes().is_empty()
@@ -1326,13 +1186,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let bridge_sections = bridge_sections && self.profile_section_bridging;
         let section_volume = cull_sections.then(|| SectionVolume::new(ctx.camera));
-        let group_sections = self.chunks.len() >= SECTION_GROUP_SIZE * 4;
+        let group_visibility = self.chunks.len() >= SECTION_GROUP_SIZE * 4;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        let group_sections = group_sections && self.profile_section_groups;
-        let group_volume = section_volume.as_ref().filter(|_| group_sections);
+        let group_visibility = group_visibility && self.profile_section_groups;
         self.section_relations.clear();
         let mut crossing_groups = 0;
-        if let Some(volume) = group_volume {
+        if group_visibility && (picking.is_none() || section_volume.is_some()) {
             self.section_groups
                 .resize_with(self.chunks.len().div_ceil(SECTION_GROUP_SIZE), || None);
             for (cached, chunks) in self
@@ -1347,7 +1206,11 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     }
                     bounds
                 });
-                let relation = group.section_relation(volume, cam_pos);
+                let relation = section_volume
+                    .as_ref()
+                    .map_or(SectionRelation::Crossing, |volume| {
+                        group.section_relation(volume, cam_pos)
+                    });
                 let inside_frustum = picking.is_none() && group.inside_frustum(&frustum, cam_pos);
                 crossing_groups +=
                     usize::from(relation == SectionRelation::Crossing && inside_frustum);
@@ -1369,8 +1232,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let mut opaque_triangles = 0;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let mut deferred_chunks = 0;
-        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        let mut lod_chunks = 0;
         for (group_index, chunks) in self.chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
             let (relation, inside_frustum) = self
                 .section_relations
@@ -1431,31 +1292,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             })
                         }
                     };
-                let use_lod = !section_culled
-                    && chunk.pick_bounds_trusted
-                    && lod_projection.as_ref().is_some_and(|projection| {
-                        chunk.lod.as_ref().is_some_and(|lod| {
-                            let [x, y, z] = offset_rel.map(f64::from);
-                            lod.vertex_buf.is_some()
-                                && projection.allows(
-                                    chunk.local_bounds,
-                                    Vec3::new(x, y, z),
-                                    lod.max_world_error,
-                                )
-                        })
-                    });
                 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                 if profiling && picking.is_none() {
-                    let triangles = if use_lod {
-                        lod_chunks += 1;
-                        chunk
-                            .lod
-                            .as_ref()
-                            .map_or(chunk.vertex_count, |lod| lod.vertex_count)
-                    } else {
-                        chunk.vertex_count
-                    } as usize
-                        / 3;
+                    let triangles = chunk.vertex_count as usize / 3;
                     if section_culled {
                         culled_chunks += 1;
                         culled_triangles += triangles;
@@ -1467,7 +1306,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 view.draws.push(PreparedObject {
                     chunk: group_index * SECTION_GROUP_SIZE + slot,
                     section_culled,
-                    use_lod,
                     bridge_section_gap: bridge_group,
                     direct_slot: None,
                     uniforms: ObjectUniforms {
@@ -1502,10 +1340,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     continue;
                 };
                 let mut direct = packed_layout.is_none()
-                    || (picking.is_none() && chunk.selected && !packed_mask)
-                    || matches!(chunk.vertex_buf, Some(VertexRange::Direct(_)));
+                    || (picking.is_none() && chunk.selected && !packed_mask);
                 if packed_layout.is_some() {
-                    if let Some((geometry, _)) = chunk.color_faces(object.use_lod) {
+                    if let Some(geometry) = &chunk.vertex_buf {
                         // A direct face can still be selected even when its opaque draw is culled.
                         direct |= matches!(geometry, VertexRange::Direct(_));
                         view.faces.push_color(
@@ -1550,10 +1387,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 "scene.section_bridged_edge_vertices",
                 view.edges.section_gap_vertices(),
             );
-            iletki_wgpu::profiling::count("scene.section_crossing_groups", crossing_groups);
+            iletki_wgpu::profiling::count(
+                "scene.section_crossing_groups",
+                if cull_sections { crossing_groups } else { 0 },
+            );
             iletki_wgpu::profiling::count("scene.section_chunk_tests", section_tests);
             iletki_wgpu::profiling::count("scene.section_deferred_chunks", deferred_chunks);
-            iletki_wgpu::profiling::count("scene.lod_chunks", lod_chunks);
             iletki_wgpu::profiling::count("scene.frustum_chunk_tests", frustum_tests);
             iletki_wgpu::profiling::count(
                 "scene.opaque_triangles",
@@ -1686,15 +1525,15 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                             return;
                         };
-                        let faces = if edges {
-                            chunk.edge_buf.as_ref().map(|edge| (edge, chunk.edge_count))
+                        let (geometry, count) = if edges {
+                            (&chunk.edge_buf, chunk.edge_count)
                         } else {
-                            chunk.color_faces(object.use_lod)
+                            (&chunk.vertex_buf, chunk.vertex_count)
                         };
-                        if let Some((buffer, count)) = faces
+                        if let Some(buffer) = geometry
                             && view.bind(pass, index, p.dynamic_uniforms)
                         {
-                            pass.set_vertex_buffer(0, buffer.slice());
+                            buffer.bind(pass);
                             pass.draw(0..count, 0..1);
                         }
                     };
@@ -1743,7 +1582,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             .or_else(|| vertices.pick_slice())
                         && view.bind(pass, index, p.dynamic_uniforms)
                     {
-                        pass.set_vertex_buffer(0, vertices.slice());
+                        vertices.bind_position(pass);
                         pass.set_vertex_buffer(1, ids);
                         pass.draw(0..chunk.vertex_count, 0..1);
                     }

@@ -13,7 +13,6 @@ pub(crate) struct PreparedObject {
     pub(crate) chunk: usize,
     pub(crate) uniforms: ObjectUniforms,
     pub(crate) section_culled: bool,
-    pub(crate) use_lod: bool,
     pub(crate) bridge_section_gap: bool,
     pub(crate) direct_slot: Option<usize>,
 }
