@@ -98,9 +98,11 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         )
         .unwrap()]);
         let mut selection_updates = Vec::new();
+        let mut motion = None;
+        let mut replaced = None;
         for i in 0..289 {
-            let x = (f64::from(i % 17) - 8.0) * 0.45;
-            let z = (f64::from(i / 17) - 8.0) * 0.45;
+            let x = (f64::from(i / 17) - 8.0) * 0.45;
+            let z = (f64::from(i % 17) - 8.0) * 0.45;
             let mut mesh = Mesh3D::at_origin(Vec3::new(x, 0.0, z));
             mesh.push_box_with_edges(
                 Vec3::new(-0.19, -0.15, -0.19),
@@ -116,7 +118,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             if i == 81 {
                 mesh.pick_ids.fill([0, 0]);
             }
-            if i == 150 {
+            if i == 246 {
                 // A caller can supply bounds that predate an edit to the public vertex list.
                 mesh.local_bounds = iletki_core::Bounds3::from_corners(
                     Vec3::new(-3.4, -0.15, -0.19),
@@ -124,6 +126,12 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
                 );
             }
             let chunk = scene.insert(mesh);
+            if i == 4 {
+                motion = Some(chunk);
+            }
+            if i == 39 {
+                replaced = Some(chunk);
+            }
             if i % 11 != 0 {
                 scene.set_selected(chunk, true);
             }
@@ -135,11 +143,30 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         for id in selection_updates {
             scene.set_selected(id, false);
         }
+        render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        scene.set_origin(motion.unwrap(), Vec3::new(2.25, -0.35, -1.8));
+        scene.remove(replaced.unwrap());
+        let mut moved_mesh = Mesh3D::at_origin(Vec3::new(2.25, -0.35, 1.8));
+        moved_mesh.push_box_with_edges(
+            Vec3::new(-0.19, -0.15, -0.19),
+            Vec3::new(0.19, 0.15, 0.19),
+            [185, 70, 175, 255],
+            [20, 30, 30, 150],
+            PickId::new(1, 290, 0),
+            true,
+        );
+        scene.insert(moved_mesh);
         let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
         let area = [0, 0, SIZE, SIZE];
         let packed = host
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
             .unwrap();
+        scene.set_profile_section_groups(false);
+        let per_chunk = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        assert!(
+            image.pixels == per_chunk.pixels,
+            "grouped section differs with {features:?} and dynamic uniform limit {limit}"
+        );
         scene.set_profile_section_culling(false);
         let unculled = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
         assert!(
@@ -147,6 +174,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             "culled section differs with {features:?} and dynamic uniform limit {limit}"
         );
         scene.set_profile_section_culling(true);
+        scene.set_profile_section_groups(true);
         scene.set_profile_batch_geometry(false);
         let direct = render(&device, &queue, &mut host, &mut scene, camera).unwrap();
         assert!(

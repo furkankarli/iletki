@@ -2,7 +2,7 @@
 
 use crate::{Vertex3D, face_batch::PackedDraws};
 use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
-use iletki_core::{Bounds3, Camera, MAX_CLIP_PLANES, Mat4, Vec4, ViewportId};
+use iletki_core::{Bounds3, Camera, Frustum, MAX_CLIP_PLANES, Mat4, Vec3, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
 
@@ -188,24 +188,96 @@ pub(crate) fn bounds_cover_vertices(bounds: Bounds3, vertices: &[Vertex3D]) -> b
 }
 
 /// Bounds rounded with the same camera-relative translation as the 3D vertex shaders.
-fn rounded_bounds(bounds: Bounds3, [ox, oy, oz]: [f32; 3]) -> Option<([f64; 3], [f64; 3])> {
+fn rounded_bounds(bounds: Bounds3, offset: [f32; 3]) -> Option<([f64; 3], [f64; 3])> {
     if bounds.is_empty() {
         return None;
     }
-    let [min_x, min_y, min_z] = bounds.min.to_f32();
-    let [max_x, max_y, max_z] = bounds.max.to_f32();
-    let lo = [min_x + ox, min_y + oy, min_z + oz].map(f64::from);
-    let hi = [max_x + ox, max_y + oy, max_z + oz].map(f64::from);
+    let lo = translated_corner(bounds.min, offset).map(f64::from);
+    let hi = translated_corner(bounds.max, offset).map(f64::from);
     lo.into_iter()
         .chain(hi)
         .all(f64::is_finite)
         .then_some((lo, hi))
 }
 
+fn translated_corner(local: Vec3, [ox, oy, oz]: [f32; 3]) -> [f32; 3] {
+    let [x, y, z] = local.to_f32();
+    [x + ox, y + oy, z + oz]
+}
+
 /// Conservative rejection for the raster clip-distance path.
 pub(crate) struct SectionVolume {
     planes: [[f64; 4]; MAX_CLIP_PLANES],
     count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionRelation {
+    Outside,
+    Inside,
+    Crossing,
+}
+
+/// An envelope around the trusted members of a group of consecutive chunk slots.
+#[derive(Default)]
+pub(crate) struct SectionGroup {
+    origins: Bounds3,
+    local: Bounds3,
+    invalid_origin: bool,
+}
+
+impl SectionGroup {
+    pub(crate) fn include(&mut self, origin: Vec3, local: Bounds3) {
+        // A nonfinite origin makes this group ineligible for either shortcut.
+        if !origin.is_finite() {
+            self.invalid_origin = true;
+            return;
+        }
+        self.origins.min = self.origins.min.min(origin);
+        self.origins.max = self.origins.max.max(origin);
+        self.local.min = self.local.min.min(local.min);
+        self.local.max = self.local.max.max(local.max);
+    }
+
+    pub(crate) fn contains_origin(&self, origin: Vec3) -> bool {
+        !self.invalid_origin
+            && origin.min(self.origins.min) == self.origins.min
+            && origin.max(self.origins.max) == self.origins.max
+    }
+
+    pub(crate) fn section_relation(&self, volume: &SectionVolume, camera: Vec3) -> SectionRelation {
+        if self.invalid_origin {
+            return SectionRelation::Crossing;
+        }
+        // Bound the two f32 operations separately. Each chunk rounds its camera offset
+        // before adding it to the local vertex, even when its world origin is far away.
+        let min = translated_corner(self.local.min, (self.origins.min - camera).to_f32());
+        let max = translated_corner(self.local.max, (self.origins.max - camera).to_f32());
+        if min.into_iter().chain(max).all(f32::is_finite) {
+            volume.classify(min.map(f64::from), max.map(f64::from), true)
+        } else {
+            SectionRelation::Crossing
+        }
+    }
+
+    pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
+        if self.invalid_origin {
+            return false;
+        }
+        let lo = (self.origins.min + self.local.min) - camera;
+        let hi = (self.origins.max + self.local.max) - camera;
+        lo.is_finite()
+            && hi.is_finite()
+            && frustum.planes.iter().flatten().all(|plane| {
+                let n = plane.normal;
+                let near = Vec3::new(
+                    if n.x >= 0.0 { lo.x } else { hi.x },
+                    if n.y >= 0.0 { lo.y } else { hi.y },
+                    if n.z >= 0.0 { lo.z } else { hi.z },
+                );
+                plane.signed_distance(near) >= 0.0
+            })
+    }
 }
 
 impl SectionVolume {
@@ -231,26 +303,53 @@ impl SectionVolume {
     }
 
     pub(crate) fn excludes(&self, bounds: Bounds3, offset: [f32; 3]) -> bool {
-        let Some(([lx, ly, lz], [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
+        let Some((lo, hi)) = rounded_bounds(bounds, offset) else {
             return false;
         };
+        self.classify(lo, hi, false) == SectionRelation::Outside
+    }
+
+    fn classify(
+        &self,
+        [lx, ly, lz]: [f64; 3],
+        [hx, hy, hz]: [f64; 3],
+        check_inside: bool,
+    ) -> SectionRelation {
         let [mx, my, mz] = [
             lx.abs().max(hx.abs()),
             ly.abs().max(hy.abs()),
             lz.abs().max(hz.abs()),
         ];
-        self.planes.iter().take(self.count).any(|&[x, y, z, d]| {
-            let support = x * if x >= 0.0 { hx } else { lx }
-                + y * if y >= 0.0 { hy } else { ly }
-                + z * if z >= 0.0 { hz } else { lz }
-                + d;
+        let mut inside = check_inside;
+        for &[x, y, z, d] in self.planes.iter().take(self.count) {
+            let (near_x, far_x) = if x >= 0.0 { (lx, hx) } else { (hx, lx) };
+            let (near_y, far_y) = if y >= 0.0 { (ly, hy) } else { (hy, ly) };
+            let (near_z, far_z) = if z >= 0.0 { (lz, hz) } else { (hz, lz) };
             let magnitude = x.abs() * mx + y.abs() * my + z.abs() * mz + d.abs();
             // The raster shader adds the camera WGSL clip tolerance. Account for all f32
             // arithmetic (including fused evaluation) before rejecting a whole primitive.
             let tolerance = f64::from(1e-4_f32);
             let error = (magnitude + tolerance) * (16.0 * f64::from(f32::EPSILON));
-            magnitude < f64::from(f32::MAX) * 0.5 && support + error < -tolerance
-        })
+            if magnitude >= f64::from(f32::MAX) * 0.5 {
+                inside = false;
+                continue;
+            }
+            let support = x * far_x + y * far_y + z * far_z + d;
+            if support + error < -tolerance {
+                return SectionRelation::Outside;
+            }
+            if inside {
+                let minimum = x * near_x + y * near_y + z * near_z + d;
+                // Every member's own positive support plus its error margin is at least
+                // this minimum. A subsequent per-member test could not reject it.
+                inside = minimum - error >= -tolerance;
+            }
+        }
+        if inside {
+            SectionRelation::Inside
+        } else {
+            SectionRelation::Crossing
+        }
     }
 }
 

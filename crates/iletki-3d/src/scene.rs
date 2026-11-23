@@ -4,7 +4,8 @@
 
 use crate::face_batch::{self, PageBuilder, VertexRange};
 use crate::objects::{
-    PickVolume, PreparedObject, SectionVolume, ViewObjects, bounds_cover_vertices,
+    PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume, ViewObjects,
+    bounds_cover_vertices,
 };
 use crate::outline_bounds::OutlineUpdate;
 use crate::section::SectionAa;
@@ -21,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
+const SECTION_GROUP_SIZE: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -102,6 +104,7 @@ pub struct Scene3DLayer {
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
     free_chunks: BinaryHeap<Reverse<usize>>,
+    section_groups: Vec<Option<SectionGroup>>,
     views: Vec<ViewObjects>,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_uniforms: bool,
@@ -111,6 +114,8 @@ pub struct Scene3DLayer {
     profile_batch_picking: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_section_culling: bool,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_section_groups: bool,
 }
 
 impl std::fmt::Debug for Scene3DLayer {
@@ -133,6 +138,7 @@ impl Scene3DLayer {
             use_antialiased_section: false,
             chunks: Vec::new(),
             free_chunks: BinaryHeap::new(),
+            section_groups: Vec::new(),
             views: Vec::new(),
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_uniforms: true,
@@ -142,6 +148,8 @@ impl Scene3DLayer {
             profile_batch_picking: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_section_culling: true,
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_section_groups: true,
         }
     }
 
@@ -175,6 +183,15 @@ impl Scene3DLayer {
     pub fn set_profile_section_culling(&mut self, enabled: bool) {
         if self.profile_section_culling != enabled {
             self.profile_section_culling = enabled;
+            self.revision.mark_static();
+        }
+    }
+
+    /// Enables grouped section and frustum tests for A/B profiling.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_section_groups(&mut self, enabled: bool) {
+        if self.profile_section_groups != enabled {
+            self.profile_section_groups = enabled;
             self.revision.mark_static();
         }
     }
@@ -217,6 +234,15 @@ impl Scene3DLayer {
             && let Some(entry) = self.chunk_mut(id)
         {
             entry.origin = origin;
+            // Motion inside the original envelope does not make its bounds stale.
+            if entry.section_bounds_trusted
+                && let Some(group) = self.section_groups.get_mut(id.index / SECTION_GROUP_SIZE)
+                && group
+                    .as_ref()
+                    .is_some_and(|group| !group.contains_origin(origin))
+            {
+                *group = None;
+            }
             self.revision.mark_static();
         }
     }
@@ -267,6 +293,9 @@ impl Scene3DLayer {
         {
             *slot = None;
             self.free_chunks.push(Reverse(id.index));
+            if let Some(group) = self.section_groups.get_mut(id.index / SECTION_GROUP_SIZE) {
+                *group = None;
+            }
             for view in &mut self.views {
                 view.faces.clear();
                 view.edges.clear();
@@ -902,6 +931,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
             if let Some(mesh) = chunk.pending_mesh.take() {
                 self.revision.mark_static();
+                if let Some(group) = self
+                    .section_groups
+                    .get_mut(chunk_index / SECTION_GROUP_SIZE)
+                {
+                    *group = None;
+                }
                 let face_bounds = bounds_cover_vertices(chunk.local_bounds, &mesh.vertices);
                 chunk.pick_bounds_trusted = face_bounds;
                 chunk.section_bounds_trusted =
@@ -1047,51 +1082,103 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let cull_sections = cull_sections && self.profile_section_culling;
         let section_volume = cull_sections.then(|| SectionVolume::new(ctx.camera));
+        let group_sections = self.chunks.len() >= SECTION_GROUP_SIZE * 4;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        let (mut culled_chunks, mut culled_triangles) = (0_usize, 0_usize);
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            let Some(chunk) = chunk else {
-                continue;
-            };
-            if !chunk.visible || (chunk.vertex_count == 0 && chunk.edge_count == 0) {
-                continue;
-            }
-            let offset_rel = (chunk.origin - cam_pos).to_f32();
-            if let Some(volume) = &pick_volume {
-                if !chunk.has_picks
-                    || (chunk.pick_bounds_trusted
-                        && !volume.intersects(chunk.local_bounds, offset_rel))
-                {
+        let group_sections = group_sections && self.profile_section_groups;
+        let group_volume = section_volume.as_ref().filter(|_| group_sections);
+        if group_volume.is_some() {
+            self.section_groups
+                .resize_with(self.chunks.len().div_ceil(SECTION_GROUP_SIZE), || None);
+        }
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let profiling = iletki_wgpu::profiling::active();
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let (mut culled_chunks, mut culled_triangles, mut section_tests, mut frustum_tests) =
+            (0, 0, 0, 0);
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let mut opaque_triangles = 0;
+        for (group_index, chunks) in self.chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
+            let (relation, inside_frustum) = group_volume
+                .and_then(|volume| {
+                    let group = self
+                        .section_groups
+                        .get_mut(group_index)?
+                        .get_or_insert_with(|| {
+                            let mut bounds = SectionGroup::default();
+                            for chunk in
+                                chunks.iter().flatten().filter(|c| c.section_bounds_trusted)
+                            {
+                                bounds.include(chunk.origin, chunk.local_bounds);
+                            }
+                            bounds
+                        });
+                    Some((
+                        group.section_relation(volume, cam_pos),
+                        group.inside_frustum(&frustum, cam_pos),
+                    ))
+                })
+                .unwrap_or((SectionRelation::Crossing, false));
+            for (slot, chunk) in chunks.iter().enumerate() {
+                let Some(chunk) = chunk else { continue };
+                if !chunk.visible || (chunk.vertex_count == 0 && chunk.edge_count == 0) {
                     continue;
                 }
-            } else {
-                let bounds = Bounds3::from_corners(
-                    chunk.origin + chunk.local_bounds.min,
-                    chunk.origin + chunk.local_bounds.max,
-                );
-                if !bounds.is_empty() && !frustum.intersects_bounds_world(bounds, cam_pos) {
-                    continue;
+                let offset_rel = (chunk.origin - cam_pos).to_f32();
+                if let Some(volume) = &pick_volume {
+                    if !chunk.has_picks
+                        || (chunk.pick_bounds_trusted
+                            && !volume.intersects(chunk.local_bounds, offset_rel))
+                    {
+                        continue;
+                    }
+                } else if !inside_frustum || !chunk.section_bounds_trusted {
+                    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                    if profiling {
+                        frustum_tests += 1;
+                    }
+                    let bounds = Bounds3::from_corners(
+                        chunk.origin + chunk.local_bounds.min,
+                        chunk.origin + chunk.local_bounds.max,
+                    );
+                    if !bounds.is_empty() && !frustum.intersects_bounds_world(bounds, cam_pos) {
+                        continue;
+                    }
                 }
+                let section_culled = chunk.section_bounds_trusted
+                    && match relation {
+                        SectionRelation::Outside => true,
+                        SectionRelation::Inside => false,
+                        SectionRelation::Crossing => {
+                            section_volume.as_ref().is_some_and(|volume| {
+                                #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                                if profiling {
+                                    section_tests += 1;
+                                }
+                                volume.excludes(chunk.local_bounds, offset_rel)
+                            })
+                        }
+                    };
+                #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                if profiling && picking.is_none() {
+                    let triangles = chunk.vertex_count as usize / 3;
+                    if section_culled {
+                        culled_chunks += 1;
+                        culled_triangles += triangles;
+                    } else {
+                        opaque_triangles += triangles;
+                    }
+                }
+                view.has_edges |= chunk.edge_count != 0 && !section_culled;
+                view.draws.push(PreparedObject {
+                    chunk: group_index * SECTION_GROUP_SIZE + slot,
+                    section_culled,
+                    direct_slot: None,
+                    uniforms: ObjectUniforms {
+                        offset_rel,
+                        scale: 1.0,
+                    },
+                });
             }
-            let section_culled = chunk.section_bounds_trusted
-                && section_volume
-                    .as_ref()
-                    .is_some_and(|volume| volume.excludes(chunk.local_bounds, offset_rel));
-            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-            if section_culled {
-                culled_chunks += 1;
-                culled_triangles += chunk.vertex_count as usize / 3;
-            }
-            view.has_edges |= chunk.edge_count != 0 && !section_culled;
-            view.draws.push(PreparedObject {
-                chunk: index,
-                section_culled,
-                direct_slot: None,
-                uniforms: ObjectUniforms {
-                    offset_rel,
-                    scale: 1.0,
-                },
-            });
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         drop(visibility);
@@ -1145,7 +1232,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        if iletki_wgpu::profiling::active() {
+        if profiling {
+            iletki_wgpu::profiling::count("scene.section_chunk_tests", section_tests);
+            iletki_wgpu::profiling::count("scene.frustum_chunk_tests", frustum_tests);
+            iletki_wgpu::profiling::count("scene.opaque_triangles", opaque_triangles);
             iletki_wgpu::profiling::count("scene.scanned_slots", self.chunks.len());
             iletki_wgpu::profiling::count("scene.candidates", view.draws.len());
             iletki_wgpu::profiling::count("scene.section_culled_chunks", culled_chunks);

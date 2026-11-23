@@ -82,6 +82,11 @@ The adapter chooses raster clipping when clip distances are available. Set
 Set `ILETKI_ASSEMBLY_NO_SECTION_CULL=1` for a raster control run that submits whole chunks
 to the GPU even when they lie outside a section plane. The `scene.section_culled_chunks`
 and `scene.section_culled_triangles` counters report the geometry skipped by the CPU.
+Use `ILETKI_ASSEMBLY_NO_SECTION_GROUPS=1` to compare grouped bounds against
+per-chunk culling. The `scene.section_chunk_tests` and `scene.frustum_chunk_tests` counters
+track individual bounds tests, and `scene.opaque_triangles` counts triangles submitted
+to the color pass. Use `ILETKI_ASSEMBLY_SHUFFLE=1` to permute the insertion order of the
+synthetic assembly while preserving the geometry and input sequence.
 `ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
 Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
 adds an orthographic view to a model run and records both reference image hashes.

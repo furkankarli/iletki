@@ -150,7 +150,12 @@ mod native {
             scene.set_profile_batch_uniforms(batch);
             scene.set_profile_batch_geometry(pack_geometry);
             let mut edits = Vec::new();
-            for i in 0..self.chunks {
+            let mut order: Vec<_> = (0..self.chunks).collect();
+            if std::env::var_os("ILETKI_ASSEMBLY_SHUFFLE").is_some() {
+                // An odd multiplier permutes the keys and distributes nearby parts across slots.
+                order.sort_unstable_by_key(|i| i.wrapping_mul(0x9e37_79b9));
+            }
+            for i in order {
                 let x = f64::from(i % 64) * 2.0;
                 let y = f64::from(i / 64) * 2.0;
                 let origin = Vec3::new(x, y, 0.0);
@@ -267,6 +272,9 @@ mod native {
         ) -> Result<(), Error> {
             if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_CULL").is_some() {
                 scene.set_profile_section_culling(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_GROUPS").is_some() {
+                scene.set_profile_section_groups(false);
             }
             self.record_memory(case, "before-targets")?;
             let host = || {
