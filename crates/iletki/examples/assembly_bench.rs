@@ -276,6 +276,9 @@ mod native {
             if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_GROUPS").is_some() {
                 scene.set_profile_section_groups(false);
             }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_BRIDGING").is_some() {
+                scene.set_profile_section_bridging(false);
+            }
             self.record_memory(case, "before-targets")?;
             let host = || {
                 ViewportHost::new_with_adapter(

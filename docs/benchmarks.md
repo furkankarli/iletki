@@ -81,7 +81,14 @@ The adapter chooses raster clipping when clip distances are available. Set
 `ILETKI_ASSEMBLY_SAMPLED_SECTION=1` to exercise the sampled shader.
 Set `ILETKI_ASSEMBLY_NO_SECTION_CULL=1` for a raster control run that submits whole chunks
 to the GPU even when they lie outside a section plane. The `scene.section_culled_chunks`
-and `scene.section_culled_triangles` counters report the geometry skipped by the CPU.
+counter counts fully clipped chunks, and `scene.section_culled_triangles` counts their
+triangles omitted by the CPU. Use `ILETKI_ASSEMBLY_NO_SECTION_BRIDGING=1` for the control
+that runs individual tests on crossing groups and omits every fully clipped range.
+The optimization activates when at least three quarters of object groups cross a section
+plane inside the camera frustum.
+`scene.section_deferred_chunks` counts small packed chunks tested only by the rasterizer.
+The `scene.section_bridged_triangles` and
+`scene.section_bridged_edge_vertices` counters track clipped geometry retained to merge draws.
 Use `ILETKI_ASSEMBLY_NO_SECTION_GROUPS=1` to compare grouped bounds against
 per-chunk culling. The `scene.section_chunk_tests` and `scene.frustum_chunk_tests` counters
 track individual bounds tests, and `scene.opaque_triangles` counts triangles submitted

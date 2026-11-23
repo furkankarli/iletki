@@ -100,8 +100,16 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         let mut selection_updates = Vec::new();
         let mut motion = None;
         let mut replaced = None;
-        for i in 0..289 {
-            let x = (f64::from(i / 17) - 8.0) * 0.45;
+        let mut hidden = None;
+        let mut removed = None;
+        for i in (0..7).chain((0..282).map(|index| 7 + index * 37 % 282)) {
+            // Put a fully clipped chunk between two visible packed ranges, then
+            // put hidden and removed chunks in separate gaps on the same page.
+            let x = if matches!(i, 0 | 2 | 3 | 5 | 6) {
+                1.8
+            } else {
+                (f64::from(i / 17) - 8.0) * 0.45
+            };
             let z = (f64::from(i % 17) - 8.0) * 0.45;
             let mut mesh = Mesh3D::at_origin(Vec3::new(x, 0.0, z));
             mesh.push_box_with_edges(
@@ -112,6 +120,17 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
                 PickId::new(1, i + 1, 0),
                 true,
             );
+            if i == 1 {
+                // Exceed the small-object cutoff so this clipped chunk forms a staged gap.
+                mesh.push_box_with_edges(
+                    Vec3::new(-0.1, -0.1, -0.1),
+                    Vec3::new(0.1, 0.1, 0.1),
+                    [185, 70, 175, 255],
+                    [20, 30, 30, 150],
+                    PickId::new(1, i + 1, 0),
+                    true,
+                );
+            }
             if i == 80 {
                 mesh.pick_ids.clear();
             }
@@ -126,8 +145,14 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
                 );
             }
             let chunk = scene.insert(mesh);
+            if i == 3 {
+                hidden = Some(chunk);
+            }
             if i == 4 {
                 motion = Some(chunk);
+            }
+            if i == 5 {
+                removed = Some(chunk);
             }
             if i == 39 {
                 replaced = Some(chunk);
@@ -144,6 +169,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             scene.set_selected(id, false);
         }
         render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        scene.set_visible(hidden.unwrap(), false);
         scene.set_origin(motion.unwrap(), Vec3::new(2.25, -0.35, -1.8));
         scene.remove(replaced.unwrap());
         let mut moved_mesh = Mesh3D::at_origin(Vec3::new(2.25, -0.35, 1.8));
@@ -156,11 +182,36 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             true,
         );
         scene.insert(moved_mesh);
+        scene.remove(removed.unwrap());
+        iletki_wgpu::profiling::begin(&device);
         let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        let capture = iletki_wgpu::profiling::finish(&device, &queue).unwrap();
+        if features.contains(wgpu::Features::CLIP_DISTANCES) {
+            for counter in [
+                "scene.section_bridged_triangles",
+                "scene.section_bridged_edge_vertices",
+                "scene.section_deferred_chunks",
+            ] {
+                assert!(
+                    capture
+                        .counters
+                        .iter()
+                        .any(|&(label, value)| label == counter && value > 0),
+                    "fixture did not exercise {counter} with dynamic uniform limit {limit}"
+                );
+            }
+        }
         let area = [0, 0, SIZE, SIZE];
         let packed = host
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
             .unwrap();
+        scene.set_profile_section_bridging(false);
+        let unbridged = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        assert!(
+            image.pixels == unbridged.pixels,
+            "bridged section differs with {features:?} and dynamic uniform limit {limit}"
+        );
+        scene.set_profile_section_bridging(true);
         scene.set_profile_section_groups(false);
         let per_chunk = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
         assert!(

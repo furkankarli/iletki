@@ -7,6 +7,8 @@ use std::{num::NonZeroU64, ops::Range, sync::Arc};
 // The matching WGSL uniform array is 4 KiB, within the WebGPU uniform binding limit.
 const OBJECTS: usize = 256;
 const MAX_VERTICES: usize = 65_536;
+// Bound the extra vertex work in exchange for one fewer draw.
+const MAX_SECTION_GAP_VERTICES: u32 = 256;
 const UNIFORM_BLOCK_BYTES: usize = 1024 * 1024;
 pub(crate) const OBJECT_BYTES: u64 = (OBJECTS * size_of::<ObjectUniforms>()) as u64;
 
@@ -181,6 +183,9 @@ pub(crate) struct PackedDraws {
     commands: Vec<Draw>,
     last_page: Option<Arc<GeometryPage>>,
     used_pages: usize,
+    section_gap_end: Option<u32>,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    section_gap_vertices: usize,
 }
 
 enum Draw {
@@ -197,6 +202,57 @@ impl PackedDraws {
         self.commands.clear();
         self.last_page = None;
         self.used_pages = 0;
+        self.section_gap_end = None;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        {
+            self.section_gap_vertices = 0;
+        }
+    }
+
+    /// Stages fully clipped vertices after an active raster draw. A matching retained range
+    /// commits the gap, so trailing clipped geometry stays out of the draw.
+    fn stage_section_gap(&mut self, geometry: &VertexRange, offset: ObjectUniforms) {
+        let VertexRange::Packed {
+            page,
+            vertices,
+            slot,
+        } = geometry
+        else {
+            return;
+        };
+        let Some(Draw::Packed {
+            geometry: previous_page,
+            uniforms,
+            vertices: previous,
+        }) = self.commands.last()
+        else {
+            return;
+        };
+        if self.section_gap_end.unwrap_or(previous.end) == vertices.start
+            && vertices.end - previous.end <= MAX_SECTION_GAP_VERTICES
+            && Arc::ptr_eq(previous_page, page)
+            && let Some(transform) = self.pages.get_mut(*uniforms).and_then(|p| p.get_mut(*slot))
+        {
+            *transform = offset;
+            self.section_gap_end = Some(vertices.end);
+        }
+    }
+
+    /// Adds a color range, with short gaps staged only for the raster clipping pipeline.
+    #[inline]
+    pub(crate) fn push_color(
+        &mut self,
+        geometry: &VertexRange,
+        offset: ObjectUniforms,
+        draw_index: usize,
+        clipped: bool,
+        bridge_sections: bool,
+    ) {
+        if !clipped {
+            self.push(geometry, offset, draw_index);
+        } else if bridge_sections {
+            self.stage_section_gap(geometry, offset);
+        }
     }
 
     pub(crate) fn push(
@@ -205,6 +261,7 @@ impl PackedDraws {
         offset: ObjectUniforms,
         draw_index: usize,
     ) {
+        let gap_end = self.section_gap_end.take();
         let VertexRange::Packed {
             page,
             vertices,
@@ -236,16 +293,20 @@ impl PackedDraws {
         {
             *transform = offset;
         }
-        // Only merge adjacent visible ranges. This keeps primitive order and never revives
-        // hidden or deleted objects when another object on the page is still live.
+        // Each merged vertex has staged uniforms for this viewport. The range ends at
+        // retained geometry and preserves the existing draw order.
         if let Some(Draw::Packed {
             uniforms: prev,
             vertices: range,
             ..
         }) = self.commands.last_mut()
             && *prev == uniforms
-            && range.end == vertices.start
+            && gap_end.unwrap_or(range.end) == vertices.start
         {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            if let Some(end) = gap_end {
+                self.section_gap_vertices += (end - range.end) as usize;
+            }
             range.end = vertices.end;
             return;
         }
@@ -344,6 +405,11 @@ impl PackedDraws {
             self.commands.len(),
             self.used_pages.div_ceil(self.pages_per_buffer.max(1)),
         )
+    }
+
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub(crate) fn section_gap_vertices(&self) -> usize {
+        self.section_gap_vertices
     }
 
     pub(crate) fn paint(

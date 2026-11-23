@@ -23,6 +23,8 @@ use std::{cmp::Reverse, collections::BinaryHeap};
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 const SECTION_GROUP_SIZE: usize = 32;
+// Keep tiny packed objects together in groups that need raster clipping anyway.
+const MAX_DEFERRED_SECTION_VERTICES: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -53,6 +55,7 @@ struct ChunkEntry {
     has_picks: bool,
     pick_bounds_trusted: bool,
     section_bounds_trusted: bool,
+    small_packed: bool,
 }
 
 struct Pipelines {
@@ -105,6 +108,7 @@ pub struct Scene3DLayer {
     chunks: Vec<Option<ChunkEntry>>,
     free_chunks: BinaryHeap<Reverse<usize>>,
     section_groups: Vec<Option<SectionGroup>>,
+    section_relations: Vec<(SectionRelation, bool)>,
     views: Vec<ViewObjects>,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_uniforms: bool,
@@ -116,6 +120,8 @@ pub struct Scene3DLayer {
     profile_section_culling: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_section_groups: bool,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_section_bridging: bool,
 }
 
 impl std::fmt::Debug for Scene3DLayer {
@@ -139,6 +145,7 @@ impl Scene3DLayer {
             chunks: Vec::new(),
             free_chunks: BinaryHeap::new(),
             section_groups: Vec::new(),
+            section_relations: Vec::new(),
             views: Vec::new(),
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_uniforms: true,
@@ -150,6 +157,8 @@ impl Scene3DLayer {
             profile_section_culling: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_section_groups: true,
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_section_bridging: true,
         }
     }
 
@@ -196,6 +205,15 @@ impl Scene3DLayer {
         }
     }
 
+    /// Enables short clipped gaps between packed raster draws for A/B profiling.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_section_bridging(&mut self, enabled: bool) {
+        if self.profile_section_bridging != enabled {
+            self.profile_section_bridging = enabled;
+            self.revision.mark_static();
+        }
+    }
+
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
     pub fn insert(&mut self, mesh: Mesh3D) -> Chunk3DId {
         self.revision.mark_static();
@@ -215,6 +233,7 @@ impl Scene3DLayer {
             has_picks: false,
             pick_bounds_trusted: false,
             section_bounds_trusted: false,
+            small_packed: false,
         };
         // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
         if let Some(Reverse(index)) = self.free_chunks.pop()
@@ -941,6 +960,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 chunk.pick_bounds_trusted = face_bounds;
                 chunk.section_bounds_trusted =
                     face_bounds && bounds_cover_vertices(chunk.local_bounds, &mesh.edges);
+                chunk.small_packed = (pack || mesh.vertices.is_empty())
+                    && (pack_edges || mesh.edges.is_empty())
+                    && mesh.vertices.len().saturating_add(mesh.edges.len())
+                        <= MAX_DEFERRED_SECTION_VERTICES;
                 if mesh.vertices.is_empty() {
                     chunk.vertex_buf = None;
                     chunk.vertex_count = 0;
@@ -1081,15 +1104,44 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let cull_sections = picking.is_none() && section == Some(SectionAa::Raster);
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let cull_sections = cull_sections && self.profile_section_culling;
+        let bridge_sections = cull_sections && pack_geometry;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let bridge_sections = bridge_sections && self.profile_section_bridging;
         let section_volume = cull_sections.then(|| SectionVolume::new(ctx.camera));
         let group_sections = self.chunks.len() >= SECTION_GROUP_SIZE * 4;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let group_sections = group_sections && self.profile_section_groups;
         let group_volume = section_volume.as_ref().filter(|_| group_sections);
-        if group_volume.is_some() {
+        self.section_relations.clear();
+        let mut crossing_groups = 0;
+        if let Some(volume) = group_volume {
             self.section_groups
                 .resize_with(self.chunks.len().div_ceil(SECTION_GROUP_SIZE), || None);
+            for (cached, chunks) in self
+                .section_groups
+                .iter_mut()
+                .zip(self.chunks.chunks(SECTION_GROUP_SIZE))
+            {
+                let group = cached.get_or_insert_with(|| {
+                    let mut bounds = SectionGroup::default();
+                    for chunk in chunks.iter().flatten().filter(|c| c.section_bounds_trusted) {
+                        bounds.include(chunk.origin, chunk.local_bounds);
+                    }
+                    bounds
+                });
+                let relation = group.section_relation(volume, cam_pos);
+                let inside_frustum = group.inside_frustum(&frustum, cam_pos);
+                crossing_groups +=
+                    usize::from(relation == SectionRelation::Crossing && inside_frustum);
+                self.section_relations.push((relation, inside_frustum));
+            }
         }
+        // Use batching across gaps when at least three quarters of the groups intersect a
+        // section inside the frustum. Localized scenes usually expose long runs of clipped
+        // groups, where the existing CPU rejection avoids more useful vertex work.
+        let group_count = self.section_relations.len();
+        let bridge_sections =
+            bridge_sections && group_count != 0 && crossing_groups >= group_count - group_count / 4;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let profiling = iletki_wgpu::profiling::active();
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -1097,27 +1149,16 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             (0, 0, 0, 0);
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let mut opaque_triangles = 0;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let mut deferred_chunks = 0;
         for (group_index, chunks) in self.chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
-            let (relation, inside_frustum) = group_volume
-                .and_then(|volume| {
-                    let group = self
-                        .section_groups
-                        .get_mut(group_index)?
-                        .get_or_insert_with(|| {
-                            let mut bounds = SectionGroup::default();
-                            for chunk in
-                                chunks.iter().flatten().filter(|c| c.section_bounds_trusted)
-                            {
-                                bounds.include(chunk.origin, chunk.local_bounds);
-                            }
-                            bounds
-                        });
-                    Some((
-                        group.section_relation(volume, cam_pos),
-                        group.inside_frustum(&frustum, cam_pos),
-                    ))
-                })
+            let (relation, inside_frustum) = self
+                .section_relations
+                .get(group_index)
+                .copied()
                 .unwrap_or((SectionRelation::Crossing, false));
+            let bridge_group = bridge_sections && relation == SectionRelation::Crossing;
+            let defer_small = bridge_group && inside_frustum;
             for (slot, chunk) in chunks.iter().enumerate() {
                 let Some(chunk) = chunk else { continue };
                 if !chunk.visible || (chunk.vertex_count == 0 && chunk.edge_count == 0) {
@@ -1148,6 +1189,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     && match relation {
                         SectionRelation::Outside => true,
                         SectionRelation::Inside => false,
+                        SectionRelation::Crossing if defer_small && chunk.small_packed => {
+                            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                            if profiling {
+                                deferred_chunks += 1;
+                            }
+                            false
+                        }
                         SectionRelation::Crossing => {
                             section_volume.as_ref().is_some_and(|volume| {
                                 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -1172,6 +1220,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 view.draws.push(PreparedObject {
                     chunk: group_index * SECTION_GROUP_SIZE + slot,
                     section_culled,
+                    bridge_section_gap: bridge_group,
                     direct_slot: None,
                     uniforms: ObjectUniforms {
                         offset_rel,
@@ -1209,16 +1258,26 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     if let Some(geometry) = &chunk.vertex_buf {
                         // A direct face can still be selected even when its opaque draw is culled.
                         direct |= matches!(geometry, VertexRange::Direct(_));
-                        if !object.section_culled {
-                            view.faces.push(geometry, object.uniforms, index);
-                        }
+                        view.faces.push_color(
+                            geometry,
+                            object.uniforms,
+                            index,
+                            object.section_culled,
+                            object.bridge_section_gap,
+                        );
                     }
                     if picking.is_none()
-                        && !object.section_culled
                         && let Some(geometry) = &chunk.edge_buf
                     {
-                        direct |= matches!(geometry, VertexRange::Direct(_));
-                        view.edges.push(geometry, object.uniforms, index);
+                        direct |=
+                            !object.section_culled && matches!(geometry, VertexRange::Direct(_));
+                        view.edges.push_color(
+                            geometry,
+                            object.uniforms,
+                            index,
+                            object.section_culled,
+                            object.bridge_section_gap,
+                        );
                     }
                 }
                 if direct {
@@ -1233,13 +1292,27 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         if profiling {
+            let bridged_triangles = view.faces.section_gap_vertices() / 3;
+            iletki_wgpu::profiling::count("scene.section_bridged_triangles", bridged_triangles);
+            iletki_wgpu::profiling::count(
+                "scene.section_bridged_edge_vertices",
+                view.edges.section_gap_vertices(),
+            );
+            iletki_wgpu::profiling::count("scene.section_crossing_groups", crossing_groups);
             iletki_wgpu::profiling::count("scene.section_chunk_tests", section_tests);
+            iletki_wgpu::profiling::count("scene.section_deferred_chunks", deferred_chunks);
             iletki_wgpu::profiling::count("scene.frustum_chunk_tests", frustum_tests);
-            iletki_wgpu::profiling::count("scene.opaque_triangles", opaque_triangles);
+            iletki_wgpu::profiling::count(
+                "scene.opaque_triangles",
+                opaque_triangles + bridged_triangles,
+            );
             iletki_wgpu::profiling::count("scene.scanned_slots", self.chunks.len());
             iletki_wgpu::profiling::count("scene.candidates", view.draws.len());
             iletki_wgpu::profiling::count("scene.section_culled_chunks", culled_chunks);
-            iletki_wgpu::profiling::count("scene.section_culled_triangles", culled_triangles);
+            iletki_wgpu::profiling::count(
+                "scene.section_culled_triangles",
+                culled_triangles.saturating_sub(bridged_triangles),
+            );
             let pass = if picking.is_some() {
                 "scene.pick_draws"
             } else {
