@@ -11,10 +11,14 @@
 //! - [`instanced`]: [`InstancedMesh3DLayer`] GPU-instanced 3D batching (100k+ instances in 1 draw
 //!   call) with per-instance 64-bit GPU picking and multi-viewport support.
 
+mod face_batch;
 pub mod gizmo;
 pub mod grid;
 pub mod instanced;
+mod objects;
+mod outline_bounds;
 pub mod scene;
+mod section;
 pub mod vertex;
 
 pub use gizmo::{GizmoAxis, TransformGizmoLayer};

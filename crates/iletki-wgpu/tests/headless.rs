@@ -472,6 +472,17 @@ fn pick_can_start_before_render_and_outlive_the_viewport() {
     let mut request = host
         .begin_pick_rect(&device, &queue, &(), &mut layers, [60, 60, 9, 9])
         .unwrap();
+    let mut corner = host
+        .begin_pick_rect(&device, &queue, &(), &mut layers, [0, 0, 9, 9])
+        .unwrap();
+    let empty = block_on(std::future::poll_fn(|_| corner.try_read())).unwrap();
+    assert!(empty.is_empty());
+    let mut reused = host
+        .begin_pick_rect(&device, &queue, &(), &mut layers, [63, 63, 3, 3])
+        .unwrap();
+    let hits = block_on(std::future::poll_fn(|_| reused.try_read())).unwrap();
+    assert_eq!(hits.first().map(|hit| hit.id), Some(id));
+
     host.resize(&device, [512, 384], 2.0);
     drop(host);
     drop(layer);

@@ -2,6 +2,7 @@
 //! structural columns, bolts, trees or markers in a single draw call with per-instance 64-bit GPU
 //! picking and multi-viewport support.
 
+use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{DrawPhase, DrawPhaseMask, PickId, Vec3, ViewportId};
@@ -52,6 +53,7 @@ struct InstPipelines {
     msaa: u32,
     batch_layout: wgpu::BindGroupLayout,
     lit: wgpu::RenderPipeline,
+    section_lit: Option<wgpu::RenderPipeline>,
     pick: wgpu::RenderPipeline,
 }
 
@@ -78,6 +80,7 @@ pub struct InstancedMesh3DLayer {
     instance_buf: Option<wgpu::Buffer>,
     instance_count: u32,
     pipelines: Option<InstPipelines>,
+    use_antialiased_section: bool,
     per_viewport: Vec<ViewportBinding>,
 }
 
@@ -112,6 +115,7 @@ impl InstancedMesh3DLayer {
             instance_buf: None,
             instance_count: 0,
             pipelines: None,
+            use_antialiased_section: false,
             per_viewport: Vec::new(),
         }
     }
@@ -129,11 +133,12 @@ impl InstancedMesh3DLayer {
     }
 
     fn ensure_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        if self
-            .pipelines
-            .as_ref()
-            .is_some_and(|p| p.format == ctx.color_format && p.msaa == ctx.msaa_samples)
-        {
+        let section_aa = SectionAa::for_viewport(ctx);
+        if self.pipelines.as_ref().is_some_and(|p| {
+            p.format == ctx.color_format
+                && p.msaa == ctx.msaa_samples
+                && (section_aa.is_none() || p.section_lit.is_some())
+        }) {
             return;
         }
         let wgsl = format!(
@@ -144,7 +149,7 @@ impl InstancedMesh3DLayer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("iletki-3d instanced shader"),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                source: wgpu::ShaderSource::Wgsl(wgsl.as_str().into()),
             });
         let batch_layout = ctx
             .device
@@ -184,46 +189,61 @@ impl InstancedMesh3DLayer {
             ],
         };
 
-        let lit = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d instanced lit"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_inst_color"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(vert_layout.clone()), Some(inst_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_inst_lit"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: ctx.color_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: ctx.msaa_samples,
-                    ..wgpu::MultisampleState::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            });
+        let make_lit = |shader: &wgpu::ShaderModule, vertex, fragment| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d instanced lit"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(vert_layout.clone()), Some(inst_layout.clone())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(fragment),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..wgpu::MultisampleState::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let lit = make_lit(&shader, "vs_inst_color", "fs_inst_lit");
+
+        let section_lit = section_aa.map(|aa| {
+            let shader = aa.shader(
+                ctx.device,
+                &wgsl,
+                include_str!("shaders/instanced3d_sampled.wgsl"),
+                include_str!("shaders/instanced3d_raster.wgsl"),
+            );
+            match aa {
+                SectionAa::Sampled => make_lit(&shader, "vs_inst_sampled", "fs_inst_sampled"),
+                SectionAa::Raster => make_lit(&shader, "vs_inst_raster", "fs_inst_raster"),
+            }
+        });
 
         let pick = ctx
             .device
@@ -269,6 +289,7 @@ impl InstancedMesh3DLayer {
             msaa: ctx.msaa_samples,
             batch_layout,
             lit,
+            section_lit,
             pick,
         });
     }
@@ -304,6 +325,8 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
             self.revision.mark_static();
         }
         self.ensure_pipelines(ctx);
+        self.use_antialiased_section =
+            ctx.supports_section_antialiasing() && !ctx.camera.clip_planes().is_empty();
         let Some(p) = &self.pipelines else {
             return false;
         };
@@ -401,7 +424,12 @@ impl<W> ViewportLayer<W> for InstancedMesh3DLayer {
         };
         match phase {
             DrawPhase::Opaque => {
-                pass.set_pipeline(&p.lit);
+                let lit = p
+                    .section_lit
+                    .as_ref()
+                    .filter(|_| self.use_antialiased_section)
+                    .unwrap_or(&p.lit);
+                pass.set_pipeline(lit);
                 pass.set_bind_group(1, &binding.bg, &[]);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.set_vertex_buffer(1, ibuf.slice(..));

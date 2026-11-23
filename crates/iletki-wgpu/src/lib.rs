@@ -19,7 +19,10 @@ pub mod error;
 pub mod host;
 pub mod layer;
 mod outline;
+#[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+pub mod profiling;
 pub mod target;
+mod trace;
 pub mod uniforms;
 
 pub use error::ViewportError;

@@ -9,7 +9,7 @@
 use iletki_3d::{
     GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Mesh3D, Scene3DLayer, TransformGizmoLayer,
 };
-use iletki_core::{Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
+use iletki_core::{Bounds3, Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
 use iletki_wgpu::{ViewportConfig, ViewportHost, ViewportLayer, wgpu};
 use std::future::Future;
 use std::pin::Pin;
@@ -187,6 +187,157 @@ fn removed_and_foreign_chunk_ids_cannot_modify_a_live_chunk() {
     scene.remove(foreign);
     assert!(scene.is_selected(current));
     assert!(!scene.is_selected(old));
+}
+
+#[cfg(feature = "profiling")]
+#[test]
+fn packed_faces_match_direct_across_views_and_chunk_edits() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let center = Vec3::new(1_000_000_000.25, -2_000_000_000.5, 20.0);
+    let mut scene = Scene3DLayer::new(1);
+    let cube = |origin, object| {
+        let mut mesh = Mesh3D::at_origin(origin);
+        mesh.push_box(
+            Vec3::new(-0.3, -0.3, -0.3),
+            Vec3::new(0.3, 0.3, 0.3),
+            [65, 195, 130, 255],
+            PickId::new(1, object, 0),
+            true,
+        );
+        mesh
+    };
+    let middle = scene.insert(cube(center, 1));
+    for i in 0..289 {
+        let x = f64::from(i % 17) - 8.0;
+        let y = f64::from(i / 17) - 8.0;
+        if i != 144 {
+            scene.insert(cube(center + Vec3::new(x, y, 0.0), i + 2));
+        }
+    }
+    let config = ViewportConfig {
+        initial_px: [128, 128],
+        upload_budget: iletki_core::UploadBudget::UNLIMITED,
+        ..ViewportConfig::default()
+    };
+    let mut top = ViewportHost::new(&device, config).unwrap();
+    let mut oblique = ViewportHost::new(&device, config).unwrap();
+    *top.camera_mut() = Camera::ortho_3d(center + Vec3::Z * 24.0, center, Vec3::Y, 24.0, 0.1, 60.0);
+    *oblique.camera_mut() = Camera::ortho_3d(
+        center + Vec3::new(8.0, -9.0, 24.0),
+        center,
+        Vec3::Z,
+        24.0,
+        0.1,
+        60.0,
+    );
+
+    let mut images = |scene: &mut Scene3DLayer, packed| {
+        scene.set_profile_batch_geometry(packed);
+        top.mark_dirty(DirtyFlags::CAMERA);
+        oblique.mark_dirty(DirtyFlags::CAMERA);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let top_frame = top.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
+        assert!(!top_frame.stats.streaming_pending);
+        let oblique_frame =
+            oblique.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
+        assert!(!oblique_frame.stats.streaming_pending);
+        queue.submit([encoder.finish()]);
+        [
+            top.readback_rgba_blocking(&device, &queue).unwrap().pixels,
+            oblique
+                .readback_rgba_blocking(&device, &queue)
+                .unwrap()
+                .pixels,
+        ]
+    };
+    let visible = images(&mut scene, true);
+    assert!(visible == images(&mut scene, false));
+
+    scene.set_visible(middle, false);
+    let hidden = images(&mut scene, true);
+    assert!(hidden != visible && hidden == images(&mut scene, false));
+
+    scene.remove(middle);
+    let replacement = scene.insert(cube(center + Vec3::X * 0.2, 500));
+    scene.set_selected(replacement, true);
+    let selected = images(&mut scene, true);
+    assert!(selected != hidden && selected == images(&mut scene, false));
+
+    scene.set_origin(replacement, center + Vec3::X * 10.0);
+    let relocated = images(&mut scene, true);
+    assert!(relocated != selected && relocated == images(&mut scene, false));
+
+    let hits = top
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [115, 62, 5, 5])
+        .unwrap();
+    assert_eq!(hits.first().unwrap().id, PickId::new(1, 500, 0));
+}
+
+#[test]
+fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let center = Vec3::new(1_000_000_000.25, -2_000_000_000.5, 20.0);
+    let mut host = ViewportHost::new(&device, ViewportConfig::default()).unwrap();
+    host.resize(&device, [127, 93], 1.75);
+    *host.camera_mut() = Camera::perspective_3d(
+        center - Vec3::Y * 2.0,
+        center,
+        Vec3::Z,
+        std::f64::consts::FRAC_PI_3,
+        0.1,
+    );
+    host.camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(Vec3::Y, center).unwrap()]);
+
+    let mut scene = Scene3DLayer::new(1);
+    for (offset, object) in [(0.0, 8), (3.0, 9)] {
+        let mut cube = Mesh3D::at_origin(center + Vec3::X * offset);
+        cube.push_box(
+            Vec3::new(-0.4, -1.95, -0.4),
+            Vec3::new(0.4, 0.2, 0.4),
+            [40, 220, 80, 255],
+            PickId::new(1, object, 0),
+            true,
+        );
+        scene.insert(cube);
+    }
+    let wide = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [52, 35, 23, 23])
+        .unwrap();
+    let pixel = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
+        .unwrap();
+    let [hit] = pixel.as_slice() else {
+        panic!("expected one hit at the viewport center, got {pixel:?}");
+    };
+    assert_eq!(hit.id, PickId::new(1, 8, 4));
+    assert!(
+        wide.iter()
+            .any(|other| other.id == hit.id && other.depth.to_bits() == hit.depth.to_bits())
+    );
+    let point = hit.world_pos.unwrap();
+    assert!((point - (center + Vec3::Y * 0.2)).length() < 1e-5);
+
+    // Direct Mesh3D edits can leave an AABB that excludes the uploaded triangles.
+    let mut stale_bounds = Mesh3D::at_origin(center);
+    stale_bounds.push_box(
+        Vec3::new(-0.2, -0.2, -0.2),
+        Vec3::new(0.2, 0.1, 0.2),
+        [255; 4],
+        PickId::new(1, 10, 0),
+        false,
+    );
+    stale_bounds.local_bounds =
+        Bounds3::from_corners(Vec3::new(500.0, 0.0, 0.0), Vec3::new(501.0, 1.0, 1.0));
+    scene.insert(stale_bounds);
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
+        .unwrap();
+    assert_eq!(hits.first().unwrap().id, PickId::new(1, 10, 0));
 }
 
 #[test]

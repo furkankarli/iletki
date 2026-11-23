@@ -445,24 +445,33 @@ impl Camera {
         depth_reverse_z: f32,
         viewport_size: Vec2,
     ) -> Option<Vec3> {
-        let z = f64::from(depth_reverse_z);
-        if !z.is_finite()
-            || z <= 0.0
-            || !screen_pos.is_finite()
-            || !viewport_size.is_finite()
-            || viewport_size.x <= 0.0
-            || viewport_size.y <= 0.0
-        {
-            return None;
+        self.depth_unprojector(viewport_size)(screen_pos, depth_reverse_z)
+    }
+
+    /// Captures an inverse projection once for reconstructing multiple depth samples from this
+    /// camera and viewport. The returned function follows [`Self::unproject_depth`].
+    pub fn depth_unprojector(
+        &self,
+        viewport_size: Vec2,
+    ) -> impl Fn(Vec2, f32) -> Option<Vec3> + use<> {
+        let inverse = (viewport_size.is_finite() && viewport_size.x > 0.0 && viewport_size.y > 0.0)
+            .then(|| self.view_proj_relative(viewport_size).inverse())
+            .flatten();
+        let origin = self.position_3d();
+        move |screen_pos, depth| {
+            let z = f64::from(depth);
+            if !z.is_finite() || z <= 0.0 || !screen_pos.is_finite() {
+                return None;
+            }
+            let inverse = inverse.as_ref()?;
+            let ndc_x = (2.0 * screen_pos.x / viewport_size.x) - 1.0;
+            let ndc_y = 1.0 - (2.0 * screen_pos.y / viewport_size.y);
+            let clip = inverse.mul_vec4(Vec4::new(ndc_x, ndc_y, z, 1.0));
+            if !clip.w.is_finite() || clip.w.abs() <= 1e-12 {
+                return None;
+            }
+            Some(origin + clip.xyz() / clip.w)
         }
-        let ndc_x = (2.0 * screen_pos.x / viewport_size.x) - 1.0;
-        let ndc_y = 1.0 - (2.0 * screen_pos.y / viewport_size.y);
-        let inv_vp = self.view_proj_relative(viewport_size).inverse()?;
-        let clip = inv_vp.mul_vec4(Vec4::new(ndc_x, ndc_y, z, 1.0));
-        if !clip.w.is_finite() || clip.w.abs() <= 1e-12 {
-            return None;
-        }
-        Some(self.position_3d() + clip.xyz() / clip.w)
     }
 
     /// Builds the GPU-ready [`CameraUniformData`] for a viewport of `logical_size` points and

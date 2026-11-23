@@ -6,7 +6,12 @@ event loop, and GPU device.
 
 [API documentation](https://docs.rs/iletki) · [Source and demos](https://github.com/furkankarli/iletki) · [Support iletki](https://github.com/sponsors/furkankarli)
 
-![Four cameras viewing one scene with a selection outline, a transform gizmo, and a section plane](https://raw.githubusercontent.com/furkankarli/iletki/main/docs/images/quad-view.webp)
+![Four cameras viewing the same NIST STEP parts with a selection outline and transform gizmo](https://raw.githubusercontent.com/furkankarli/iletki/main/docs/images/quad-view.webp)
+
+![The camera orbits two STEP parts while an outline marks the selected part](https://raw.githubusercontent.com/furkankarli/iletki/main/docs/images/step-selection.gif)
+
+The STEP captures use tessellated, recolored NIST CTC-02 and CTC-04 parts spaced for inspection.
+[NIST model source](https://www.nist.gov/ctl/smart-connected-systems-division/smart-connected-manufacturing-systems-group/mbe-pmi-0) · [More demos and model credits](https://github.com/furkankarli/iletki#real-model-demos) · [Changelog](https://github.com/furkankarli/iletki/blob/main/CHANGELOG.md)
 
 ## Get started
 

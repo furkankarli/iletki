@@ -17,10 +17,15 @@ default = ["wgpu", "cad2d", "cad3d"]
 wgpu = ["dep:iletki-wgpu"]
 cad2d = ["wgpu", "dep:iletki-2d"]
 cad3d = ["wgpu", "dep:iletki-3d"]
+profiling = ["wgpu", "iletki-wgpu/profiling", "iletki-3d?/profiling"]
 
 [[example]]
 name = "webgpu_smoke"
 required-features = ["cad2d"]
+
+[[example]]
+name = "assembly_bench"
+required-features = ["cad3d", "profiling"]
 
 [dependencies]
 iletki-core.workspace = true

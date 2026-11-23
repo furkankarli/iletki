@@ -1,8 +1,8 @@
 //! Jump-Flooding Algorithm (JFA) screen-space selection outline post-processing engine.
 //!
 //! Lazily allocated only when at least one active layer participates in [`DrawPhase::OutlineMask`].
-//! Renders selected objects to an `R8Unorm` mask, propagates nearest-seed coordinates in 4
-//! logarithmic JFA passes (`step = 8, 4, 2, 1`), and composites a smooth anti-aliased silhouette
+//! Renders selected objects to an `R8Unorm` coverage mask, propagates nearest-seed offsets in
+//! width-dependent JFA passes, and composites a smooth anti-aliased silhouette
 //! outline of up to 15 px thickness onto the active viewport target.
 
 use bytemuck::{Pod, Zeroable};
@@ -17,7 +17,8 @@ pub const OUTLINE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unor
 struct JfaParams {
     step_px: f32,
     width_px: f32,
-    _pad: [f32; 2],
+    coverage_aa: u32,
+    _pad: u32,
     color: [f32; 4],
     active_px: [f32; 2],
     _pad2: [f32; 2],
@@ -32,13 +33,16 @@ pub(crate) struct OutlineEngine {
     composite_msaa: u32,
     // Separate uniform buffers for each pass so queue writes never clobber each other.
     step_buffers: [wgpu::Buffer; 5],
+    composite_buffer: wgpu::Buffer,
     extent: [u32; 2],
     mask_view: wgpu::TextureView,
+    multisampled_mask_view: Option<wgpu::TextureView>,
     ping_view: wgpu::TextureView,
     pong_view: wgpu::TextureView,
-    seed_bg: wgpu::BindGroup,
-    step_ping_to_pong_bgs: [wgpu::BindGroup; 4],
-    step_pong_to_ping_bgs: [wgpu::BindGroup; 4],
+    seed_ping_bg: wgpu::BindGroup,
+    seed_pong_bg: wgpu::BindGroup,
+    step_ping_to_pong_bgs: [wgpu::BindGroup; 5],
+    step_pong_to_ping_bgs: [wgpu::BindGroup; 5],
     composite_bg: wgpu::BindGroup,
 }
 
@@ -60,11 +64,13 @@ impl OutlineEngine {
         composite_format: wgpu::TextureFormat,
         composite_msaa: u32,
         depth_format: wgpu::TextureFormat,
+        multisampled_mask: bool,
     ) -> &'a mut Self {
         let needs_rebuild = slot.as_ref().is_none_or(|e| {
             e.extent != allocated_px
                 || e.composite_format != composite_format
                 || e.composite_msaa != composite_msaa
+                || e.multisampled_mask_view.is_some() != multisampled_mask
         });
         if needs_rebuild {
             *slot = Some(Self::new(
@@ -73,6 +79,7 @@ impl OutlineEngine {
                 composite_format,
                 composite_msaa,
                 depth_format,
+                multisampled_mask,
             ));
         }
         slot.get_or_insert_with(|| {
@@ -82,6 +89,7 @@ impl OutlineEngine {
                 composite_format,
                 composite_msaa,
                 depth_format,
+                multisampled_mask,
             )
         })
     }
@@ -92,6 +100,7 @@ impl OutlineEngine {
         composite_format: wgpu::TextureFormat,
         composite_msaa: u32,
         depth_format: wgpu::TextureFormat,
+        multisampled_mask: bool,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iletki outline jfa shader"),
@@ -138,7 +147,7 @@ impl OutlineEngine {
             immediate_size: 0,
         });
 
-        let make_jfa = |label: &str, fs: &str| {
+        let make_jfa = |label: &'static str, fs: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipe_layout),
@@ -209,7 +218,7 @@ impl OutlineEngine {
             height: height.max(1),
             depth_or_array_layers: 1,
         };
-        let mk_tex = |label: &str, format: wgpu::TextureFormat| {
+        let mk_tex = |label: &'static str, format: wgpu::TextureFormat| {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size,
@@ -224,6 +233,20 @@ impl OutlineEngine {
             t.create_view(&wgpu::TextureViewDescriptor::default())
         };
         let mask_view = mk_tex("iletki outline mask", OUTLINE_MASK_FORMAT);
+        let multisampled_mask_view = multisampled_mask.then(|| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("iletki multisampled outline mask"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 4,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: OUTLINE_MASK_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
         let ping_view = mk_tex("iletki jfa ping", wgpu::TextureFormat::Rg16Float);
         let pong_view = mk_tex("iletki jfa pong", wgpu::TextureFormat::Rg16Float);
 
@@ -235,6 +258,7 @@ impl OutlineEngine {
             })
         };
         let step_buffers = [mk_buf(), mk_buf(), mk_buf(), mk_buf(), mk_buf()];
+        let composite_buffer = mk_buf();
 
         let mk_bg = |src: &wgpu::TextureView, buf: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -257,22 +281,11 @@ impl OutlineEngine {
             })
         };
 
-        let [b0, b1, b2, b3, b4] = &step_buffers;
-        let seed_bg = mk_bg(&pong_view, b4);
-        let step_ping_to_pong_bgs = [
-            mk_bg(&ping_view, b0),
-            mk_bg(&ping_view, b1),
-            mk_bg(&ping_view, b2),
-            mk_bg(&ping_view, b3),
-        ];
-        let step_pong_to_ping_bgs = [
-            mk_bg(&pong_view, b0),
-            mk_bg(&pong_view, b1),
-            mk_bg(&pong_view, b2),
-            mk_bg(&pong_view, b3),
-        ];
-        // After 4 JFA steps (ping->pong, pong->ping, ping->pong, pong->ping), final seeds sit in ping.
-        let composite_bg = mk_bg(&ping_view, b4);
+        let seed_ping_bg = mk_bg(&pong_view, &composite_buffer);
+        let seed_pong_bg = mk_bg(&ping_view, &composite_buffer);
+        let step_ping_to_pong_bgs = step_buffers.each_ref().map(|buf| mk_bg(&ping_view, buf));
+        let step_pong_to_ping_bgs = step_buffers.each_ref().map(|buf| mk_bg(&pong_view, buf));
+        let composite_bg = mk_bg(&ping_view, &composite_buffer);
 
         Self {
             seed_pipe,
@@ -281,32 +294,51 @@ impl OutlineEngine {
             composite_format,
             composite_msaa,
             step_buffers,
+            composite_buffer,
             extent: allocated_px,
             mask_view,
+            multisampled_mask_view,
             ping_view,
             pong_view,
-            seed_bg,
+            seed_ping_bg,
+            seed_pong_bg,
             step_ping_to_pong_bgs,
             step_pong_to_ping_bgs,
             composite_bg,
         }
     }
 
-    pub(crate) fn mask_view(&self) -> &wgpu::TextureView {
-        &self.mask_view
+    pub(crate) fn mask_color_views(&self) -> (&wgpu::TextureView, Option<&wgpu::TextureView>) {
+        self.multisampled_mask_view
+            .as_ref()
+            .map_or((&self.mask_view, None), |view| {
+                (view, Some(&self.mask_view))
+            })
     }
 
-    /// Runs the 1 seed pass + 4 Jump-Flood passes (`step = 8, 4, 2, 1`) across `active_px`.
+    /// Runs seed initialization and the propagation needed for the requested width.
     pub(crate) fn run_jump_flood(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         active_px: [u32; 2],
+        rect: [u32; 4],
         config: OutlineConfig,
     ) {
         let [aw, ah] = active_px;
         let [alloc_w, alloc_h] = self.extent;
-        let steps = [8.0f32, 4.0, 2.0, 1.0];
+        let width = if config.width_px.is_finite() {
+            config.width_px.clamp(1.0, 15.0)
+        } else {
+            OutlineConfig::default().width_px
+        };
+        // Include the 0.65 px feather and up to 0.5 px of subpixel seed displacement.
+        let steps: &[f32] = match width {
+            ..=2.0 => &[2.0, 1.0],
+            ..=6.0 => &[4.0, 2.0, 1.0],
+            ..=14.0 => &[8.0, 4.0, 2.0, 1.0],
+            _ => &[8.0, 4.0, 2.0, 1.0, 1.0],
+        };
 
         let [cr, cg, cb, ca] = config.color;
         let target_color = if self.composite_format.is_srgb() {
@@ -323,47 +355,38 @@ impl OutlineEngine {
             config.color
         };
 
-        for (step, buf) in steps.iter().zip(self.step_buffers.iter()) {
-            let p = JfaParams {
-                step_px: *step,
-                width_px: config.width_px,
-                _pad: [0.0, 0.0],
-                color: target_color,
-                active_px: [aw as f32, ah as f32],
-                _pad2: [0.0, 0.0],
-            };
-            queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+        let params = |step_px| JfaParams {
+            step_px,
+            width_px: width,
+            coverage_aa: u32::from(self.multisampled_mask_view.is_some()),
+            _pad: 0,
+            color: target_color,
+            active_px: [aw as f32, ah as f32],
+            _pad2: [0.0, 0.0],
+        };
+        for (&step, buf) in steps.iter().zip(&self.step_buffers) {
+            queue.write_buffer(buf, 0, bytemuck::bytes_of(&params(step)));
         }
-        if let Some(comp_buf) = self.step_buffers.get(4) {
-            let p = JfaParams {
-                step_px: 1.0,
-                width_px: config.width_px,
-                _pad: [0.0, 0.0],
-                color: target_color,
-                active_px: [aw as f32, ah as f32],
-                _pad2: [0.0, 0.0],
-            };
-            queue.write_buffer(comp_buf, 0, bytemuck::bytes_of(&p));
-        }
+        queue.write_buffer(&self.composite_buffer, 0, bytemuck::bytes_of(&params(1.0)));
 
-        // Seed pass: mask -> ping
+        // Choose the initial texture so the last propagation always writes into ping.
+        let (seed_view, seed_bg) = if steps.len().is_multiple_of(2) {
+            (&self.ping_view, &self.seed_ping_bg)
+        } else {
+            (&self.pong_view, &self.seed_pong_bg)
+        };
         self.fullscreen_pass(
             encoder,
             "iletki jfa seed",
-            &self.ping_view,
+            seed_view,
             &self.seed_pipe,
-            &self.seed_bg,
+            seed_bg,
             [alloc_w, alloc_h],
-            [aw, ah],
+            rect,
         );
 
-        // 4 logarithmic JFA steps:
-        // 0 (step 8): ping -> pong
-        // 1 (step 4): pong -> ping
-        // 2 (step 2): ping -> pong
-        // 3 (step 1): pong -> ping (final nearest seeds live in ping_view)
-        for i in 0..4usize {
-            let (dst, bg) = if i % 2 == 0 {
+        for i in 0..steps.len() {
+            let (dst, bg) = if (i + steps.len()).is_multiple_of(2) {
                 (&self.pong_view, self.step_ping_to_pong_bgs.get(i))
             } else {
                 (&self.ping_view, self.step_pong_to_ping_bgs.get(i))
@@ -376,18 +399,18 @@ impl OutlineEngine {
                     &self.step_pipe,
                     bg,
                     [alloc_w, alloc_h],
-                    [aw, ah],
+                    rect,
                 );
             }
         }
     }
 
     /// Composites the smooth Jump-Flood outline halo inside an open color render pass.
-    pub(crate) fn composite_into_pass(&self, pass: &mut wgpu::RenderPass<'_>, active_px: [u32; 2]) {
-        let [aw, ah] = active_px;
+    pub(crate) fn composite_into_pass(&self, pass: &mut wgpu::RenderPass<'_>, rect: [u32; 4]) {
+        let [x, y, w, h] = rect;
         let [alloc_w, alloc_h] = self.extent;
         pass.set_viewport(0.0, 0.0, alloc_w as f32, alloc_h as f32, 0.0, 1.0);
-        pass.set_scissor_rect(0, 0, aw, ah);
+        pass.set_scissor_rect(x, y, w, h);
         pass.set_pipeline(&self.composite_pipe);
         pass.set_bind_group(0, &self.composite_bg, &[]);
         pass.draw(0..3, 0..1);
@@ -397,13 +420,14 @@ impl OutlineEngine {
     fn fullscreen_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        label: &str,
+        label: &'static str,
         dst_view: &wgpu::TextureView,
         pipeline: &wgpu::RenderPipeline,
         bg: &wgpu::BindGroup,
         [alloc_w, alloc_h]: [u32; 2],
-        [aw, ah]: [u32; 2],
+        [x, y, w, h]: [u32; 4],
     ) {
+        let gpu_timer = crate::trace::pass(label);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -412,8 +436,8 @@ impl OutlineEngine {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: -1.0,
-                        g: -1.0,
+                        r: -128.0,
+                        g: -128.0,
                         b: 0.0,
                         a: 0.0,
                     }),
@@ -421,12 +445,12 @@ impl OutlineEngine {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
         pass.set_viewport(0.0, 0.0, alloc_w as f32, alloc_h as f32, 0.0, 1.0);
-        pass.set_scissor_rect(0, 0, aw, ah);
+        pass.set_scissor_rect(x, y, w, h);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.draw(0..3, 0..1);

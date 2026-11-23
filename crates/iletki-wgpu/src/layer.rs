@@ -33,6 +33,16 @@ impl LayerRevision {
     pub fn mark_dynamic(&mut self) {
         self.dynamic = NEXT_LAYER_REVISION.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Returns the revision without its dynamic component.
+    /// Compare this only for work known to ignore dynamic scene content.
+    #[must_use]
+    pub const fn static_only(self) -> Self {
+        Self {
+            static_scene: self.static_scene,
+            dynamic: 0,
+        }
+    }
 }
 
 /// Weak reference to a viewport's lifetime, for caches stored inside shared layers.
@@ -123,6 +133,8 @@ impl UploadTracker {
 /// Context handed to [`ViewportLayer::prepare`] before drawing a frame or pick pass.
 pub struct PrepareCtx<'a, W = ()> {
     pub(crate) viewport_lifetime: &'a Arc<()>,
+    pub(crate) section_antialiasing: bool,
+    pub(crate) picking_rect: Option<[u32; 4]>,
     /// Unique identifier of the viewport being prepared (use as key for per-viewport GPU buffers
     /// when one scene is shared across multiple split viewports).
     pub viewport_id: ViewportId,
@@ -155,6 +167,20 @@ pub struct PrepareCtx<'a, W = ()> {
 }
 
 impl<W> PrepareCtx<'_, W> {
+    /// Returns the clipped physical-pixel picking rectangle, or `None` when preparing a frame.
+    ///
+    /// Layers may use this hint to discard objects that cannot contribute to the pick pass.
+    #[must_use]
+    pub const fn picking_rect_px(&self) -> Option<[u32; 4]> {
+        self.picking_rect
+    }
+
+    /// Returns whether this viewport can use antialiased 3D section clipping at 4× MSAA.
+    #[must_use]
+    pub const fn supports_section_antialiasing(&self) -> bool {
+        self.section_antialiasing
+    }
+
     /// Returns a weak reference that lets a layer retire viewport-local GPU state after close.
     #[must_use]
     pub fn viewport_lifetime(&self) -> ViewportLifetime {
@@ -224,6 +250,32 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
     ///
     /// Return `true` if more streaming uploads remain for subsequent frames.
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool;
+
+    /// Returns whether this layer prepared a 4× MSAA pipeline for its outline mask.
+    ///
+    /// The host uses a single-sample mask when any participating layer uses the default.
+    fn supports_multisampled_outline_mask(&self) -> bool {
+        false
+    }
+
+    /// Records the outline mask with a 4× MSAA `R8Unorm` color attachment and no depth attachment.
+    ///
+    /// Layers that report support must implement this method. The camera bind group is bound.
+    fn paint_multisampled_outline_mask(
+        &self,
+        _pass: &mut wgpu::RenderPass<'_>,
+        _ctx: &PaintCtx<'_, W>,
+    ) {
+    }
+
+    /// Returns a conservative physical pixel rectangle `[x, y, width, height]` for mask geometry.
+    ///
+    /// Return `None` to use the full viewport, or an empty rectangle for an invisible mask.
+    /// The host adds space for the outline and its filter. Mask drawing must stay within this
+    /// rectangle before filtering. Update the layer revision when its outline geometry changes.
+    fn outline_mask_rect(&self, _ctx: &PaintCtx<'_, W>) -> Option<[u32; 4]> {
+        None
+    }
 
     /// Records draw commands for `phase` into `pass`.
     ///

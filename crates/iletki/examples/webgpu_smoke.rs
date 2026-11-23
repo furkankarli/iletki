@@ -12,8 +12,8 @@ fn main() -> Result<(), iletki::gpu::wgpu::web_sys::wasm_bindgen::JsValue> {
 mod web {
     use iletki::gpu::wgpu;
     use iletki::{
-        DrawStyle2D, Mesh2D, PassTargetDesc, PickId, Scene2DLayer, Vec2, ViewportConfig,
-        ViewportHost, ViewportLayer,
+        Camera, DrawStyle2D, Mesh2D, Mesh3D, PassTargetDesc, PickId, Plane, Scene2DLayer,
+        Scene3DLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer,
     };
     use wgpu::web_sys::{
         js_sys::{self, Promise, Reflect, futures::future_to_promise},
@@ -75,6 +75,155 @@ mod web {
         let mut layer = Scene2DLayer::new(ID.layer);
         layer.set_static_mesh(&mesh);
         let layers: &mut [&mut dyn ViewportLayer<()>] = &mut [&mut layer];
+        let pixel = render_pixels(&device, &queue, &mut host, layers, SIZE / 2, 1).await?;
+        if pixel != COLOR {
+            return Err(format!("unexpected WebGPU center pixel: {pixel:?}"));
+        }
+        let hits = host
+            .pick_rect_async(&device, &queue, &(), layers, [SIZE / 2, SIZE / 2, 1, 1])
+            .await
+            .map_err(|e| e.to_string())?;
+        if !matches!(hits.as_slice(), [hit] if hit.id == ID && (hit.depth - 0.5).abs() < 1e-5) {
+            return Err(format!("unexpected WebGPU pick: {hits:?}"));
+        }
+        check_section(&adapter, &device, &queue).await?;
+        Ok(format!(
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline and packed geometry",
+            info.backend, info.name
+        ))
+    }
+
+    async fn check_section(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        let mut host = ViewportHost::new_with_adapter(
+            device,
+            adapter,
+            ViewportConfig {
+                color_format: FORMAT,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+                initial_px: [SIZE; 2],
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let mut camera = Camera::ortho_3d(
+            Vec3::new(0.0, -8.0, 0.0),
+            Vec3::ZERO,
+            Vec3::Z,
+            8.0,
+            0.05,
+            100.0,
+        );
+        let section = Plane::from_normal_point(Vec3::X, Vec3::new(0.0625, 0.0, 0.0))
+            .ok_or("invalid test section plane")?;
+        camera.set_clip_planes(&[section]);
+        *host.camera_mut() = camera;
+
+        let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+        mesh.push_quad(
+            Vec3::new(-3.0, 0.0, -3.0),
+            Vec3::new(3.0, 0.0, -3.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(-3.0, 0.0, 3.0),
+            COLOR,
+            ID,
+        );
+        let mut scene = Scene3DLayer::new(ID.layer);
+        let chunk = scene.insert(mesh);
+        let pixels =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        let (Some(&clipped), Some(&cut), Some(&solid)) =
+            (pixels.get(1), pixels.get(5), pixels.get(9))
+        else {
+            return Err("missing WebGPU section pixels".to_owned());
+        };
+        if clipped != 0 || cut < 8 || cut.saturating_add(8) >= solid {
+            return Err(format!("unexpected WebGPU section pixels: {pixels:?}"));
+        }
+        scene.set_selected(chunk, true);
+        let pixels =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        let (Some(&outside), Some(&edge), Some(&inside)) =
+            (pixels.first(), pixels.get(4), pixels.get(8))
+        else {
+            return Err("missing WebGPU outline pixels".to_owned());
+        };
+        if outside < 220 || !(95..=160).contains(&edge) || inside > 16 {
+            return Err(format!("unexpected WebGPU outline pixels: {pixels:?}"));
+        }
+
+        scene.set_selected(chunk, false);
+        host.camera_mut().clear_clip_planes();
+        // Enough visible geometry to exercise the packed path. Keep these quads behind the
+        // original surface so the center retains its expected shading and pick ID.
+        let mut packed_chunks = vec![chunk];
+        for i in 1..=128 {
+            let mut mesh = Mesh3D::at_origin(Vec3::new(0.0, f64::from(i) * 0.01, 0.0));
+            mesh.push_quad(
+                Vec3::new(-0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, 0.5),
+                Vec3::new(-0.5, 0.0, 0.5),
+                [255, 0, 0, 255],
+                PickId::new(ID.layer, i, 0),
+            );
+            packed_chunks.push(scene.insert(mesh));
+        }
+        let center =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if !matches!(center.as_slice(), [r, g, b, 255] if *g > 32 && g > r && g > b) {
+            return Err(format!(
+                "unexpected WebGPU packed geometry pixel: {center:?}"
+            ));
+        }
+        let hits = host
+            .pick_rect_async(
+                device,
+                queue,
+                &(),
+                &mut [&mut scene],
+                [SIZE / 2, SIZE / 2, 1, 1],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(hits.as_slice(), [hit] if hit.id == ID) {
+            return Err(format!("unexpected WebGPU packed geometry pick: {hits:?}"));
+        }
+        host.camera_mut().set_clip_planes(&[section]);
+        let packed_cut =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        if packed_cut.get(1) != Some(&clipped)
+            || packed_cut.get(5) != Some(&cut)
+            || packed_cut.get(9) != Some(&solid)
+        {
+            return Err(format!(
+                "unexpected WebGPU packed section pixels: {packed_cut:?}"
+            ));
+        }
+        for id in packed_chunks {
+            scene.set_selected(id, true);
+        }
+        let packed_outline =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        if packed_outline != pixels {
+            return Err(format!(
+                "unexpected WebGPU packed outline: {packed_outline:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn render_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        host: &mut ViewportHost,
+        layers: &mut [&mut dyn ViewportLayer<()>],
+        x: u32,
+        width: u32,
+    ) -> Result<Vec<u8>, String> {
         let target = PassTargetDesc {
             format: FORMAT,
             sample_count: 1,
@@ -83,7 +232,7 @@ mod web {
         };
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        host.prepare_for_pass(&device, &queue, &mut encoder, &(), layers, target)
+        host.prepare_for_pass(device, queue, &mut encoder, &(), layers, target)
             .map_err(|e| e.to_string())?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("WebGPU smoke output"),
@@ -116,15 +265,15 @@ mod web {
             host.paint_into_pass(&mut pass, target);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("center pixel"),
-            size: 4,
+            label: Some("WebGPU smoke pixels"),
+            size: u64::from(width) * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 origin: wgpu::Origin3d {
-                    x: SIZE / 2,
+                    x,
                     y: SIZE / 2,
                     z: 0,
                 },
@@ -135,7 +284,7 @@ mod web {
                 layout: Default::default(),
             },
             wgpu::Extent3d {
-                width: 1,
+                width,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -155,23 +304,11 @@ mod web {
         .await
         .map_err(|e| format!("pixel mapping failed: {e:?}"))?;
 
-        let pixel = readback.get_mapped_range(..).map_err(|e| e.to_string())?;
-        if *pixel != COLOR {
-            return Err(format!("unexpected WebGPU center pixel: {:?}", &*pixel));
-        }
-        drop(pixel);
+        let pixels = readback
+            .get_mapped_range(..)
+            .map_err(|e| e.to_string())?
+            .to_vec();
         readback.unmap();
-
-        let hits = host
-            .pick_rect_async(&device, &queue, &(), layers, [SIZE / 2, SIZE / 2, 1, 1])
-            .await
-            .map_err(|e| e.to_string())?;
-        if !matches!(hits.as_slice(), [hit] if hit.id == ID && (hit.depth - 0.5).abs() < 1e-5) {
-            return Err(format!("unexpected WebGPU pick: {hits:?}"));
-        }
-        Ok(format!(
-            "{:?} ({}) rendered {COLOR:?} and picked {ID:?}",
-            info.backend, info.name
-        ))
+        Ok(pixels)
     }
 }

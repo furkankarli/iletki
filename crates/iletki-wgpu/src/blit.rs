@@ -258,6 +258,7 @@ pub(crate) struct DepthCopyPipeline {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     params_buffer: wgpu::Buffer,
+    scratch: Option<([u32; 2], wgpu::Texture, wgpu::TextureView)>,
 }
 
 impl DepthCopyPipeline {
@@ -330,11 +331,12 @@ impl DepthCopyPipeline {
             layout,
             pipeline,
             params_buffer,
+            scratch: None,
         }
     }
 
     pub(crate) fn copy_subrect(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -349,21 +351,39 @@ impl DepthCopyPipeline {
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
-        let dst = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("iletki pick depth r32f"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let make_scratch = || {
+            let dst = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iletki pick depth r32f"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+            (size, dst, dst_view)
+        };
+        // Bound persistent GPU storage independently of occasional large selections.
+        let temporary;
+        let (_, dst, dst_view) = if width.saturating_mul(height) <= 512 * 512 {
+            if self
+                .scratch
+                .as_ref()
+                .is_some_and(|(cached, _, _)| *cached != size)
+            {
+                self.scratch = None;
+            }
+            self.scratch.get_or_insert_with(make_scratch)
+        } else {
+            temporary = make_scratch();
+            &temporary
+        };
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("iletki depth copy bg"),
             layout: &self.layout,
@@ -378,10 +398,11 @@ impl DepthCopyPipeline {
                 },
             ],
         });
+        let gpu_timer = crate::trace::pass("iletki depth subrect copy");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki depth subrect copy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &dst_view,
+                view: dst_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -390,7 +411,7 @@ impl DepthCopyPipeline {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -398,6 +419,6 @@ impl DepthCopyPipeline {
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
-        dst
+        dst.clone()
     }
 }

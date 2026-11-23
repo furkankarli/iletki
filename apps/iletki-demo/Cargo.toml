@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+profiling = ["iletki/profiling"]
+
 [dependencies]
 iletki = { path = "../../crates/iletki" }
 # Avoid `wayland-csd-adwaita` so the demo does not pull in unmaintained `ttf-parser` (RUSTSEC-2026-0192).

@@ -39,9 +39,8 @@ struct PickOut {
     @location(1) @interpolate(flat) pick_id: vec2<u32>,
 };
 
-@vertex
-fn vs_mesh(v: VertIn) -> ColorOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn mesh_vertex_with_object(v: VertIn, placement: ObjectUniforms) -> ColorOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: ColorOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
@@ -50,26 +49,38 @@ fn vs_mesh(v: VertIn) -> ColorOut {
     return out;
 }
 
-// Reversed-Z depth-offset vertex shader for crisp 3D CAD edges over solid faces without z-fighting.
+fn mesh_vertex(v: VertIn) -> ColorOut {
+    return mesh_vertex_with_object(v, object);
+}
+
 @vertex
-fn vs_edge(v: VertIn) -> ColorOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
-    var clip = iletki_project_3d(pos_rel);
+fn vs_mesh(v: VertIn) -> ColorOut {
+    return mesh_vertex(v);
+}
+
+// Reversed-Z depth-offset vertex shader for crisp 3D CAD edges over solid faces without z-fighting.
+fn edge_vertex_with_object(v: VertIn, placement: ObjectUniforms) -> ColorOut {
+    var out = mesh_vertex_with_object(v, placement);
+    var clip = out.clip_pos;
     // In infinite Reversed-Z (near = 1.0, far = 0.0), clip.z scales with `near` (Perspective) or
     // linear depth (Ortho). Scaling multiplicatively pulls the edge ~0.08% closer across every
     // distance without ever punching through solid geometry behind it.
     clip.z = min(clip.z * 1.0008 + 1e-5, clip.w);
-    var out: ColorOut;
     out.clip_pos = clip;
-    out.pos_rel = pos_rel;
-    out.normal = v.normal;
-    out.color = v.color;
     return out;
 }
 
+fn edge_vertex(v: VertIn) -> ColorOut {
+    return edge_vertex_with_object(v, object);
+}
+
 @vertex
-fn vs_mask(v: VertIn) -> MaskOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn vs_edge(v: VertIn) -> ColorOut {
+    return edge_vertex(v);
+}
+
+fn mask_vertex(v: VertIn, placement: ObjectUniforms) -> MaskOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: MaskOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
@@ -77,25 +88,30 @@ fn vs_mask(v: VertIn) -> MaskOut {
 }
 
 @vertex
-fn vs_mesh_pick(v: VertIn, p: PickIn) -> PickOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn vs_mask(v: VertIn) -> MaskOut {
+    return mask_vertex(v, object);
+}
+
+fn pick_vertex(v: VertIn, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: PickOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
-    out.pick_id = p.pick_id;
+    out.pick_id = id;
     return out;
 }
 
-@fragment
-fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
-    if (iletki_is_clipped(in.pos_rel)) {
-        discard;
-    }
-    let n_raw = normalize(in.normal);
+@vertex
+fn vs_mesh_pick(v: VertIn, p: PickIn) -> PickOut {
+    return pick_vertex(v, object, p.pick_id);
+}
+
+fn shade_mesh(pos_rel: vec3<f32>, normal: vec3<f32>, color: vec4<f32>, is_front: bool) -> vec4<f32> {
+    let n_raw = normalize(normal);
     // Flip normals on interior back-faces revealed by section clip planes and shade slightly
     // darker so cutaway cavities read cleanly like professional CAD/BIM viewports.
     let n = select(-n_raw, n_raw, is_front);
-    let view_dir = normalize(-in.pos_rel);
+    let view_dir = normalize(-pos_rel);
     // Combine key and fill lights, hemispherical ambient light, and a view-aligned light
     // to keep faces readable as the camera orbits.
     let key_dir = normalize(vec3<f32>(0.45, 0.35, 0.82));
@@ -108,9 +124,17 @@ fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) v
     let spec = pow(max(dot(n, half_v), 0.0), 32.0) * 0.07;
     let back_tint = select(0.72, 1.0, is_front);
     let shade = min(hemi + key + fill + head, 1.05) * back_tint;
-    let base_rgb = iletki_color_to_target(in.color.rgb);
+    let base_rgb = iletki_color_to_target(color.rgb);
     let lit = base_rgb * shade + vec3<f32>(spec * back_tint);
-    return vec4<f32>(lit, in.color.a);
+    return vec4<f32>(lit, color.a);
+}
+
+@fragment
+fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    if (iletki_is_clipped(in.pos_rel)) {
+        discard;
+    }
+    return shade_mesh(in.pos_rel, in.normal, in.color, is_front);
 }
 
 @fragment

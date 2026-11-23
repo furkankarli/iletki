@@ -17,6 +17,7 @@ CRATES = (
     "iletki-2d",
     "iletki-3d",
     "iletki-egui",
+    "iletki-slint",
     "iletki",
 )
 LICENSES = ("LICENSE-MIT", "LICENSE-APACHE")
@@ -53,7 +54,11 @@ def main():
             patches.append(f"{name} = {{ path = {json.dumps('../archives/' + basename)} }}")
 
         with (consumer / "Cargo.toml").open("a", encoding="utf-8") as manifest:
+            # Compile the Slint adapter from its archive as part of this consumer too.
+            manifest.write(f'\niletki-slint = "={version}"\n')
             manifest.write("\n[patch.crates-io]\n" + "\n".join(patches) + "\n")
+        with (consumer / "src" / "main.rs").open("a", encoding="utf-8") as source:
+            source.write("\nuse iletki_slint as _;\n")
         cargo("generate-lockfile", cwd=consumer)
         lock = tomllib.loads((consumer / "Cargo.lock").read_text(encoding="utf-8"))
         for name in CRATES:
@@ -62,7 +67,7 @@ def main():
                 raise ValueError(f"consumer resolved {name} outside the release archives: {packages}")
 
         cargo("run", "--locked", "--target-dir", TARGET / "package-example-build", cwd=consumer)
-        print(f"Verified the egui consumer and license files for {len(CRATES)} archives.", flush=True)
+        print(f"Verified the archive consumer and license files for {len(CRATES)} crates.", flush=True)
 
 
 if __name__ == "__main__":

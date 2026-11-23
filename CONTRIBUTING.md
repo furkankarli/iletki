@@ -42,6 +42,20 @@ iletki uses [Conventional Commits](https://www.conventionalcommits.org/):
 - Breaking changes: `!` after the type and a `BREAKING CHANGE:` footer.
 - One logical change per commit; tests land with the change they cover.
 
+## Releasing
+
+Update the workspace version, internal dependency requirements, standalone example
+requirements, lockfiles and [changelog](CHANGELOG.md) together. Run `cargo xtask ci`
+and `python3 .github/scripts/package-smoke.py` before publishing.
+
+Publish the crates with `cargo publish --locked -p <crate>` from the release commit.
+Publish `iletki-core` first, then `iletki-wgpu`. Next publish `iletki-2d`, `iletki-3d`,
+`iletki-egui`, and `iletki-slint`. Publish the `iletki` facade last. Wait for each
+dependency to be visible in the registry before publishing a crate that uses it.
+
+Push the matching `v<version>` tag from the release commit. The CI workflow publishes
+the GitHub Release with the corresponding changelog entry after its checks pass.
+
 ## License
 
 Unless you state otherwise, any contribution you submit is dual licensed under the MIT license and

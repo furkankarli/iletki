@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["iletki contributors"]
@@ -12,10 +12,10 @@ repository = "https://github.com/furkankarli/iletki"
 
 [workspace.dependencies]
 # internal
-iletki-core = { version = "0.1.0", path = "crates/iletki-core" }
-iletki-wgpu = { version = "0.1.0", path = "crates/iletki-wgpu" }
-iletki-2d = { version = "0.1.0", path = "crates/iletki-2d" }
-iletki-3d = { version = "0.1.0", path = "crates/iletki-3d" }
+iletki-core = { version = "0.1.1", path = "crates/iletki-core" }
+iletki-wgpu = { version = "0.1.1", path = "crates/iletki-wgpu" }
+iletki-2d = { version = "0.1.1", path = "crates/iletki-2d" }
+iletki-3d = { version = "0.1.1", path = "crates/iletki-3d" }
 
 # gpu
 wgpu = "30"
