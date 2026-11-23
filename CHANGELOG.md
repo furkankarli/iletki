@@ -14,6 +14,9 @@
 - Show selection, shared camera views, and live sections with real STEP and IFC models
   in the project and crate READMEs.
 
+On Mesa 25.2 lavapipe, the sampled section path can quantize a CAD line's cut endpoint
+to a whole pixel. Section clipping still removes the line beyond the cut.
+
 ## 0.1.0
 
 Initial crates.io release of the viewport libraries and the egui and Slint adapters.
