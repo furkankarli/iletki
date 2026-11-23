@@ -232,6 +232,14 @@ fn packed_faces_match_direct_across_views_and_chunk_edits() {
         0.1,
         60.0,
     );
+    top.camera_mut().set_clip_planes(&[
+        Plane::from_normal_point(Vec3::X, center - Vec3::X * 3.15).unwrap(),
+        Plane::from_normal_point(Vec3::Y, center - Vec3::Y * 4.2).unwrap(),
+    ]);
+    oblique.camera_mut().set_clip_planes(&[
+        Plane::from_normal_point(Vec3::X, center - Vec3::X * 6.2).unwrap(),
+        Plane::from_normal_point(-Vec3::Y, center + Vec3::Y * 3.1).unwrap(),
+    ]);
 
     let mut images = |scene: &mut Scene3DLayer, packed| {
         scene.set_profile_batch_geometry(packed);
@@ -268,6 +276,9 @@ fn packed_faces_match_direct_across_views_and_chunk_edits() {
     scene.set_origin(replacement, center + Vec3::X * 10.0);
     let relocated = images(&mut scene, true);
     assert!(relocated != selected && relocated == images(&mut scene, false));
+    scene.clear_selection();
+    let cleared = images(&mut scene, true);
+    assert!(cleared != relocated && cleared == images(&mut scene, false));
 
     let hits = top
         .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [115, 62, 5, 5])

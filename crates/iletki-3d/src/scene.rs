@@ -19,7 +19,10 @@ use iletki_wgpu::{
     PrepareCtx, ViewportLayer,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{cmp::Reverse, collections::BinaryHeap};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap},
+};
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 const SECTION_GROUP_SIZE: usize = 32;
@@ -107,6 +110,8 @@ pub struct Scene3DLayer {
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
     free_chunks: BinaryHeap<Reverse<usize>>,
+    selected_slots: BTreeSet<usize>,
+    pending_meshes: usize,
     section_groups: Vec<Option<SectionGroup>>,
     section_relations: Vec<(SectionRelation, bool)>,
     views: Vec<ViewObjects>,
@@ -144,6 +149,8 @@ impl Scene3DLayer {
             use_antialiased_section: false,
             chunks: Vec::new(),
             free_chunks: BinaryHeap::new(),
+            selected_slots: BTreeSet::new(),
+            pending_meshes: 0,
             section_groups: Vec::new(),
             section_relations: Vec::new(),
             views: Vec::new(),
@@ -217,6 +224,7 @@ impl Scene3DLayer {
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
     pub fn insert(&mut self, mesh: Mesh3D) -> Chunk3DId {
         self.revision.mark_static();
+        self.pending_meshes += 1;
         let generation = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
         let entry = ChunkEntry {
             generation,
@@ -282,6 +290,11 @@ impl Scene3DLayer {
     pub fn set_selected(&mut self, id: Chunk3DId, selected: bool) {
         if let Some(entry) = self.chunk_mut(id) {
             entry.selected = selected;
+            if selected {
+                self.selected_slots.insert(id.index);
+            } else {
+                self.selected_slots.remove(&id.index);
+            }
             self.revision.mark_dynamic();
         }
     }
@@ -298,9 +311,12 @@ impl Scene3DLayer {
     /// Clears selection on all chunks.
     pub fn clear_selection(&mut self) {
         self.revision.mark_dynamic();
-        for chunk in self.chunks.iter_mut().flatten() {
-            chunk.selected = false;
+        for index in &self.selected_slots {
+            if let Some(Some(chunk)) = self.chunks.get_mut(*index) {
+                chunk.selected = false;
+            }
         }
+        self.selected_slots.clear();
     }
 
     /// Removes a chunk and releases its GPU resources. Other chunks can retain a shared page.
@@ -310,7 +326,13 @@ impl Scene3DLayer {
                 .as_ref()
                 .is_some_and(|entry| entry.generation == id.generation)
         {
-            *slot = None;
+            if slot
+                .take()
+                .is_some_and(|entry| entry.pending_mesh.is_some())
+            {
+                self.pending_meshes -= 1;
+            }
+            self.selected_slots.remove(&id.index);
             self.free_chunks.push(Reverse(id.index));
             if let Some(group) = self.section_groups.get_mut(id.index / SECTION_GROUP_SIZE) {
                 *group = None;
@@ -888,11 +910,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         if any_picks {
             mask = mask.union(DrawPhaseMask::PICKING);
         }
-        let any_selected = self
-            .chunks
-            .iter()
-            .flatten()
-            .any(|c| c.visible && c.selected);
+        let any_selected = self.selected_slots.iter().any(|index| {
+            self.chunks
+                .get(*index)
+                .and_then(Option::as_ref)
+                .is_some_and(|chunk| chunk.visible)
+        });
         if any_selected {
             mask = mask.union(DrawPhaseMask::OUTLINE_MASK);
         }
@@ -921,7 +944,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let mut edge_builder = PageBuilder::default();
         let mut uploaded_edges = Vec::new();
 
-        for (chunk_index, entry) in self.chunks.iter_mut().enumerate() {
+        let upload_slots = if self.pending_meshes == 0 {
+            0
+        } else {
+            self.chunks.len()
+        };
+        for (chunk_index, entry) in self.chunks.iter_mut().take(upload_slots).enumerate() {
             let Some(chunk) = entry else { continue };
             let Some(mesh) = &chunk.pending_mesh else {
                 continue;
@@ -949,6 +977,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 }
             }
             if let Some(mesh) = chunk.pending_mesh.take() {
+                self.pending_meshes -= 1;
                 self.revision.mark_static();
                 if let Some(group) = self
                     .section_groups
@@ -1065,9 +1094,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 ctx,
                 self.revision,
                 self.chunks.len(),
-                self.chunks.iter().enumerate().filter_map(|(index, chunk)| {
-                    let chunk = chunk.as_ref()?;
-                    (chunk.selected && chunk.visible && chunk.vertex_count != 0).then_some((
+                self.selected_slots.iter().filter_map(|&index| {
+                    let chunk = self.chunks.get(index)?.as_ref()?;
+                    (chunk.visible && chunk.vertex_count != 0).then_some((
                         index,
                         chunk.local_bounds,
                         chunk.origin,
@@ -1076,6 +1105,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             );
             match update {
                 OutlineUpdate::Unchanged => return pending,
+                OutlineUpdate::Selection if self.selected_slots.is_empty() => {
+                    view.mask.clear();
+                    return pending;
+                }
                 OutlineUpdate::Selection if pack_geometry && view.faces.has_packed() => {
                     if let Some(packed) = &p.packed
                         && Self::prepare_packed_mask(ctx, &packed.layout, &self.chunks, view)
@@ -1243,6 +1276,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             .filter(|packed| use_packed && (picking.is_none() || packed.pick.is_some()))
             .map(|packed| &packed.layout);
         let packed_mask = picking.is_none()
+            && self.selected_slots.len() >= 128
             && packed_layout
                 .is_some_and(|layout| Self::prepare_packed_mask(ctx, layout, &self.chunks, view));
         {
@@ -1518,5 +1552,32 @@ mod tests {
         assert_eq!(insert(&mut scene).index, third.index);
         assert_eq!(insert(&mut scene).index, 3);
         assert!(scene.chunk_mut(second).is_some());
+    }
+
+    #[test]
+    fn pending_uploads_and_selection_follow_chunk_lifetimes() {
+        let mut scene = Scene3DLayer::new(1);
+        let first = scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+        let second = scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+        scene.set_selected(first, true);
+        scene.set_selected(first, true);
+        scene.set_selected(second, true);
+        scene.set_visible(second, false);
+        assert!(ViewportLayer::<()>::phases(&scene).contains(DrawPhase::OutlineMask));
+
+        scene.remove(first);
+        assert_eq!(scene.pending_meshes, 1);
+        assert!(!ViewportLayer::<()>::phases(&scene).contains(DrawPhase::OutlineMask));
+        let replacement = scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+        scene.set_selected(first, true);
+        scene.remove(first);
+        assert_eq!(scene.pending_meshes, 2);
+        assert!(!scene.is_selected(replacement));
+
+        scene.set_visible(second, true);
+        assert!(ViewportLayer::<()>::phases(&scene).contains(DrawPhase::OutlineMask));
+        scene.clear_selection();
+        assert!(!scene.is_selected(second));
+        assert!(scene.selected_slots.is_empty());
     }
 }
