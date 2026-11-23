@@ -41,6 +41,7 @@ impl Action {
 pub(crate) enum Scene {
     Demo,
     Wide,
+    Shuffled,
     Model(PathBuf),
 }
 
@@ -65,6 +66,7 @@ pub(crate) enum Motion {
     Orbit,
     Section,
     Edit,
+    Combined,
 }
 
 pub(crate) struct Options {
@@ -73,6 +75,7 @@ pub(crate) struct Options {
     pub(crate) action: Action,
     pub(crate) style: Style,
     pub(crate) dual: bool,
+    pub(crate) full_hd: bool,
     pub(crate) notify: bool,
     pub(crate) present: Option<wgpu::PresentMode>,
     pub(crate) depth: Option<u32>,
@@ -98,6 +101,7 @@ impl Options {
             action: Action::Orbit,
             style: Style::Faces,
             dual: false,
+            full_hd: false,
             notify: false,
             present: None,
             depth: None,
@@ -110,12 +114,14 @@ impl Options {
         while let Some(flag) = args.next() {
             match flag.to_str() {
                 Some("--dual") => config.dual = true,
+                Some("--1080p") => config.full_hd = true,
                 Some("--notify-present") => config.notify = true,
                 Some("--scene") => {
                     let value = args.next().ok_or("missing scene")?;
                     config.scene = match value.to_str() {
                         Some("demo") => Scene::Demo,
                         Some("wide") => Scene::Wide,
+                        Some("shuffled-100k") => Scene::Shuffled,
                         _ => Scene::Model(value.into()),
                     };
                 }
@@ -151,6 +157,7 @@ impl Options {
                         (Some("--motion"), "orbit") => config.motion = Motion::Orbit,
                         (Some("--motion"), "section") => config.motion = Motion::Section,
                         (Some("--motion"), "edit") => config.motion = Motion::Edit,
+                        (Some("--motion"), "combined") => config.motion = Motion::Combined,
                         (Some("--rect-size"), "256") => config.rect_size = 256,
                         (Some("--rect-size"), "512") => config.rect_size = 512,
                         (Some("--input-hz"), _) => {
@@ -170,9 +177,6 @@ impl Options {
                 }
             }
         }
-        if config.dual && matches!(config.action, Action::Click | Action::Marquee) {
-            return Err("select a single viewport for the picking replay".into());
-        }
         if config.action == Action::Edit && matches!(config.scene, Scene::Demo) {
             return Err("edit replay requires the wide or model scene".into());
         }
@@ -181,7 +185,9 @@ impl Options {
         {
             return Err("marquee motion requires the wide or model scene".into());
         }
-        if config.motion == Motion::Section && config.style != Style::Section {
+        if matches!(config.motion, Motion::Section | Motion::Combined)
+            && config.style != Style::Section
+        {
             return Err("section motion requires --style edges-section".into());
         }
         if config.action == Action::Live && config.input_hz != DEFAULT_INPUT_HZ {
@@ -191,9 +197,12 @@ impl Options {
     }
 
     pub(crate) fn dimensions(&self) -> [u32; 2] {
+        if self.full_hd {
+            return [1920, 1080];
+        }
         match self.scene {
             Scene::Wide => [1024, 768],
-            Scene::Model(_) => [1920, 1080],
+            Scene::Model(_) | Scene::Shuffled => [1920, 1080],
             Scene::Demo => [1280, 800],
         }
     }

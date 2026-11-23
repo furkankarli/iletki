@@ -45,7 +45,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
 const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -329,6 +329,19 @@ impl GpuState {
                 let style = bench.as_ref().map_or(latency::Style::Faces, |b| b.style);
                 bench_scene(
                     (0..20_000).map(|index| latency::wide_mesh(index, style)),
+                    &mut bench_edits,
+                )
+            }
+            Some(latency::Scene::Shuffled) => {
+                let center = f64::from(100_000_u32.div_ceil(64));
+                bench_fit = Some((Vec3::new(63.0, center, 0.8), center * 2.0));
+                let style = bench.as_ref().map_or(latency::Style::Faces, |b| b.style);
+                let mut order: Vec<u32> = (0..100_000).collect();
+                order.sort_unstable_by_key(|index| index.wrapping_mul(0x9e37_79b9));
+                bench_scene(
+                    order
+                        .into_iter()
+                        .map(|index| latency::wide_mesh(index, style)),
                     &mut bench_edits,
                 )
             }
@@ -643,6 +656,14 @@ impl GpuState {
         let now = Instant::now();
         let dpi = self.window.scale_factor();
         let px = (logical_pos.x * dpi).round().max(0.0) as u32;
+        let px = if self.bench_dual {
+            let Some(local) = px.checked_sub(self.surface_config.width / 2) else {
+                return;
+            };
+            local
+        } else {
+            px
+        };
         let py = (logical_pos.y * dpi).round().max(0.0) as u32;
         let event = self
             .latency
@@ -753,7 +774,7 @@ impl GpuState {
     }
 
     fn request_pick(&mut self, rect: [u32; 4], kind: PickKind, event: Option<usize>) {
-        if self.quad_view || self.bench_dual {
+        if self.quad_view {
             self.pick_status(event, "unsupported-view", None);
             return;
         }
@@ -891,7 +912,7 @@ impl GpuState {
         if let Ok(hits) = &result {
             self.pick_status(request.event, "ready", Some(hits.len()));
         }
-        if request.epoch != self.pick_epoch || self.quad_view || self.bench_dual {
+        if request.epoch != self.pick_epoch || self.quad_view {
             self.pick_status(request.event, "cancelled", None);
         } else if request.view != self.pick_view(request.kind) {
             if request.kind == PickKind::Commit {
@@ -937,6 +958,9 @@ impl GpuState {
         if self.visible_selection != *desired {
             self.visible_selection = preview.unwrap_or_else(|| self.committed_selection.clone());
             self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+            if self.bench_dual {
+                self.vp_top.mark_dirty(DirtyFlags::SELECTION);
+            }
         }
     }
 
@@ -1126,13 +1150,33 @@ impl GpuState {
                         modifiers,
                     });
                 }
-                if motion == latency::Motion::Edit && tick % 6 == 0 {
-                    let offset = if tick % 12 == 0 { 0.2 } else { 0.0 };
+                if motion == latency::Motion::Combined
+                    && let Some((focus, radius)) = self.bench_fit
+                {
+                    let angle = f64::from(tick % 60) * std::f64::consts::TAU / 60.0;
+                    let eye = focus
+                        + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius * 0.65);
+                    *self.vp_main.camera_mut() = Camera::perspective_3d(
+                        eye,
+                        focus,
+                        Vec3::Z,
+                        55_f64.to_radians(),
+                        radius / 1500.0,
+                    );
+                }
+                if matches!(motion, latency::Motion::Edit | latency::Motion::Combined)
+                    && tick.is_multiple_of(6)
+                {
+                    let edited = tick.is_multiple_of(12);
+                    let offset = if edited { 0.2 } else { 0.0 };
                     for &(id, origin) in &self.bench_edits {
                         self.scene_3d.set_origin(id, origin + Vec3::X * offset);
+                        if motion == latency::Motion::Combined {
+                            self.scene_3d.set_visible(id, !edited);
+                        }
                     }
                 }
-                if motion == latency::Motion::Section {
+                if matches!(motion, latency::Motion::Section | latency::Motion::Combined) {
                     self.rotate_bench_section(tick);
                 }
                 let (x, y) = match region {
@@ -1150,11 +1194,12 @@ impl GpuState {
                         )
                     }
                 };
+                let [width, height] = [width.min(w), width.min(h)];
                 let rect = [
-                    x.saturating_sub(width / 2),
-                    y.saturating_sub(width / 2),
-                    width.min(w),
-                    width.min(h),
+                    x.saturating_sub(width / 2).min(w - width),
+                    y.saturating_sub(height / 2).min(h - height),
+                    width,
+                    height,
                 ];
                 if motion != latency::Motion::Static {
                     self.window.request_redraw();
@@ -1520,9 +1565,13 @@ impl ApplicationHandler for DemoApp {
             .bench
             .as_ref()
             .map_or([1280, 800], latency::Options::dimensions);
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("iletki-demo")
             .with_inner_size(PhysicalSize::new(width, height));
+        if self.bench.as_ref().is_some_and(|bench| bench.full_hd) {
+            attrs =
+                attrs.with_fullscreen(Some(Fullscreen::Borderless(event_loop.primary_monitor())));
+        }
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
             return;

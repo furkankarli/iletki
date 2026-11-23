@@ -36,6 +36,7 @@ mod native {
     type Error = Box<dyn std::error::Error>;
     const SIZE: [u32; 2] = [1024, 768];
     const ORBIT_PERIOD: u32 = 30;
+    const WARMUP: u32 = 60;
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -80,7 +81,8 @@ mod native {
         }
 
         fn acceptance_wide(self) -> bool {
-            matches!(self.chunks, 20_000 | 100_000) && self.view == "wide"
+            matches!(self.chunks, 20_000 | 100_000)
+                && matches!(self.view, "wide" | "split" | "wide-dual")
         }
 
         fn camera(self, frame: u32, secondary: bool) -> Camera {
@@ -126,10 +128,20 @@ mod native {
                 );
             }
             let focus = Vec3::new(30.0, 4.0, 0.8);
-            if self.view == "wide" {
+            if matches!(self.view, "wide" | "split" | "wide-dual") {
                 let half_y = f64::from(self.chunks.div_ceil(64));
                 let focus = Vec3::new(63.0, half_y, 0.8);
                 let radius = half_y.max(64.0) * 2.0;
+                if secondary {
+                    return Camera::ortho_3d(
+                        focus + Vec3::Z * radius,
+                        focus,
+                        Vec3::Y,
+                        radius,
+                        0.05,
+                        radius * 3.0,
+                    );
+                }
                 let eye = focus + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius);
                 return Camera::perspective_3d(eye, focus, Vec3::Z, 55_f64.to_radians(), 0.05);
             }
@@ -199,9 +211,9 @@ mod native {
                 ..Default::default()
             }))?;
             eprintln!(
-                "{:?}; timestamp queries: {}",
+                "{:?}; features: {:?}",
                 adapter.get_info(),
-                required_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+                required_features
             );
             Ok(Self {
                 adapter,
@@ -227,11 +239,14 @@ mod native {
 
     fn hit_hash(hits: &[PickHit]) -> u64 {
         hash_bytes(hits.iter().flat_map(|hit| {
+            let position = hit.world_pos.map(|pos| [pos.x, pos.y, pos.z]);
             hit.id
                 .to_u64()
                 .to_le_bytes()
                 .into_iter()
                 .chain(hit.depth.to_le_bytes())
+                .chain([u8::from(position.is_some())])
+                .chain(position.into_iter().flatten().flat_map(f64::to_le_bytes))
         }))
     }
 
@@ -280,18 +295,27 @@ mod native {
                 scene.set_profile_section_bridging(false);
             }
             self.record_memory(case, "before-targets")?;
-            let host = || {
+            let host = |initial_px| {
                 ViewportHost::new_with_adapter(
                     &self.gpu.device,
                     &self.gpu.adapter,
                     ViewportConfig {
-                        initial_px: self.size,
+                        initial_px,
                         ..Default::default()
                     },
                 )
             };
-            let mut main = host()?;
-            let mut second = (case.view == "dual").then(host).transpose()?;
+            let [width, height] = self.size;
+            let split = case.view == "split";
+            if split && width < 2 {
+                return Err("split benchmark requires at least two pixels of width".into());
+            }
+            let left = if split { width / 2 } else { width };
+            let right = if split { width - left } else { width };
+            let mut main = host([right, height])?;
+            let mut second = matches!(case.view, "dual" | "split" | "wide-dual")
+                .then(|| host([left, height]))
+                .transpose()?;
             *main.camera_mut() = case.camera(0, false);
             if let Some(second) = second.as_mut() {
                 *second.camera_mut() = case.camera(0, true);
@@ -300,6 +324,7 @@ mod native {
             self.record_memory(case, "after-orbit")?;
             if (case.primary() || case.model.is_some() || case.chunks == 100_000)
                 && self.variant != "visibility-only"
+                && std::env::var_os("ILETKI_ASSEMBLY_ORBIT_ONLY").is_none()
             {
                 self.picking(case, &mut scene, &mut main)?;
             }
@@ -391,9 +416,11 @@ mod native {
                 (true, _) => 8,
                 (false, _) => 0,
             };
+            let signatures = std::env::var_os("ILETKI_ASSEMBLY_SIGNATURES").is_some();
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
-            for frame in 0..12 + samples + traces {
+            let trace_end = WARMUP + samples + traces;
+            for frame in 0..trace_end + if signatures { ORBIT_PERIOD } else { 0 } {
                 let start = Instant::now();
                 let edited = (edit_scene || edit_visibility) && frame % 6 == 0;
                 if edited {
@@ -412,7 +439,7 @@ mod native {
                 if let Some(second) = second.as_mut() {
                     *second.camera_mut() = case.camera(frame, true);
                 }
-                let trace = frame >= 12 + samples;
+                let trace = (WARMUP + samples..trace_end).contains(&frame);
                 if trace {
                     profiling::begin(&gpu.device);
                 }
@@ -439,8 +466,13 @@ mod native {
                         "orbit"
                     };
                     record_capture(&mut self.profile, label, frame, capture)?;
-                } else if frame >= 12 {
-                    let signature = if frame == 12 {
+                } else if frame >= WARMUP {
+                    let reference_frame = if signatures {
+                        frame >= trace_end
+                    } else {
+                        frame == WARMUP
+                    };
+                    let signature = if reference_frame {
                         let image = main.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
                         if case.model.is_some()
                             && let Some(background) = image.pixels.get(..4)
@@ -463,9 +495,20 @@ mod native {
                     } else {
                         String::new()
                     };
-                    self.record(case, "orbit", frame - 12, encode, wall, &signature)?;
-                    if edited {
-                        self.record(case, "edit-frame", frame - 12, encode, wall, "")?;
+                    if frame >= trace_end {
+                        self.record(
+                            case,
+                            "image-signature",
+                            frame - WARMUP,
+                            0.0,
+                            0.0,
+                            &signature,
+                        )?;
+                    } else {
+                        self.record(case, "orbit", frame - WARMUP, encode, wall, &signature)?;
+                        if edited {
+                            self.record(case, "edit-frame", frame - WARMUP, encode, wall, "")?;
+                        }
                     }
                 }
             }
@@ -482,12 +525,12 @@ mod native {
             *main.camera_mut() = case.camera(35, false);
             let samples = 360;
             let profile = std::env::var_os("ILETKI_PROFILE").is_some();
-            let [x, y] = self.size.map(|dimension| dimension / 2);
+            let [x, y] = main.size().active_px.map(|dimension| dimension / 2);
             let click = [x.saturating_sub(2), y.saturating_sub(2), 5, 5];
             let marquee = [x.saturating_sub(128), y.saturating_sub(128), 256, 256];
             for (label, rect) in [("click", click), ("marquee", marquee), ("hover", click)] {
-                for frame in 0..12 + samples + if profile { 8 } else { 0 } {
-                    let trace = frame >= 12 + samples;
+                for frame in 0..WARMUP + samples + if profile { 8 } else { 0 } {
+                    let trace = frame >= WARMUP + samples;
                     if trace {
                         profiling::begin(&gpu.device);
                     }
@@ -527,11 +570,11 @@ mod native {
                     if trace {
                         let capture = profiling::finish(&gpu.device, &gpu.queue)?;
                         record_capture(&mut self.profile, label, frame, capture)?;
-                    } else if frame >= 12 {
+                    } else if frame >= WARMUP {
                         self.record(
                             case,
                             label,
-                            frame - 12,
+                            frame - WARMUP,
                             submit,
                             wall,
                             &format!("{:016x}", hit_hash(&hits)),
@@ -631,7 +674,9 @@ mod native {
             }
             let case = Case {
                 chunks,
-                view: if std::env::var_os("ILETKI_ASSEMBLY_DUAL").is_some() {
+                view: if std::env::var_os("ILETKI_ASSEMBLY_SPLIT").is_some() {
+                    "split"
+                } else if std::env::var_os("ILETKI_ASSEMBLY_DUAL").is_some() {
                     "dual"
                 } else {
                     "model"
@@ -664,14 +709,16 @@ mod native {
         let filter = std::env::var("ILETKI_ASSEMBLY_CASE").ok();
         let mut ran_case = false;
         for chunks in [1000, 4000, 20000, 100_000] {
-            for view in ["near", "wide", "dual"] {
+            for view in ["near", "wide", "dual", "split", "wide-dual"] {
                 let case = Case {
                     chunks,
                     view,
                     model: None,
                     style,
                 };
-                if (chunks == 100_000 && filter.as_deref() != Some("100000/wide"))
+                if (chunks == 100_000 && !case.acceptance_wide())
+                    || (filter.is_none()
+                        && (chunks == 100_000 || matches!(view, "split" | "wide-dual")))
                     || (primary_only && !case.primary())
                     || filter
                         .as_ref()

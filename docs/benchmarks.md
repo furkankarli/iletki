@@ -96,7 +96,14 @@ to the color pass. Use `ILETKI_ASSEMBLY_SHUFFLE=1` to permute the insertion orde
 synthetic assembly while preserving the geometry and input sequence.
 `ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
 Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
-adds an orthographic view to a model run and records both reference image hashes.
+adds a full-size orthographic view to a model run. Use `ILETKI_ASSEMBLY_SPLIT=1` to
+divide the requested width between two views. For the synthetic grid, select
+`20000/split`, `100000/split`, or `100000/wide-dual` through `ILETKI_ASSEMBLY_CASE`.
+After 60 warm-up frames, each of these workloads records 360 orbit samples.
+Use `ILETKI_ASSEMBLY_ORBIT_ONLY=1` to skip the separate picking workloads during
+timing repetitions. `ILETKI_ASSEMBLY_SIGNATURES=1` records both views at each of the 30
+orbit angles after timing and profiling. The angle in degrees is the orbit frame
+number modulo 30, multiplied by 12.
 `ILETKI_ASSEMBLY_VISIBILITY_EDITS=1` toggles visibility for the same subset.
 With either edit control, `edit-frame` repeats the changing frames from the orbit
 series for separate percentile analysis.
@@ -138,6 +145,22 @@ final release event. Set `--input-hz 240 --samples 1440` or
 During a burst, the demo keeps the newest pending preview and schedules GPU work against
 the window's nominal refresh interval. A ready preview gets a redraw opportunity before
 the next preview is encoded. Release requests take priority.
+
+For simultaneous orbit, live section, scene edits, and marquee previews, use
+`--action marquee --style edges-section --motion combined`. Add `--dual` to split
+the window between an orthographic view on the left and the perspective view on
+the right. The replay picks in right-panel pixels and shows the selection in both
+views. Use `--1080p` to run borderless on a 1920×1080 display and
+`--scene shuffled-100k` for the 100,000-part permutation. Confirm the actual drawable
+size in `monitor.txt`. The replay holds its final camera and scene
+while the release request finishes. Compare the applied preview rate, the input
+to present-return percentiles, and the release digest between builds.
+
+Run the combined replay three times per adapter at 60 Hz. The software gate is
+at least 57 applied preview frames per scheduled second, 16.67 ms p95 and
+33.3 ms p99 from input to present return. Compare the final release digest with
+the baseline for the same fixture, sequence, viewport layout, and GPU. Report
+an absent preview percentile when no previews reach a frame.
 
 ```sh
 cargo run --release -p iletki-demo -- --latency-bench out/marquee/radeon/filled/1 \
@@ -221,6 +244,15 @@ XDE document with `ReadStep`, take its shape with `XGetOneShape`, tessellate wit
 [Schependomlaan model](https://github.com/buildingsmart-community/Community-Sample-Test-Files/blob/main/IFC%202.3.0.1%20%28IFC%202x3%29/Schependomlaan/Design%20model%20IFC/IFC%20Schependomlaan.ifc)
 [Model license](https://github.com/openBIMstandards/Archive-DataSetSchependomlaan/blob/master/LICENSE.MD)
 [NIST CAD models](https://www.nist.gov/ctl/smart-connected-systems-division/smart-connected-manufacturing-systems-group/mbe-pmi-0)
+
+For an assembly-scale STEP run, use
+`OpenArm Cell/Integration with OpenArm/OpenArm_Cell+OpenArm_2.0.STEP` from the
+OpenArm Hardware 2.0.0 release archive, by Enactic, Inc., under CERN-OHL-S-2.0.
+The archive SHA-256 is
+`247ce0141a9be6ebbb5a6c206cf0557574929ea0b80e20dddbff7c0c0919db75`.
+With the same meshing and export settings, OCCT 7.9.3 and the fixture converter
+produced 538 chunks and 1,586,648 triangles. Record the generated fixture hash
+with the results. [OpenArm release](https://github.com/enactic/openarm_hardware/releases/tag/2.0.0)
 
 ```sh
 python3 docs/benchmarks/repro/convert-model.py ifc out/schependomlaan.iltmesh out/schependomlaan.ifc
