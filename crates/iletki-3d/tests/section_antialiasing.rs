@@ -444,7 +444,8 @@ fn section_clips_cad_lines_and_instances() {
             ViewportHost::new_with_adapter(&device, &adapter, config(4, ViewportMode::OnDemand))
                 .unwrap();
         let mid = SIZE / 2;
-        let offset = 0.5 * 8.0 / f64::from(SIZE);
+        let pixel_width = 8.0 / f64::from(SIZE);
+        let offset = 0.5 * pixel_width;
         let mut camera = head_on_camera();
         let plane = Plane::from_normal_point(Vec3::X, Vec3::new(offset, 0.0, 0.0)).unwrap();
         camera.set_clip_planes(&[plane]);
@@ -506,16 +507,17 @@ fn section_clips_cad_lines_and_instances() {
         let full = green_column(&image, mid + 1);
         assert!(left == 0 && full > 0, "{features:?}: {left}, {full}");
         if features.is_empty() {
-            // Default line rasterization can place the endpoint coverage at a whole pixel.
-            // Check that a moving plane still removes the previous boundary column.
+            // Default line rasterization can round coverage near the endpoint. Move the
+            // plane several pixels to test clipping clear of the endpoint sample pattern.
             let boundary = green_column(&image, mid);
             assert!(boundary <= full, "sampled line: {boundary}, {full}");
             let shifted =
-                Plane::from_normal_point(Vec3::X, Vec3::new(offset * 2.5, 0.0, 0.0)).unwrap();
+                Plane::from_normal_point(Vec3::X, Vec3::new(offset + 4.0 * pixel_width, 0.0, 0.0))
+                    .unwrap();
             camera.set_clip_planes(&[shifted]);
             let image = render(&device, &queue, &mut host, &mut scene, camera).unwrap();
             assert_eq!(green_column(&image, mid), 0);
-            assert_eq!(green_column(&image, mid + 2), full);
+            assert_eq!(green_column(&image, mid + 6), full);
         } else {
             // Hardware applies the backend's own line endpoint rules to the clipped segment.
             let mut clipped_edge = Mesh3D::at_origin(Vec3::ZERO);
