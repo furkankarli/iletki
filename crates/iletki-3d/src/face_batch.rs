@@ -1,4 +1,4 @@
-//! Immutable triangle pages and per-viewport draw ranges.
+//! Immutable vertex pages and per-viewport draw ranges.
 
 use crate::{Vertex3D, scene::ObjectUniforms};
 use iletki_wgpu::wgpu::{self, util::DeviceExt};
@@ -14,7 +14,7 @@ pub(crate) struct GeometryPage {
     slots: wgpu::Buffer,
 }
 
-pub(crate) enum Faces {
+pub(crate) enum VertexRange {
     Direct(wgpu::Buffer),
     Packed {
         page: Arc<GeometryPage>,
@@ -23,7 +23,7 @@ pub(crate) enum Faces {
     },
 }
 
-impl Faces {
+impl VertexRange {
     pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
         match self {
             Self::Direct(buffer) => buffer.slice(..),
@@ -50,8 +50,10 @@ impl PageBuilder {
             && limits.max_buffer_size >= (MAX_VERTICES * size_of::<Vertex3D>()) as u64
     }
 
-    pub(crate) fn can_pack(vertices: &[Vertex3D]) -> bool {
-        !vertices.is_empty() && vertices.len() <= MAX_VERTICES && vertices.len().is_multiple_of(3)
+    pub(crate) fn can_pack(vertices: &[Vertex3D], primitive_vertices: usize) -> bool {
+        !vertices.is_empty()
+            && vertices.len() <= MAX_VERTICES
+            && vertices.len().is_multiple_of(primitive_vertices)
     }
 
     pub(crate) fn push(
@@ -59,7 +61,7 @@ impl PageBuilder {
         chunk: usize,
         vertices: &[Vertex3D],
         device: &wgpu::Device,
-        uploaded: &mut Vec<(usize, Faces)>,
+        uploaded: &mut Vec<(usize, VertexRange)>,
     ) {
         if self.objects.len() == OBJECTS || self.vertices.len() + vertices.len() > MAX_VERTICES {
             self.flush(device, uploaded);
@@ -72,7 +74,11 @@ impl PageBuilder {
             .push((chunk, start..self.vertices.len() as u32));
     }
 
-    pub(crate) fn flush(&mut self, device: &wgpu::Device, uploaded: &mut Vec<(usize, Faces)>) {
+    pub(crate) fn flush(
+        &mut self,
+        device: &wgpu::Device,
+        uploaded: &mut Vec<(usize, VertexRange)>,
+    ) {
         if self.objects.is_empty() {
             return;
         }
@@ -84,13 +90,19 @@ impl PageBuilder {
             })
         };
         let page = Arc::new(GeometryPage {
-            vertices: make_buffer("iletki-3d face page", bytemuck::cast_slice(&self.vertices)),
-            slots: make_buffer("iletki-3d face slots", bytemuck::cast_slice(&self.slots)),
+            vertices: make_buffer(
+                "iletki-3d geometry page",
+                bytemuck::cast_slice(&self.vertices),
+            ),
+            slots: make_buffer(
+                "iletki-3d geometry slots",
+                bytemuck::cast_slice(&self.slots),
+            ),
         });
         for (slot, (chunk, vertices)) in self.objects.drain(..).enumerate() {
             uploaded.push((
                 chunk,
-                Faces::Packed {
+                VertexRange::Packed {
                     page: page.clone(),
                     vertices,
                     slot,
@@ -104,7 +116,7 @@ impl PageBuilder {
 
 pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("iletki-3d face page transforms"),
+        label: Some("iletki-3d geometry page transforms"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 1,
             visibility: wgpu::ShaderStages::VERTEX,
@@ -125,7 +137,7 @@ struct ViewUniforms {
 }
 
 #[derive(Default)]
-pub(crate) struct FaceDraws {
+pub(crate) struct PackedDraws {
     pages: Vec<ViewUniforms>,
     commands: Vec<Draw>,
     last_page: Option<Arc<GeometryPage>>,
@@ -141,7 +153,7 @@ enum Draw {
     },
 }
 
-impl FaceDraws {
+impl PackedDraws {
     pub(crate) fn clear(&mut self) {
         self.commands.clear();
         self.last_page = None;
@@ -152,15 +164,15 @@ impl FaceDraws {
         &mut self,
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        faces: &Faces,
+        geometry: &VertexRange,
         offset: ObjectUniforms,
         draw_index: usize,
     ) {
-        let Faces::Packed {
+        let VertexRange::Packed {
             page,
             vertices,
             slot,
-        } = faces
+        } = geometry
         else {
             self.commands.push(Draw::Direct(draw_index));
             return;
@@ -172,13 +184,13 @@ impl FaceDraws {
         {
             if self.used_pages == self.pages.len() {
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("iletki-3d face transform page"),
+                    label: Some("iletki-3d geometry transform page"),
                     size: OBJECT_BYTES,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
                 let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("iletki-3d face transform binding"),
+                    label: Some("iletki-3d geometry transform binding"),
                     layout,
                     entries: &[wgpu::BindGroupEntry {
                         binding: 1,
@@ -237,12 +249,6 @@ impl FaceDraws {
 
     pub(crate) fn has_packed(&self) -> bool {
         self.used_pages != 0
-    }
-
-    pub(crate) fn needs_direct_uniforms(&self) -> bool {
-        self.commands
-            .iter()
-            .any(|command| matches!(command, Draw::Direct(_)))
     }
 
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]

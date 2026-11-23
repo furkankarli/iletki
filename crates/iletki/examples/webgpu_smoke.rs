@@ -191,6 +191,17 @@ mod web {
         if !matches!(hits.as_slice(), [hit] if hit.id == ID) {
             return Err(format!("unexpected WebGPU packed geometry pick: {hits:?}"));
         }
+        host.camera_mut().set_clip_planes(&[section]);
+        let packed_cut =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        if packed_cut.get(1) != Some(&clipped)
+            || packed_cut.get(5) != Some(&cut)
+            || packed_cut.get(9) != Some(&solid)
+        {
+            return Err(format!(
+                "unexpected WebGPU packed section pixels: {packed_cut:?}"
+            ));
+        }
         Ok(())
     }
 

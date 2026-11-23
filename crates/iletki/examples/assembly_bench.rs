@@ -22,7 +22,8 @@ mod assembly_fixture;
 mod native {
     use iletki::gpu::{profiling, wgpu};
     use iletki::{
-        Camera, Mesh3D, PickHit, PickId, Scene3DLayer, Vec3, ViewportConfig, ViewportHost,
+        Camera, Chunk3DId, Mesh3D, PickHit, PickId, Plane, Scene3DLayer, Vec3, ViewportConfig,
+        ViewportHost,
     };
     use std::fs::{self, File};
     use std::future::Future;
@@ -46,11 +47,30 @@ mod native {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Style {
+        Faces,
+        Edges,
+        Section,
+    }
+
+    impl Style {
+        fn from_env() -> Result<Self, Error> {
+            match std::env::var("ILETKI_ASSEMBLY_STYLE").as_deref() {
+                Err(_) | Ok("faces") => Ok(Self::Faces),
+                Ok("edges") => Ok(Self::Edges),
+                Ok("edges-section") => Ok(Self::Section),
+                _ => Err("expected faces, edges or edges-section".into()),
+            }
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct Case {
         chunks: u32,
         view: &'static str,
         model: Option<(Vec3, f64)>,
+        style: Style,
     }
 
     impl Case {
@@ -63,8 +83,35 @@ mod native {
         }
 
         fn camera(self, frame: u32, secondary: bool) -> Camera {
+            let mut camera = self.orbit_camera(frame, secondary);
+            if self.style == Style::Section {
+                let center = self.model.map_or(
+                    Vec3::new(63.0, f64::from(self.chunks.div_ceil(64)), 0.0),
+                    |model| model.0,
+                );
+                let angle = f64::from(frame % 30) * std::f64::consts::TAU / 30.0;
+                if let Some(plane) =
+                    Plane::from_normal_point(Vec3::new(angle.sin(), angle.cos(), 0.15), center)
+                {
+                    camera.set_clip_planes(&[plane]);
+                }
+            }
+            camera
+        }
+
+        fn orbit_camera(self, frame: u32, secondary: bool) -> Camera {
             let angle = f64::from(frame % 30) * std::f64::consts::TAU / 30.0;
             if let Some((focus, radius)) = self.model {
+                if secondary {
+                    return Camera::ortho_3d(
+                        focus + Vec3::Z * radius,
+                        focus,
+                        Vec3::Y,
+                        radius,
+                        radius / 1500.0,
+                        radius * 3.0,
+                    );
+                }
                 let eye =
                     focus + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius * 0.65);
                 return Camera::perspective_3d(
@@ -91,28 +138,40 @@ mod native {
             }
         }
 
-        fn make_scene(self, batch: bool, pack_geometry: bool) -> Scene3DLayer {
+        fn make_scene(
+            self,
+            batch: bool,
+            pack_geometry: bool,
+        ) -> (Scene3DLayer, Vec<(Chunk3DId, Vec3)>) {
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_uniforms(batch);
             scene.set_profile_batch_geometry(pack_geometry);
+            let mut edits = Vec::new();
             for i in 0..self.chunks {
                 let x = f64::from(i % 64) * 2.0;
                 let y = f64::from(i / 64) * 2.0;
-                let mut mesh = Mesh3D::at_origin(Vec3::new(x, y, 0.0));
-                mesh.push_box(
-                    Vec3::new(-0.6, -0.6, 0.0),
-                    Vec3::new(0.6, 0.6, 1.6),
-                    [120, 170, 200, 255],
-                    PickId::new(1, i + 1, 0),
-                    false,
-                );
-                scene.insert(mesh);
+                let origin = Vec3::new(x, y, 0.0);
+                let mut mesh = Mesh3D::at_origin(origin);
+                let min = Vec3::new(-0.6, -0.6, 0.0);
+                let max = Vec3::new(0.6, 0.6, 1.6);
+                let id = PickId::new(1, i + 1, 0);
+                let color = [120, 170, 200, 255];
+                if self.style == Style::Faces {
+                    mesh.push_box(min, max, color, id, false);
+                } else {
+                    mesh.push_box_with_edges(min, max, color, [24, 32, 40, 160], id, false);
+                }
+                let id = scene.insert(mesh);
+                if i % 100 == 0 {
+                    edits.push((id, origin));
+                }
             }
-            scene
+            (scene, edits)
         }
     }
 
     struct Gpu {
+        adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
     }
@@ -123,7 +182,10 @@ mod native {
                 wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
             );
             let adapter = block_on(instance.request_adapter(&Default::default()))?;
-            let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+            let mut required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+            if std::env::var_os("ILETKI_ASSEMBLY_SAMPLED_SECTION").is_none() {
+                required_features |= adapter.features() & wgpu::Features::CLIP_DISTANCES;
+            }
             let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 required_features,
                 ..Default::default()
@@ -131,9 +193,13 @@ mod native {
             eprintln!(
                 "{:?}; timestamp queries: {}",
                 adapter.get_info(),
-                !required_features.is_empty()
+                required_features.contains(wgpu::Features::TIMESTAMP_QUERY)
             );
-            Ok(Self { device, queue })
+            Ok(Self {
+                adapter,
+                device,
+                queue,
+            })
         }
 
         fn wait(&self, submission_index: wgpu::SubmissionIndex) -> Result<(), wgpu::PollError> {
@@ -189,10 +255,16 @@ mod native {
     }
 
     impl Benchmark<'_> {
-        fn run_case(&mut self, case: Case, mut scene: Scene3DLayer) -> Result<(), Error> {
+        fn run_case(
+            &mut self,
+            case: Case,
+            mut scene: Scene3DLayer,
+            edits: &[(Chunk3DId, Vec3)],
+        ) -> Result<(), Error> {
             let host = || {
-                ViewportHost::new(
+                ViewportHost::new_with_adapter(
                     &self.gpu.device,
+                    &self.gpu.adapter,
                     ViewportConfig {
                         initial_px: self.size,
                         ..Default::default()
@@ -205,7 +277,7 @@ mod native {
             if let Some(second) = second.as_mut() {
                 *second.camera_mut() = case.camera(0, true);
             }
-            self.orbit(case, &mut scene, &mut main, &mut second)?;
+            self.orbit(case, &mut scene, &mut main, &mut second, edits)?;
             if (case.primary() || case.model.is_some()) && self.variant != "visibility-only" {
                 self.picking(case, &mut scene, &mut main)?;
             }
@@ -220,6 +292,7 @@ mod native {
             scene: &mut Scene3DLayer,
             main: &mut ViewportHost,
             second: &mut Option<ViewportHost>,
+            edits: &[(Chunk3DId, Vec3)],
         ) -> Result<(), Error> {
             let gpu = self.gpu;
             let stream_start = Instant::now();
@@ -258,7 +331,15 @@ mod native {
             let long = case.primary() || case.acceptance_wide() || case.model.is_some();
             let samples = if long { 360 } else { 60 };
             let profile = std::env::var_os("ILETKI_PROFILE").is_some() && long;
+            let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             for frame in 0..12 + samples + if profile { 8 } else { 0 } {
+                let start = Instant::now();
+                if edit_scene && frame % 6 == 0 {
+                    let delta = if frame % 12 == 0 { 0.2 } else { 0.0 };
+                    for &(id, origin) in edits {
+                        scene.set_origin(id, origin + Vec3::X * delta);
+                    }
+                }
                 *main.camera_mut() = case.camera(frame, false);
                 if let Some(second) = second.as_mut() {
                     *second.camera_mut() = case.camera(frame, true);
@@ -267,7 +348,6 @@ mod native {
                 if trace {
                     profiling::begin(&gpu.device);
                 }
-                let start = Instant::now();
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
                 main.render_to_texture(&gpu.device, &gpu.queue, &mut encoder, &(), &mut [scene]);
                 if let Some(second) = second.as_mut() {
@@ -305,7 +385,13 @@ mod native {
                         {
                             return Err("the model produced a uniform reference image".into());
                         }
-                        format!("{:016x}", hash_bytes(image.pixels))
+                        let hash = hash_bytes(image.pixels);
+                        if let Some(second) = second.as_ref() {
+                            let image = second.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
+                            format!("{hash:016x}/{:016x}", hash_bytes(image.pixels))
+                        } else {
+                            format!("{hash:016x}")
+                        }
                     } else {
                         String::new()
                     };
@@ -446,6 +532,7 @@ mod native {
             "variant,run,chunks,view,workload,frame,cpu_ms,wall_ms,signature"
         )?;
         writeln!(bench.profile, "workload,frame,kind,label,value")?;
+        let style = Style::from_env()?;
         let pack = !matches!(
             bench.variant.as_str(),
             "geometry-direct" | "visibility-only"
@@ -461,20 +548,30 @@ mod native {
             }
             let case = Case {
                 chunks,
-                view: "model",
+                view: if std::env::var_os("ILETKI_ASSEMBLY_DUAL").is_some() {
+                    "dual"
+                } else {
+                    "model"
+                },
                 model: Some((focus, radius)),
+                style,
             };
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_geometry(pack);
-            for mesh in fixture.meshes {
-                scene.insert(mesh);
+            let mut edits = Vec::new();
+            for (index, mesh) in fixture.meshes.into_iter().enumerate() {
+                let origin = mesh.origin;
+                let id = scene.insert(mesh);
+                if index % 100 == 0 {
+                    edits.push((id, origin));
+                }
             }
             eprintln!(
                 "model: {chunks} chunks, {} triangles, {:?} pixels",
                 fixture.triangles, bench.size
             );
             bench.record(case, "scene-load", 0, 0.0, elapsed_ms(started), "")?;
-            return bench.run_case(case, scene);
+            return bench.run_case(case, scene, &edits);
         }
         let primary_only = std::env::var_os("ILETKI_PRIMARY_ONLY").is_some();
         let filter = std::env::var("ILETKI_ASSEMBLY_CASE").ok();
@@ -485,6 +582,7 @@ mod native {
                     chunks,
                     view,
                     model: None,
+                    style,
                 };
                 if (primary_only && !case.primary())
                     || filter
@@ -494,8 +592,8 @@ mod native {
                     continue;
                 }
                 ran_case = true;
-                let scene = case.make_scene(bench.variant != "visibility-only", pack);
-                bench.run_case(case, scene)?;
+                let (scene, edits) = case.make_scene(bench.variant != "visibility-only", pack);
+                bench.run_case(case, scene, &edits)?;
             }
         }
         if !ran_case {

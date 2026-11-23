@@ -70,6 +70,71 @@ fn render(
     host.readback_rgba_blocking(device, queue)
 }
 
+#[cfg(feature = "profiling")]
+#[test]
+fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
+    let Some(adapter) = adapter() else { return };
+    for features in device_features(&adapter) {
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: features,
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut settings = config(4, ViewportMode::OnDemand);
+        settings.upload_budget = iletki_core::UploadBudget::UNLIMITED;
+        let mut host = ViewportHost::new_with_adapter(&device, &adapter, settings).unwrap();
+        let mut scene = Scene3DLayer::new(1);
+        let mut camera = head_on_camera();
+        camera.set_clip_planes(&[Plane::from_normal_point(
+            Vec3::new(1.0, 0.4, 0.15),
+            Vec3::new(0.06, 0.0, 0.0),
+        )
+        .unwrap()]);
+        for i in 0..169 {
+            let x = (f64::from(i % 13) - 6.0) * 0.45;
+            let z = (f64::from(i / 13) - 6.0) * 0.45;
+            let mut mesh = Mesh3D::at_origin(Vec3::new(x, 0.0, z));
+            mesh.push_box_with_edges(
+                Vec3::new(-0.19, -0.15, -0.19),
+                Vec3::new(0.19, 0.15, 0.19),
+                [70, 200, 130, 255],
+                [20, 30, 30, 150],
+                PickId::new(1, i + 1, 0),
+                true,
+            );
+            let chunk = scene.insert(mesh);
+            if i == 85 {
+                scene.set_selected(chunk, true);
+            }
+        }
+        let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        let area = [46, 46, 48, 48];
+        let packed = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
+            .unwrap();
+        scene.set_profile_batch_geometry(false);
+        let direct = render(&device, &queue, &mut host, &mut scene, camera).unwrap();
+        assert!(
+            image.pixels == direct.pixels,
+            "packed section differs with {features:?}"
+        );
+        let picks = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
+            .unwrap();
+        assert!(!packed.is_empty());
+        assert_eq!(
+            packed
+                .iter()
+                .map(|hit| (hit.id, hit.depth.to_bits()))
+                .collect::<Vec<_>>(),
+            picks
+                .iter()
+                .map(|hit| (hit.id, hit.depth.to_bits()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 fn clip_triangle(triangle: [Vec3; 3], plane: Plane) -> Vec<Vec3> {
     let mut clipped = Vec::new();
     for (a, b) in triangle

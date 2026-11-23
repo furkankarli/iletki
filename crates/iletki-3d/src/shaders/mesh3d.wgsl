@@ -59,8 +59,8 @@ fn vs_mesh(v: VertIn) -> ColorOut {
 }
 
 // Reversed-Z depth-offset vertex shader for crisp 3D CAD edges over solid faces without z-fighting.
-fn edge_vertex(v: VertIn) -> ColorOut {
-    var out = mesh_vertex(v);
+fn edge_vertex_with_object(v: VertIn, placement: ObjectUniforms) -> ColorOut {
+    var out = mesh_vertex_with_object(v, placement);
     var clip = out.clip_pos;
     // In infinite Reversed-Z (near = 1.0, far = 0.0), clip.z scales with `near` (Perspective) or
     // linear depth (Ortho). Scaling multiplicatively pulls the edge ~0.08% closer across every
@@ -68,6 +68,10 @@ fn edge_vertex(v: VertIn) -> ColorOut {
     clip.z = min(clip.z * 1.0008 + 1e-5, clip.w);
     out.clip_pos = clip;
     return out;
+}
+
+fn edge_vertex(v: VertIn) -> ColorOut {
+    return edge_vertex_with_object(v, object);
 }
 
 @vertex

@@ -2,7 +2,7 @@
 //! planes, *Shaded with Edges* depth-offset wireframe overlays, Jump-Flood selection outline masks,
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
-use crate::face_batch::{self, Faces, PageBuilder};
+use crate::face_batch::{self, PageBuilder, VertexRange};
 use crate::objects::{PickVolume, PreparedObject, ViewObjects};
 use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
@@ -39,9 +39,9 @@ struct ChunkEntry {
     visible: bool,
     selected: bool,
     pending_mesh: Option<Mesh3D>,
-    vertex_buf: Option<Faces>,
+    vertex_buf: Option<VertexRange>,
     vertex_count: u32,
-    edge_buf: Option<wgpu::Buffer>,
+    edge_buf: Option<VertexRange>,
     edge_count: u32,
     pick_buf: Option<wgpu::Buffer>,
     has_picks: bool,
@@ -54,12 +54,23 @@ struct Pipelines {
     object_layout: wgpu::BindGroupLayout,
     dynamic_uniforms: bool,
     lit: wgpu::RenderPipeline,
-    packed_lit: Option<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
+    packed: Option<PackedPipelines>,
     section: Option<SectionPipelines>,
     edge: wgpu::RenderPipeline,
     mask: wgpu::RenderPipeline,
     multisampled_mask: Option<wgpu::RenderPipeline>,
     pick: wgpu::RenderPipeline,
+}
+
+struct ColorPipelines {
+    faces: wgpu::RenderPipeline,
+    edges: wgpu::RenderPipeline,
+}
+
+struct PackedPipelines {
+    layout: wgpu::BindGroupLayout,
+    base: ColorPipelines,
+    section: Option<ColorPipelines>,
 }
 
 struct SectionPipelines {
@@ -224,6 +235,7 @@ impl Scene3DLayer {
             *slot = None;
             for view in &mut self.views {
                 view.faces.clear();
+                view.edges.clear();
             }
             self.revision.mark_static();
         }
@@ -306,14 +318,19 @@ impl Scene3DLayer {
             attributes: &wgpu::vertex_attr_array![3 => Uint32x2],
         };
 
-        let make_lit = |shader: &wgpu::ShaderModule,
-                        vertex,
-                        fragment,
-                        layout: &wgpu::PipelineLayout,
-                        buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+        let make_color = |shader: &wgpu::ShaderModule,
+                          vertex,
+                          fragment,
+                          layout: &wgpu::PipelineLayout,
+                          buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+                          edges: bool| {
             ctx.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("iletki-3d lit mesh"),
+                    label: Some(if edges {
+                        "iletki-3d shaded edges"
+                    } else {
+                        "iletki-3d lit mesh"
+                    }),
                     layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module: shader,
@@ -332,14 +349,18 @@ impl Scene3DLayer {
                         })],
                     }),
                     primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        topology: if edges {
+                            wgpu::PrimitiveTopology::LineList
+                        } else {
+                            wgpu::PrimitiveTopology::TriangleList
+                        },
                         // Keep back faces visible so section clip planes reveal solid interiors.
                         cull_mode: None,
                         ..wgpu::PrimitiveState::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(true),
+                        depth_write_enabled: Some(!edges),
                         depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                         stencil: wgpu::StencilState::default(),
                         bias: wgpu::DepthBiasState::default(),
@@ -353,25 +374,37 @@ impl Scene3DLayer {
                 })
         };
         let face_layout = [Some(vert_layout.clone())];
-        let lit = make_lit(&shader, "vs_mesh", "fs_lit", &pipeline_layout, &face_layout);
-        let packed_lit = PageBuilder::supports(ctx.device).then(|| {
-            let bind_layout = face_batch::bind_layout(ctx.device);
-            let packed_layout =
+        let lit = make_color(
+            &shader,
+            "vs_mesh",
+            "fs_lit",
+            &pipeline_layout,
+            &face_layout,
+            false,
+        );
+        let edge = make_color(
+            &shader,
+            "vs_edge",
+            "fs_edge",
+            &pipeline_layout,
+            &face_layout,
+            true,
+        );
+        let packed = PageBuilder::supports(ctx.device).then(|| {
+            let layout = face_batch::bind_layout(ctx.device);
+            let pipeline_layout =
                 ctx.device
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("iletki-3d packed face pipeline layout"),
-                        bind_group_layouts: &[
-                            Some(ctx.camera_bind_group_layout),
-                            Some(&bind_layout),
-                        ],
+                        label: Some("iletki-3d packed geometry layout"),
+                        bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&layout)],
                         immediate_size: 0,
                     });
             let source = format!("{wgsl}\n{}", include_str!("shaders/mesh3d_batched.wgsl"));
             let shader = ctx
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("iletki-3d packed face mesh shader"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                    label: Some("iletki-3d packed geometry shader"),
+                    source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
                 });
             let buffers = [
                 Some(vert_layout.clone()),
@@ -381,58 +414,69 @@ impl Scene3DLayer {
                     attributes: &wgpu::vertex_attr_array![3 => Uint32],
                 }),
             ];
-            let pipeline = make_lit(
+            let pipelines =
+                |shader: &wgpu::ShaderModule, face, face_fragment, edge, edge_fragment| {
+                    ColorPipelines {
+                        faces: make_color(
+                            shader,
+                            face,
+                            face_fragment,
+                            &pipeline_layout,
+                            &buffers,
+                            false,
+                        ),
+                        edges: make_color(
+                            shader,
+                            edge,
+                            edge_fragment,
+                            &pipeline_layout,
+                            &buffers,
+                            true,
+                        ),
+                    }
+                };
+            let base = pipelines(
                 &shader,
                 "vs_mesh_batched",
                 "fs_lit",
-                &packed_layout,
-                &buffers,
+                "vs_edge_batched",
+                "fs_edge",
             );
-            (bind_layout, pipeline)
+            let section = section_aa.map(|aa| {
+                let sampled = concat!(
+                    include_str!("shaders/mesh3d_sampled.wgsl"),
+                    "\n",
+                    include_str!("shaders/mesh3d_batched_sampled.wgsl")
+                );
+                let raster = concat!(
+                    include_str!("shaders/mesh3d_raster.wgsl"),
+                    "\n",
+                    include_str!("shaders/mesh3d_batched_raster.wgsl")
+                );
+                let shader = aa.shader(ctx.device, &source, sampled, raster);
+                match aa {
+                    SectionAa::Sampled => pipelines(
+                        &shader,
+                        "vs_mesh_batched_sampled",
+                        "fs_lit_sampled",
+                        "vs_edge_batched_sampled",
+                        "fs_edge_sampled",
+                    ),
+                    SectionAa::Raster => pipelines(
+                        &shader,
+                        "vs_mesh_batched_raster",
+                        "fs_lit_raster",
+                        "vs_edge_batched_raster",
+                        "fs_unlit",
+                    ),
+                }
+            });
+            PackedPipelines {
+                layout,
+                base,
+                section,
+            }
         });
-
-        let make_edge = |shader: &wgpu::ShaderModule, vertex, fragment| {
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("iletki-3d shaded edges"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some(vertex),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers: &[Some(vert_layout.clone())],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some(fragment),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: ctx.color_format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::LineList,
-                        cull_mode: None,
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(false),
-                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: ctx.msaa_samples,
-                        ..wgpu::MultisampleState::default()
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-        };
-        let edge = make_edge(&shader, "vs_edge", "fs_edge");
 
         let make_mask = |shader: &wgpu::ShaderModule, vertex, fragment, count| {
             ctx.device
@@ -482,25 +526,41 @@ impl Scene3DLayer {
             );
             match aa {
                 SectionAa::Sampled => SectionPipelines {
-                    lit: make_lit(
+                    lit: make_color(
                         &shader,
                         "vs_mesh_sampled",
                         "fs_lit_sampled",
                         &pipeline_layout,
                         &face_layout,
+                        false,
                     ),
-                    edge: make_edge(&shader, "vs_edge_sampled", "fs_edge_sampled"),
+                    edge: make_color(
+                        &shader,
+                        "vs_edge_sampled",
+                        "fs_edge_sampled",
+                        &pipeline_layout,
+                        &face_layout,
+                        true,
+                    ),
                     multisampled_mask: make_mask(&shader, "vs_mesh_sampled", "fs_mask_sampled", 4),
                 },
                 SectionAa::Raster => SectionPipelines {
-                    lit: make_lit(
+                    lit: make_color(
                         &shader,
                         "vs_mesh_raster",
                         "fs_lit_raster",
                         &pipeline_layout,
                         &face_layout,
+                        false,
                     ),
-                    edge: make_edge(&shader, "vs_edge_raster", "fs_unlit"),
+                    edge: make_color(
+                        &shader,
+                        "vs_edge_raster",
+                        "fs_unlit",
+                        &pipeline_layout,
+                        &face_layout,
+                        true,
+                    ),
                     multisampled_mask: make_mask(&shader, "vs_mesh_raster", "fs_mask_unclipped", 4),
                 },
             }
@@ -551,7 +611,7 @@ impl Scene3DLayer {
             object_layout,
             dynamic_uniforms,
             lit,
-            packed_lit,
+            packed,
             section,
             edge,
             mask,
@@ -630,25 +690,30 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         };
         let cam_pos = ctx.camera.position_3d();
         let mut pending = false;
-        let pack_geometry = p.packed_lit.is_some();
+        let pack_geometry = p.packed.is_some();
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let pack_geometry = pack_geometry && self.profile_batch_geometry;
         let mut builder = PageBuilder::default();
         let mut uploaded_faces = Vec::new();
+        let mut edge_builder = PageBuilder::default();
+        let mut uploaded_edges = Vec::new();
 
         for (chunk_index, entry) in self.chunks.iter_mut().enumerate() {
             let Some(chunk) = entry else { continue };
-            let pack = pack_geometry
-                && chunk
-                    .pending_mesh
-                    .as_ref()
-                    .is_some_and(|mesh| PageBuilder::can_pack(&mesh.vertices));
-            if let Some(mesh) = &chunk.pending_mesh {
+            let Some(mesh) = &chunk.pending_mesh else {
+                continue;
+            };
+            let pack = pack_geometry && PageBuilder::can_pack(&mesh.vertices, 3);
+            let pack_edges = pack_geometry && PageBuilder::can_pack(&mesh.edges, 2);
+            {
                 let mut bytes = size_of_val(mesh.vertices.as_slice())
                     .saturating_add(size_of_val(mesh.edges.as_slice()));
                 if pack {
                     bytes =
                         bytes.saturating_add(mesh.vertices.len().saturating_mul(size_of::<u32>()));
+                }
+                if pack_edges {
+                    bytes = bytes.saturating_add(mesh.edges.len().saturating_mul(size_of::<u32>()));
                 }
                 if mesh.pick_ids.len() == mesh.vertices.len() {
                     bytes = bytes.saturating_add(size_of_val(mesh.pick_ids.as_slice()));
@@ -671,13 +736,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     if pack {
                         builder.push(chunk_index, &mesh.vertices, ctx.device, &mut uploaded_faces);
                     } else {
-                        chunk.vertex_buf = Some(Faces::Direct(ctx.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("iletki-3d vertices"),
-                                contents: bytemuck::cast_slice(&mesh.vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        )));
+                        chunk.vertex_buf = Some(VertexRange::Direct(
+                            ctx.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("iletki-3d vertices"),
+                                    contents: bytemuck::cast_slice(&mesh.vertices),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                }),
+                        ));
                     }
                     if mesh.pick_ids.len() == mesh.vertices.len() {
                         chunk.pick_buf = Some(ctx.device.create_buffer_init(
@@ -702,13 +768,22 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     chunk.edge_count = 0;
                 } else {
                     chunk.edge_count = u32::try_from(mesh.edges.len()).unwrap_or(0);
-                    chunk.edge_buf = Some(ctx.device.create_buffer_init(
-                        &wgpu::util::BufferInitDescriptor {
-                            label: Some("iletki-3d edges"),
-                            contents: bytemuck::cast_slice(&mesh.edges),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        },
-                    ));
+                    if pack_edges {
+                        edge_builder.push(
+                            chunk_index,
+                            &mesh.edges,
+                            ctx.device,
+                            &mut uploaded_edges,
+                        );
+                    } else {
+                        chunk.edge_buf = Some(VertexRange::Direct(ctx.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("iletki-3d edges"),
+                                contents: bytemuck::cast_slice(&mesh.edges),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            },
+                        )));
+                    }
                 }
                 ctx.uploads.finish_upload();
             }
@@ -717,6 +792,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         for (index, faces) in uploaded_faces {
             if let Some(Some(chunk)) = self.chunks.get_mut(index) {
                 chunk.vertex_buf = Some(faces);
+            }
+        }
+
+        edge_builder.flush(ctx.device, &mut uploaded_edges);
+        for (index, edges) in uploaded_edges {
+            if let Some(Some(chunk)) = self.chunks.get_mut(index) {
+                chunk.edge_buf = Some(edges);
             }
         }
 
@@ -738,6 +820,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         view.draws.clear();
         view.has_edges = false;
         view.faces.clear();
+        view.edges.clear();
+        view.direct_uniforms.clear();
 
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let visibility = iletki_wgpu::profiling::scope("scene.visibility");
@@ -772,6 +856,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             view.has_edges |= chunk.edge_count != 0;
             view.draws.push(PreparedObject {
                 chunk: index,
+                direct_slot: None,
                 uniforms: ObjectUniforms {
                     offset_rel,
                     scale: 1.0,
@@ -781,30 +866,39 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         drop(visibility);
 
-        // Small visible subsets save work with the direct path. Section AA uses its original
-        // vertex entrypoints and the same packed geometry buffers through per-chunk slices.
-        let mut needs_object_uniforms = true;
-        if pack_geometry
-            && !self.use_antialiased_section
-            && picking.is_none()
-            && view.draws.len() >= 128
-            && let Some((layout, _)) = &p.packed_lit
+        // Small visible subsets use direct draws. Each larger pass preserves chunk order
+        // and stages aligned uniforms only for direct draws or a selected mask.
+        let packed_layout = p
+            .packed
+            .as_ref()
+            .filter(|_| pack_geometry && picking.is_none() && view.draws.len() >= 128)
+            .map(|packed| &packed.layout);
         {
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-            let _profile = iletki_wgpu::profiling::scope("scene.face_batch");
-            let mut has_outline = false;
-            for (draw_index, object) in view.draws.iter().enumerate() {
-                if let Some(Some(chunk)) = self.chunks.get(object.chunk)
-                    && let Some(faces) = &chunk.vertex_buf
-                {
-                    has_outline |= chunk.selected;
-                    view.faces
-                        .push(ctx.device, layout, faces, object.uniforms, draw_index);
+            let _profile = iletki_wgpu::profiling::scope("scene.geometry_batch");
+            for (index, object) in view.draws.iter_mut().enumerate() {
+                let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
+                    continue;
+                };
+                let mut direct = packed_layout.is_none() || chunk.selected;
+                if let Some(layout) = packed_layout {
+                    for (geometry, draws) in [
+                        (&chunk.vertex_buf, &mut view.faces),
+                        (&chunk.edge_buf, &mut view.edges),
+                    ] {
+                        if let Some(geometry) = geometry {
+                            direct |= matches!(geometry, VertexRange::Direct(_));
+                            draws.push(ctx.device, layout, geometry, object.uniforms, index);
+                        }
+                    }
+                }
+                if direct {
+                    object.direct_slot = Some(view.direct_uniforms.len());
+                    view.direct_uniforms.push(object.uniforms);
                 }
             }
             view.faces.upload(ctx.queue);
-            needs_object_uniforms =
-                view.has_edges || has_outline || view.faces.needs_direct_uniforms();
+            view.edges.upload(ctx.queue);
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         if iletki_wgpu::profiling::active() {
@@ -815,35 +909,25 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             } else {
                 "scene.opaque_draws"
             };
-            let mut draws = view
-                .draws
-                .iter()
-                .filter_map(|object| self.chunks.get(object.chunk)?.as_ref())
-                .map(|chunk| {
-                    usize::from(chunk.vertex_buf.is_some())
-                        + usize::from(picking.is_none() && chunk.edge_buf.is_some())
-                })
-                .sum::<usize>();
-            if view.faces.has_packed() {
-                let (commands, pages) = view.faces.counts();
-                let edge_draws = view
-                    .draws
+            let draws = if packed_layout.is_some() {
+                let (faces, face_pages) = view.faces.counts();
+                let (edges, edge_pages) = view.edges.counts();
+                iletki_wgpu::profiling::count("scene.face_page_writes", face_pages);
+                iletki_wgpu::profiling::count("scene.edge_page_writes", edge_pages);
+                faces.saturating_add(edges)
+            } else {
+                view.draws
                     .iter()
-                    .filter(|object| {
-                        self.chunks
-                            .get(object.chunk)
-                            .and_then(Option::as_ref)
-                            .is_some_and(|chunk| chunk.edge_buf.is_some())
+                    .filter_map(|object| self.chunks.get(object.chunk)?.as_ref())
+                    .map(|chunk| {
+                        usize::from(chunk.vertex_buf.is_some())
+                            + usize::from(picking.is_none() && chunk.edge_buf.is_some())
                     })
-                    .count();
-                draws = commands.saturating_add(edge_draws);
-                iletki_wgpu::profiling::count("scene.face_page_writes", pages);
-            }
+                    .sum()
+            };
             iletki_wgpu::profiling::count(pass, draws);
         }
-        if needs_object_uniforms {
-            view.upload(ctx.device, ctx.queue, &p.object_layout);
-        }
+        view.upload(ctx.device, ctx.queue, &p.object_layout);
         pending
     }
 
@@ -986,41 +1070,52 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         match phase {
             DrawPhase::Opaque => {
-                let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
-                    if let Some(object) = view.draws.get(index)
-                        && let Some(Some(chunk)) = self.chunks.get(object.chunk)
-                        && let Some(vbuf) = &chunk.vertex_buf
-                        && view.bind(pass, index, p.dynamic_uniforms)
-                    {
-                        pass.set_vertex_buffer(0, vbuf.slice());
-                        pass.draw(0..chunk.vertex_count, 0..1);
+                let packed = p.packed.as_ref().map(|pipelines| {
+                    pipelines
+                        .section
+                        .as_ref()
+                        .filter(|_| self.use_antialiased_section)
+                        .unwrap_or(&pipelines.base)
+                });
+                let passes = [
+                    (lit, packed.map(|p| &p.faces), &view.faces, false),
+                    (edge, packed.map(|p| &p.edges), &view.edges, true),
+                ];
+                for (direct_pipeline, packed_pipeline, draws, edges) in passes {
+                    if edges && !view.has_edges {
+                        continue;
                     }
-                };
-                if let Some((_, pipeline)) = &p.packed_lit
-                    && view.faces.has_packed()
-                {
-                    view.faces.paint(pass, pipeline, |pass, index| {
-                        pass.set_pipeline(lit);
-                        draw_direct(pass, index);
-                    });
-                } else {
-                    pass.set_pipeline(lit);
-                    for index in 0..view.draws.len() {
-                        draw_direct(pass, index);
-                    }
-                }
-
-                if !view.has_edges {
-                    return;
-                }
-                pass.set_pipeline(edge);
-                for (index, object) in view.draws.iter().enumerate() {
-                    if let Some(Some(chunk)) = self.chunks.get(object.chunk)
-                        && let Some(ebuf) = &chunk.edge_buf
-                        && view.bind(pass, index, p.dynamic_uniforms)
+                    let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
+                        let Some(object) = view.draws.get(index) else {
+                            return;
+                        };
+                        let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
+                            return;
+                        };
+                        let (geometry, count) = if edges {
+                            (&chunk.edge_buf, chunk.edge_count)
+                        } else {
+                            (&chunk.vertex_buf, chunk.vertex_count)
+                        };
+                        if let Some(buffer) = geometry
+                            && view.bind(pass, index, p.dynamic_uniforms)
+                        {
+                            pass.set_vertex_buffer(0, buffer.slice());
+                            pass.draw(0..count, 0..1);
+                        }
+                    };
+                    if let Some(pipeline) = packed_pipeline
+                        && draws.has_packed()
                     {
-                        pass.set_vertex_buffer(0, ebuf.slice(..));
-                        pass.draw(0..chunk.edge_count, 0..1);
+                        draws.paint(pass, pipeline, |pass, index| {
+                            pass.set_pipeline(direct_pipeline);
+                            draw_direct(pass, index);
+                        });
+                    } else {
+                        pass.set_pipeline(direct_pipeline);
+                        for index in 0..view.draws.len() {
+                            draw_direct(pass, index);
+                        }
                     }
                 }
             }

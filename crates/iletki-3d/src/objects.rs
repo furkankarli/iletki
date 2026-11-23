@@ -1,7 +1,7 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
 use crate::scene::ObjectUniforms;
-use crate::{Vertex3D, face_batch::FaceDraws};
+use crate::{Vertex3D, face_batch::PackedDraws};
 use iletki_core::{Bounds3, Mat4, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
@@ -12,6 +12,7 @@ const PAGE_BYTES: usize = 1024 * 1024;
 pub(crate) struct PreparedObject {
     pub(crate) chunk: usize,
     pub(crate) uniforms: ObjectUniforms,
+    pub(crate) direct_slot: Option<usize>,
 }
 
 struct UniformPage {
@@ -25,7 +26,9 @@ pub(crate) struct ViewObjects {
     pub(crate) lifetime: ViewportLifetime,
     pub(crate) draws: Vec<PreparedObject>,
     pub(crate) has_edges: bool,
-    pub(crate) faces: FaceDraws,
+    pub(crate) faces: PackedDraws,
+    pub(crate) edges: PackedDraws,
+    pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
     staging: Vec<u8>,
     stride: usize,
@@ -49,7 +52,9 @@ impl ViewObjects {
             lifetime: ctx.viewport_lifetime(),
             draws: Vec::new(),
             has_edges: false,
-            faces: FaceDraws::default(),
+            faces: PackedDraws::default(),
+            edges: PackedDraws::default(),
+            direct_uniforms: Vec::new(),
             pages: Vec::new(),
             staging: Vec::new(),
             stride,
@@ -67,7 +72,7 @@ impl ViewObjects {
         let _profile = iletki_wgpu::profiling::scope("scene.uniforms");
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let mut total_bytes: usize = 0;
-        for (index, objects) in self.draws.chunks(self.slots_per_page).enumerate() {
+        for (index, objects) in self.direct_uniforms.chunks(self.slots_per_page).enumerate() {
             let bytes_for = |slots: usize| (slots.saturating_sub(1)) * self.stride + OBJECT_BYTES;
             let page = match self.pages.get(index) {
                 Some(page) if page.capacity >= objects.len() => page,
@@ -110,12 +115,12 @@ impl ViewObjects {
                 }
             };
             let bytes = if let [only] = objects {
-                bytemuck::bytes_of(&only.uniforms)
+                bytemuck::bytes_of(only)
             } else {
                 self.staging.resize(bytes_for(objects.len()), 0);
                 for (slot, obj) in self.staging.chunks_mut(self.stride).zip(objects) {
                     if let Some(payload) = slot.get_mut(..OBJECT_BYTES) {
-                        payload.copy_from_slice(bytemuck::bytes_of(&obj.uniforms));
+                        payload.copy_from_slice(bytemuck::bytes_of(obj));
                     }
                 }
                 &self.staging
@@ -130,7 +135,7 @@ impl ViewObjects {
         {
             iletki_wgpu::profiling::count(
                 "scene.uniform_writes",
-                self.draws.len().div_ceil(self.slots_per_page),
+                self.direct_uniforms.len().div_ceil(self.slots_per_page),
             );
             iletki_wgpu::profiling::count("scene.uniform_bytes", total_bytes);
         }
@@ -142,6 +147,9 @@ impl ViewObjects {
         index: usize,
         dynamic: bool,
     ) -> bool {
+        let Some(index) = self.draws.get(index).and_then(|draw| draw.direct_slot) else {
+            return false;
+        };
         let Some(page) = self.pages.get(index / self.slots_per_page) else {
             return false;
         };

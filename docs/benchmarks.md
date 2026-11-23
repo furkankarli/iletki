@@ -74,9 +74,52 @@ filtering and uses individual uniform writes for the orbit control. The
 `ILETKI_ASSEMBLY_CASE=20000/wide` isolates one size and view. For revision A/B testing,
 build each checkout in a separate Cargo target directory and alternate their run order.
 
+Use `ILETKI_ASSEMBLY_STYLE=edges` for shaded edges and
+`ILETKI_ASSEMBLY_STYLE=edges-section` for shaded edges and a rotating section plane.
+The adapter chooses raster clipping when clip distances are available. Set
+`ILETKI_ASSEMBLY_SAMPLED_SECTION=1` to exercise the sampled shader.
+`ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
+Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
+adds an orthographic view to a model run and records both reference image hashes.
+
 The offscreen workloads exclude window acquisition, compositing and presentation. The
 asynchronous pick workload polls continuously to measure request readiness independently
 of the application's event loop or display refresh rate.
+
+### Interactive window capture
+
+```sh
+cargo build --release --locked -p iletki-demo
+target/release/iletki-demo --latency-bench out/interaction/wide \
+  --scene wide --style edges-section --action orbit
+python3 docs/benchmarks/repro/summarize-latency.py out/interaction/wide
+```
+
+The window workload uses the demo camera rig and picking API. It records 60 warm-up
+events followed by 360 samples by default. Choose `--scene demo`, `--scene wide` or
+`--scene path/to/model.iltmesh`. The model viewport requests 1920×1080 pixels and the
+synthetic viewport requests 1024×768 pixels. `monitor.txt` records the actual window
+size, output and active refresh rate. The replay runs at approximately 60 input
+events per second. Actions are `orbit`, `pan`, `zoom`, `click`, `marquee` and `edit`.
+The edit action orbits while moving every hundredth part once every six events.
+`--action live` records OS input from dragging, scrolling and releasing a pick button.
+`--dual` adds an orthographic view for camera and edit replays.
+
+For a controlled presentation comparison, select `--present fifo` or `--present mailbox`,
+`--depth 1` or `--depth 2`, and optionally `--notify-present` for the Wayland frame
+callback. Baseline runs omit these overrides. Each frame records surface acquisition,
+encode, queue submit and present return timestamps. GPU completion uses callbacks
+observed during nonblocking polling. The event CSV tracks the frame using each input
+or pick result, including superseded and stale picks. Surface failures retain their
+own status. The top-left marker encodes the low 16 Gray-code frame-ID bits in
+left-to-right three-pixel cells. Match external optical captures to the frame ID and
+use a synchronized physical input trigger to measure input-to-display latency.
+The timing CSVs cover software observations and leave physical latency to that capture.
+
+For physical acceptance, use a fixed 60 Hz display and report both camera and selection
+latency against the agreed limits. The rendering limits are 12 ms p95 and 16.67 ms p99
+for the 20,000-part workload with edges and a live section. The physical targets are
+33.3/50 ms for camera p95/p99 and 50/66.7 ms for click-to-contour p95/p99.
 
 ### Tessellated IFC and STEP models
 

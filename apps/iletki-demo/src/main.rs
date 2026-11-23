@@ -19,6 +19,10 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+#[path = "../../../crates/iletki/examples/assembly_fixture/mod.rs"]
+mod assembly_fixture;
+mod latency;
+
 use iletki::gpu::wgpu;
 use iletki::{
     Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DirtyFlags, DrawStyle2D,
@@ -71,6 +75,13 @@ struct PickView {
     camera: Camera,
     size: [u32; 2],
     dpi: f64,
+    revision: iletki::gpu::LayerRevision,
+}
+
+struct PickRequest {
+    rect: [u32; 4],
+    view: PickView,
+    event: Option<usize>,
 }
 
 struct GpuState {
@@ -109,8 +120,12 @@ struct GpuState {
     modifiers: Modifiers,
     last_cursor: Vec2,
     press_pos: Option<Vec2>,
-    pending_pick: Option<(PendingPick, PickView)>,
-    queued_pick: Option<(Vec2, PickView)>,
+    pending_pick: Option<(PendingPick, PickRequest)>,
+    queued_pick: Option<PickRequest>,
+    latency: Option<latency::Trace>,
+    bench_fit: Option<(Vec3, f64)>,
+    bench_edits: Vec<(Chunk3DId, Vec3)>,
+    bench_dual: bool,
     last_pick_text: String,
     frame_count: u32,
     fps_timer: Instant,
@@ -118,7 +133,7 @@ struct GpuState {
 }
 
 impl GpuState {
-    fn new(window: Arc<Window>) -> Result<Self, String> {
+    fn new(window: Arc<Window>, bench: Option<latency::Options>) -> Result<Self, String> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -154,7 +169,14 @@ impl GpuState {
             .find(wgpu::TextureFormat::is_srgb)
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| "surface reported no supported formats".to_string())?;
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if let Some(mode) = bench.as_ref().and_then(|options| options.present) {
+            if !caps.present_modes.contains(&mode) {
+                return Err(format!(
+                    "present mode {mode:?} is unsupported by this surface"
+                ));
+            }
+            mode
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else {
             wgpu::PresentMode::Fifo
@@ -165,6 +187,15 @@ impl GpuState {
             .ok_or_else(|| "surface reported no default configuration".to_string())?;
         surface_config.format = format;
         surface_config.present_mode = present_mode;
+        if let Some(depth) = bench.as_ref().and_then(|options| options.depth) {
+            surface_config.desired_maximum_frame_latency = depth;
+        }
+        if bench.is_some() {
+            println!(
+                "latency surface: {width}x{height}, {present_mode:?}, requested depth {}",
+                surface_config.desired_maximum_frame_latency
+            );
+        }
         surface.configure(&device, &surface_config);
 
         let make_vp = |px: [u32; 2]| {
@@ -194,7 +225,34 @@ impl GpuState {
         let vp_right =
             make_vp([(width / 2).max(1), (height / 2).max(1)]).map_err(|e| e.to_string())?;
 
-        let (scene_3d, chunks_3d) = build_arch_3d();
+        let mut bench_fit = None;
+        let mut bench_edits = Vec::new();
+        let (scene_3d, chunks_3d) = match bench.as_ref().map(|b| &b.scene) {
+            Some(latency::Scene::Wide) => {
+                bench_fit = Some((Vec3::new(64.0, 312.0, 0.8), 626.0));
+                let style = bench.as_ref().map_or(latency::Style::Faces, |b| b.style);
+                bench_scene(
+                    (0..20_000).map(|index| latency::wide_mesh(index, style)),
+                    &mut bench_edits,
+                )
+            }
+            Some(latency::Scene::Model(path)) => {
+                let fixture = assembly_fixture::load(path).map_err(|error| error.to_string())?;
+                let center = fixture.bounds.center().ok_or("model bounds are empty")?;
+                let radius = fixture.bounds.radius() * 2.6;
+                if !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
+                    return Err("model camera bounds are invalid".into());
+                }
+                bench_fit = Some((center, radius));
+                println!(
+                    "latency model: {} chunks, {} triangles",
+                    fixture.meshes.len(),
+                    fixture.triangles
+                );
+                bench_scene(fixture.meshes, &mut bench_edits)
+            }
+            _ => build_arch_3d(),
+        };
         let grid_3d = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
         let mut gizmo_3d = TransformGizmoLayer::new(3, 1);
         gizmo_3d.origin = Some(Vec3::new(-0.8, 0.4, 3.0));
@@ -203,9 +261,16 @@ impl GpuState {
 
         let origin_2d = Vec2::new(661_858.0, 4_491_159.0);
         let mut scene_2d = Scene2DLayer::new(4);
-        let mut mesh_2d = build_cad_2d(origin_2d, format.is_srgb());
-        mesh_2d.optimize_spatial();
-        scene_2d.upload_static_mesh(&device, &queue, &mesh_2d);
+        if bench.is_none() {
+            let mut mesh_2d = build_cad_2d(origin_2d, format.is_srgb());
+            mesh_2d.optimize_spatial();
+            scene_2d.upload_static_mesh(&device, &queue, &mesh_2d);
+        }
+        let bench_dual = bench.as_ref().is_some_and(|options| options.dual);
+        let clip_enabled = bench
+            .as_ref()
+            .is_some_and(|options| options.style == latency::Style::Section);
+        let latency = bench.map(|options| latency::Trace::new(options, &device, format));
 
         let mut state = Self {
             window,
@@ -236,18 +301,42 @@ impl GpuState {
             origin_2d,
             active_scene: DemoScene::Arch3D,
             quad_view: false,
-            clip_enabled: false,
+            clip_enabled,
             modifiers: Modifiers::default(),
             last_cursor: Vec2::ZERO,
             press_pos: None,
             pending_pick: None,
             queued_pick: None,
+            latency,
+            bench_fit,
+            bench_edits,
+            bench_dual,
             last_pick_text: String::from("Click any 3D object to pick"),
             frame_count: 0,
             fps_timer: Instant::now(),
             smoothed_ms: 0.0,
         };
         state.reset_cameras();
+        if let Some((center, radius)) = state.bench_fit {
+            *state.vp_main.camera_mut() = Camera::perspective_3d(
+                center + Vec3::new(0.0, -radius, radius * 0.65),
+                center,
+                Vec3::Z,
+                55_f64.to_radians(),
+                radius / 1500.0,
+            );
+            *state.vp_top.camera_mut() = Camera::ortho_3d(
+                center + Vec3::Z * radius,
+                center,
+                Vec3::Y,
+                radius,
+                radius / 1500.0,
+                radius * 3.0,
+            );
+            state.orbit_rig.pivot = center;
+            state.gizmo_3d.origin = None;
+            state.apply_clip_planes();
+        }
         state.update_title();
         Ok(state)
     }
@@ -311,7 +400,11 @@ impl GpuState {
 
     fn apply_clip_planes(&mut self) {
         let clip = if self.clip_enabled {
-            Plane::from_normal_point(Vec3::Y, Vec3::new(0.0, -0.35, 0.0))
+            Plane::from_normal_point(
+                Vec3::Y,
+                self.bench_fit
+                    .map_or(Vec3::new(0.0, -0.35, 0.0), |fit| fit.0),
+            )
         } else {
             None
         };
@@ -344,7 +437,12 @@ impl GpuState {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
         let dpi = self.window.scale_factor() as f32;
-        if self.quad_view && self.active_scene == DemoScene::Arch3D {
+        if self.bench_dual {
+            let left = (w / 2).max(1);
+            self.vp_top.resize(&self.device, [left, h], dpi);
+            self.vp_main
+                .resize(&self.device, [(w - left).max(1), h], dpi);
+        } else if self.quad_view && self.active_scene == DemoScene::Arch3D {
             let qw = (w / 2).max(1);
             let qh = (h / 2).max(1);
             self.vp_top.resize(&self.device, [qw, qh], dpi);
@@ -394,31 +492,62 @@ impl GpuState {
     }
 
     fn pick_view(&self) -> PickView {
+        let revision = match self.active_scene {
+            DemoScene::Arch3D => ViewportLayer::<()>::revision(&self.scene_3d),
+            // The demo's 2D geometry is immutable. Cursor overlay writes are unrelated to picks.
+            DemoScene::Cad2D => iletki::gpu::LayerRevision::default(),
+            DemoScene::Instanced100k => ViewportLayer::<()>::revision(&self.instanced_3d),
+        };
         PickView {
             scene: self.active_scene,
             camera: self.vp_main.camera().clone(),
             size: self.vp_main.size().active_px,
             dpi: self.window.scale_factor(),
+            revision,
         }
     }
 
     fn handle_pick(&mut self, logical_pos: Vec2) {
-        if self.quad_view {
-            return;
-        }
-        let view = self.pick_view();
-        if self.pending_pick.is_some() {
-            self.queued_pick = Some((logical_pos, view));
-            return;
-        }
-        self.begin_pick(logical_pos, view);
+        let now = Instant::now();
+        let dpi = self.window.scale_factor();
+        let px = (logical_pos.x * dpi).round().max(0.0) as u32;
+        let py = (logical_pos.y * dpi).round().max(0.0) as u32;
+        let event = self
+            .latency
+            .as_mut()
+            .and_then(|trace| trace.live("click", now));
+        self.request_pick([px.saturating_sub(2), py.saturating_sub(2), 5, 5], event);
     }
 
-    fn begin_pick(&mut self, logical_pos: Vec2, view: PickView) {
-        let px = (logical_pos.x * view.dpi).round().max(0.0) as u32;
-        let py = (logical_pos.y * view.dpi).round().max(0.0) as u32;
-        let rect = [px.saturating_sub(2), py.saturating_sub(2), 5, 5];
+    fn pick_status(&mut self, event: Option<usize>, status: &'static str, hits: Option<usize>) {
+        if let Some(trace) = &mut self.latency
+            && let Some(id) = event
+        {
+            trace.selection_status(id, status, hits);
+        }
+    }
 
+    fn request_pick(&mut self, rect: [u32; 4], event: Option<usize>) {
+        if self.quad_view || self.bench_dual {
+            self.pick_status(event, "unsupported-view", None);
+            return;
+        }
+        let request = PickRequest {
+            rect,
+            view: self.pick_view(),
+            event,
+        };
+        if self.pending_pick.is_some() {
+            if let Some(old) = self.queued_pick.replace(request) {
+                self.pick_status(old.event, "superseded", None);
+            }
+        } else {
+            self.begin_pick(request);
+        }
+    }
+
+    fn begin_pick(&mut self, mut request: PickRequest) {
+        let rect = request.rect;
         let pick = match self.active_scene {
             DemoScene::Arch3D => {
                 let mut layers: [&mut dyn ViewportLayer<()>; 3] =
@@ -437,9 +566,13 @@ impl GpuState {
                     .begin_pick_rect(&self.device, &self.queue, &(), &mut layers, rect)
             }
         };
-
         if let Ok(pick) = pick {
-            self.pending_pick = Some((pick, view));
+            // Picking can itself finish progressive uploads during preparation.
+            request.view = self.pick_view();
+            self.pick_status(request.event, "submitted", None);
+            self.pending_pick = Some((pick, request));
+        } else {
+            self.pick_status(request.event, "error", None);
         }
     }
 
@@ -450,24 +583,38 @@ impl GpuState {
         let Poll::Ready(result) = pick.try_read() else {
             return;
         };
-        let Some((_, picked_view)) = self.pending_pick.take() else {
+        let Some((_, request)) = self.pending_pick.take() else {
             return;
         };
-        if self.quad_view {
-            self.queued_pick = None;
-            return;
-        }
         let current = self.pick_view();
-        if let Some((position, queued_view)) = self.queued_pick.take()
-            && queued_view == current
-        {
-            self.begin_pick(position, queued_view);
+        if self.quad_view || self.bench_dual {
+            self.pick_status(request.event, "stale", None);
+            if let Some(queued) = self.queued_pick.take() {
+                self.pick_status(queued.event, "stale", None);
+            }
             return;
         }
-        if picked_view == current
-            && let Ok(hits) = result
-        {
+        if let Some(queued) = self.queued_pick.take() {
+            if queued.view == current {
+                self.pick_status(request.event, "superseded", None);
+                self.begin_pick(queued);
+                return;
+            }
+            self.pick_status(queued.event, "stale", None);
+        }
+        if request.view != current {
+            self.pick_status(request.event, "stale", None);
+        } else if let Ok(hits) = result {
+            self.pick_status(request.event, "ready", Some(hits.len()));
+            if let Some(trace) = &mut self.latency
+                && let Some(id) = request.event
+            {
+                trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
+                trace.selection_redraw(id);
+            }
             self.apply_pick(&hits);
+        } else {
+            self.pick_status(request.event, "error", None);
         }
     }
 
@@ -558,6 +705,121 @@ impl GpuState {
         self.last_frame_time = Instant::now();
     }
 
+    fn dispatch_input(&mut self, event: &ViewportInput) -> bool {
+        let outcome = if self.active_scene == DemoScene::Cad2D {
+            self.vp_main.on_input(event, &mut self.cad2d_rig)
+        } else {
+            self.vp_main.on_input(event, &mut self.orbit_rig)
+        };
+        outcome
+            .iter()
+            .any(|command| matches!(command, iletki::ViewportCommand::RequestRedraw))
+    }
+
+    fn track_live_input(&mut self, kind: &'static str, started: Instant) {
+        if let Some(trace) = &mut self.latency
+            && let Some(id) = trace.live(kind, started)
+        {
+            trace.redraw(id);
+        }
+    }
+
+    fn replay_latency(&mut self, now: Instant) {
+        let Some(trace) = &mut self.latency else {
+            return;
+        };
+        let Some((tick, event)) = trace.tick(now) else {
+            return;
+        };
+        let action = trace.options.action;
+        let [w, h] = self.vp_main.size().active_px;
+        let center = self.vp_main.logical_size() * 0.5;
+        let sign = if tick % 2 == 0 { 1.0 } else { -1.0 };
+        let modifiers = Modifiers {
+            shift: action == latency::Action::Pan,
+            ..Modifiers::default()
+        };
+        match action {
+            latency::Action::Click | latency::Action::Marquee => {
+                let width = if action == latency::Action::Click {
+                    5
+                } else {
+                    256
+                };
+                let x = if tick % 2 == 0 { w / 2 } else { w / 8 };
+                let rect = [
+                    x.saturating_sub(width / 2),
+                    (h / 2).saturating_sub(width / 2),
+                    width,
+                    width,
+                ];
+                self.request_pick(rect, Some(event));
+                return;
+            }
+            latency::Action::Live => return,
+            latency::Action::Zoom => {
+                self.dispatch_input(&ViewportInput::Scroll {
+                    pos: center,
+                    delta: Vec2::new(0.0, sign),
+                    unit: ScrollUnit::Line,
+                    modifiers,
+                });
+            }
+            latency::Action::Orbit | latency::Action::Pan | latency::Action::Edit => {
+                if tick == 0 {
+                    self.dispatch_input(&ViewportInput::PointerDown {
+                        pos: center,
+                        button: PointerButton::Middle,
+                        modifiers,
+                    });
+                }
+                if action == latency::Action::Edit && tick % 6 == 0 {
+                    let offset = if tick % 12 == 0 { 0.2 } else { 0.0 };
+                    for &(id, origin) in &self.bench_edits {
+                        self.scene_3d.set_origin(id, origin + Vec3::X * offset);
+                    }
+                }
+                self.dispatch_input(&ViewportInput::PointerMove {
+                    pos: center,
+                    delta: Vec2::new(6.0 * sign, sign),
+                    modifiers,
+                });
+            }
+        }
+        if self.clip_enabled
+            && let Some((focus, _)) = self.bench_fit
+        {
+            let angle = f64::from(tick % 60) * std::f64::consts::TAU / 60.0;
+            if let Some(plane) =
+                Plane::from_normal_point(Vec3::new(angle.sin(), angle.cos(), 0.15), focus)
+            {
+                self.vp_main.camera_mut().set_clip_planes(&[plane]);
+                if self.bench_dual {
+                    self.vp_top.camera_mut().set_clip_planes(&[plane]);
+                }
+            }
+        }
+        if let Some(trace) = &mut self.latency {
+            trace.redraw(event);
+        }
+        self.window.request_redraw();
+    }
+
+    fn trace_surface_failure(&mut self, started: Instant, status: &'static str) {
+        if let Some(trace) = &mut self.latency {
+            trace.frame(latency::Frame {
+                id: trace.frame_id(),
+                started: trace.ns(started),
+                acquired: trace.ns(Instant::now()),
+                encoded: 0,
+                submitted: 0,
+                presented: 0,
+                status,
+                streaming: false,
+            });
+        }
+    }
+
     fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
         let dt = self.last_frame_time.elapsed().as_secs_f64().min(0.1);
@@ -573,12 +835,23 @@ impl GpuState {
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
+                self.trace_surface_failure(frame_start, "reconfigured");
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.trace_surface_failure(frame_start, "timeout");
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.trace_surface_failure(frame_start, "occluded");
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.trace_surface_failure(frame_start, "validation");
+                return Ok(());
+            }
         };
+        let acquired = self.latency.as_ref().map(|_| Instant::now());
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -591,47 +864,37 @@ impl GpuState {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
 
-        if self.quad_view && self.active_scene == DemoScene::Arch3D {
-            {
-                let mut layers: [&mut dyn ViewportLayer<()>; 3] =
-                    [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d];
-                self.vp_top.prepare_for_pass(
-                    &self.device,
-                    &self.queue,
-                    &mut enc,
-                    &(),
-                    &mut layers,
-                    self.pass_desc,
-                )?;
-                self.vp_main.prepare_for_pass(
-                    &self.device,
-                    &self.queue,
-                    &mut enc,
-                    &(),
-                    &mut layers,
-                    self.pass_desc,
-                )?;
-                self.vp_front.prepare_for_pass(
-                    &self.device,
-                    &self.queue,
-                    &mut enc,
-                    &(),
-                    &mut layers,
-                    self.pass_desc,
-                )?;
-                self.vp_right.prepare_for_pass(
-                    &self.device,
-                    &self.queue,
-                    &mut enc,
-                    &(),
-                    &mut layers,
-                    self.pass_desc,
-                )?;
-            }
+        let mut streaming = false;
+        if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
             let qw = (w / 2) as f32;
             let qh = (h / 2) as f32;
             let rw = (w - w / 2) as f32;
             let rh = (h - h / 2) as f32;
+            let mut views = [
+                (
+                    &mut self.vp_top,
+                    [0.0, 0.0, qw, if self.bench_dual { h as f32 } else { qh }],
+                ),
+                (
+                    &mut self.vp_main,
+                    [qw, 0.0, rw, if self.bench_dual { h as f32 } else { qh }],
+                ),
+                (&mut self.vp_front, [0.0, qh, qw, rh]),
+                (&mut self.vp_right, [qw, qh, rw, rh]),
+            ];
+            let count = if self.bench_dual { 2 } else { 4 };
+            for (viewport, _) in views.iter_mut().take(count) {
+                streaming |= viewport
+                    .prepare_for_pass(
+                        &self.device,
+                        &self.queue,
+                        &mut enc,
+                        &(),
+                        &mut [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d],
+                        self.pass_desc,
+                    )?
+                    .streaming_pending;
+            }
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-demo quad blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -648,16 +911,12 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_viewport(0.0, 0.0, qw, qh, 0.0, 1.0);
-            self.vp_top.paint_into_pass(&mut pass, self.pass_desc);
-            pass.set_viewport(qw, 0.0, rw, qh, 0.0, 1.0);
-            self.vp_main.paint_into_pass(&mut pass, self.pass_desc);
-            pass.set_viewport(0.0, qh, qw, rh, 0.0, 1.0);
-            self.vp_front.paint_into_pass(&mut pass, self.pass_desc);
-            pass.set_viewport(qw, qh, rw, rh, 0.0, 1.0);
-            self.vp_right.paint_into_pass(&mut pass, self.pass_desc);
+            for (viewport, [x, y, width, height]) in views.iter().take(count) {
+                pass.set_viewport(*x, *y, *width, *height, 0.0, 1.0);
+                viewport.paint_into_pass(&mut pass, self.pass_desc);
+            }
         } else {
-            match self.active_scene {
+            let stats = match self.active_scene {
                 DemoScene::Arch3D => {
                     let mut layers: [&mut dyn ViewportLayer<()>; 3] =
                         [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d];
@@ -668,7 +927,7 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    )?;
+                    )?
                 }
                 DemoScene::Cad2D => {
                     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.scene_2d];
@@ -679,7 +938,7 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    )?;
+                    )?
                 }
                 DemoScene::Instanced100k => {
                     let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.instanced_3d];
@@ -690,9 +949,10 @@ impl GpuState {
                         &(),
                         &mut layers,
                         self.pass_desc,
-                    )?;
+                    )?
                 }
-            }
+            };
+            streaming |= stats.streaming_pending;
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-demo blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -712,8 +972,53 @@ impl GpuState {
             self.vp_main.paint_into_pass(&mut pass, self.pass_desc);
         }
 
-        self.queue.submit(std::iter::once(enc.finish()));
+        if let Some(trace) = &self.latency
+            && w >= 48
+            && h >= 8
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("latency optical marker"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_viewport(0.0, 0.0, 48.0, 8.0, 0.0, 1.0);
+            pass.set_pipeline(&trace.marker);
+            let id = trace.frame_id();
+            pass.draw(0..3, id..id.saturating_add(1));
+        }
+        let commands = enc.finish();
+        let encoded = self.latency.as_ref().map(|_| Instant::now());
+        self.queue.submit([commands]);
+        let submitted = self.latency.as_ref().map(|_| Instant::now());
+        if let Some(trace) = &self.latency {
+            trace.track_gpu(&self.queue, trace.frame_id());
+            if trace.options.notify {
+                self.window.pre_present_notify();
+            }
+        }
         self.queue.present(output);
+        if let (Some(trace), Some(acquired), Some(encoded), Some(submitted)) =
+            (&mut self.latency, acquired, encoded, submitted)
+        {
+            trace.frame(latency::Frame {
+                id: trace.frame_id(),
+                started: trace.ns(frame_start),
+                acquired: trace.ns(acquired),
+                encoded: trace.ns(encoded),
+                submitted: trace.ns(submitted),
+                presented: trace.ns(Instant::now()),
+                status: "present-called",
+                streaming,
+            });
+        }
 
         let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         self.smoothed_ms = if self.smoothed_ms == 0.0 {
@@ -727,7 +1032,10 @@ impl GpuState {
             self.frame_count = 0;
             self.fps_timer = Instant::now();
         }
-        if self.vp_main.mode() == ViewportMode::Continuous || self.transition.is_active() {
+        if streaming
+            || self.vp_main.mode() == ViewportMode::Continuous
+            || self.transition.is_active()
+        {
             self.window.request_redraw();
         }
         Ok(())
@@ -736,6 +1044,7 @@ impl GpuState {
 
 struct DemoApp {
     state: Option<GpuState>,
+    bench: Option<latency::Options>,
 }
 
 impl ApplicationHandler for DemoApp {
@@ -743,14 +1052,18 @@ impl ApplicationHandler for DemoApp {
         if self.state.is_some() {
             return;
         }
+        let [width, height] = self
+            .bench
+            .as_ref()
+            .map_or([1280, 800], latency::Options::dimensions);
         let attrs = WindowAttributes::default()
             .with_title("iletki-demo")
-            .with_inner_size(PhysicalSize::new(1280u32, 800u32));
+            .with_inner_size(PhysicalSize::new(width, height));
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
             return;
         };
-        match GpuState::new(Arc::new(window)) {
+        match GpuState::new(Arc::new(window), self.bench.take()) {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
@@ -764,13 +1077,29 @@ impl ApplicationHandler for DemoApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            let now = Instant::now();
             state.poll_pick();
-            let flow = if state.pending_pick.is_some() {
-                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2))
-            } else {
-                ControlFlow::Wait
-            };
-            event_loop.set_control_flow(flow);
+            state.replay_latency(now);
+            let mut deadline = state
+                .pending_pick
+                .as_ref()
+                .map(|_| now + Duration::from_millis(2));
+            if let Some(trace) = &state.latency {
+                if trace.pending_gpu() {
+                    let _ = state.device.poll(wgpu::PollType::Poll);
+                }
+                if trace.finished(now, state.pending_pick.is_some()) {
+                    if let Err(error) = trace.write(&state.window, state.vp_main.camera()) {
+                        eprintln!("latency trace write failed: {error}");
+                    }
+                    event_loop.exit();
+                    return;
+                }
+                if let Some(next) = trace.deadline(now) {
+                    deadline = Some(deadline.map_or(next, |existing| existing.min(next)));
+                }
+            }
+            event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
     }
 
@@ -779,7 +1108,14 @@ impl ApplicationHandler for DemoApp {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(trace) = &s.latency
+                    && let Err(error) = trace.write(&s.window, s.vp_main.camera())
+                {
+                    eprintln!("latency trace write failed: {error}");
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 s.resize(size);
                 s.window.request_redraw();
@@ -873,15 +1209,12 @@ impl ApplicationHandler for DemoApp {
                             modifiers: s.modifiers,
                         },
                     };
-                    if s.active_scene == DemoScene::Cad2D {
-                        s.vp_main.on_input(&ev, &mut s.cad2d_rig);
-                    } else {
-                        s.vp_main.on_input(&ev, &mut s.orbit_rig);
-                    }
+                    s.dispatch_input(&ev);
                     s.window.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let started = Instant::now();
                 let dpi = s.window.scale_factor();
                 let pos = Vec2::new(position.x / dpi, position.y / dpi);
                 let delta = pos - s.last_cursor;
@@ -891,17 +1224,18 @@ impl ApplicationHandler for DemoApp {
                     delta,
                     modifiers: s.modifiers,
                 };
+                if s.dispatch_input(&ev) {
+                    s.track_live_input("drag", started);
+                }
                 if s.active_scene == DemoScene::Cad2D {
-                    s.vp_main.on_input(&ev, &mut s.cad2d_rig);
                     s.update_2d_overlay(pos);
-                } else {
-                    s.vp_main.on_input(&ev, &mut s.orbit_rig);
                 }
                 if !s.vp_main.dirty().is_empty() {
                     s.window.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let started = Instant::now();
                 s.transition.cancel();
                 let (d, unit) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {
@@ -915,11 +1249,11 @@ impl ApplicationHandler for DemoApp {
                     unit,
                     modifiers: s.modifiers,
                 };
+                if s.dispatch_input(&ev) {
+                    s.track_live_input("zoom", started);
+                }
                 if s.active_scene == DemoScene::Cad2D {
-                    s.vp_main.on_input(&ev, &mut s.cad2d_rig);
                     s.update_2d_overlay(s.last_cursor);
-                } else {
-                    s.vp_main.on_input(&ev, &mut s.orbit_rig);
                 }
                 s.window.request_redraw();
             }
@@ -932,6 +1266,31 @@ impl ApplicationHandler for DemoApp {
             _ => {}
         }
     }
+}
+
+fn bench_scene(
+    meshes: impl IntoIterator<Item = Mesh3D>,
+    edits: &mut Vec<(Chunk3DId, Vec3)>,
+) -> (Scene3DLayer, Vec<ChunkMeta>) {
+    let mut scene = Scene3DLayer::new(1);
+    let mut meta = Vec::new();
+    for (index, mesh) in meshes.into_iter().enumerate() {
+        let origin = mesh.origin;
+        let pick = mesh.pick_ids.first().copied().map(PickId::from_rg32u);
+        let id = scene.insert(mesh);
+        if index % 100 == 0 {
+            edits.push((id, origin));
+        }
+        if let Some(pick) = pick {
+            meta.push(ChunkMeta {
+                pick_object: pick.object,
+                chunk_id: id,
+                gizmo_pos: origin,
+                name: "Assembly part",
+            });
+        }
+    }
+    (scene, meta)
 }
 
 fn build_arch_3d() -> (Scene3DLayer, Vec<ChunkMeta>) {
@@ -1097,7 +1456,14 @@ fn main() {
         return;
     };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = DemoApp { state: None };
+    let bench = match latency::Options::parse() {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
+    let mut app = DemoApp { state: None, bench };
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {err}");
     }
