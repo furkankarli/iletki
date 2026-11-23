@@ -116,6 +116,13 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             if i == 81 {
                 mesh.pick_ids.fill([0, 0]);
             }
+            if i == 150 {
+                // A caller can supply bounds that predate an edit to the public vertex list.
+                mesh.local_bounds = iletki_core::Bounds3::from_corners(
+                    Vec3::new(-3.4, -0.15, -0.19),
+                    Vec3::new(-3.2, 0.15, 0.19),
+                );
+            }
             let chunk = scene.insert(mesh);
             if i % 11 != 0 {
                 scene.set_selected(chunk, true);
@@ -133,6 +140,13 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         let packed = host
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
             .unwrap();
+        scene.set_profile_section_culling(false);
+        let unculled = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        assert!(
+            image.pixels == unculled.pixels,
+            "culled section differs with {features:?} and dynamic uniform limit {limit}"
+        );
+        scene.set_profile_section_culling(true);
         scene.set_profile_batch_geometry(false);
         let direct = render(&device, &queue, &mut host, &mut scene, camera).unwrap();
         assert!(

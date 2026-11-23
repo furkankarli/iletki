@@ -65,8 +65,9 @@ time through submission and `wall_ms` includes polling and decode. Orbit records
 reference image hash per case and run. Picking records the ordered ID and depth hash
 of each request. Compare signatures on the same adapter and backend.
 
-`ILETKI_PROFILE=1` records eight additional frames per acceptance or model workload in `profile.csv`,
-outside the latency samples. CPU scopes and GPU pass timestamps are in nanoseconds,
+`ILETKI_PROFILE=1` records additional frames per acceptance or model workload in `profile.csv`,
+outside the latency samples. Section orbit traces cover all 30 camera angles. Other workloads
+record eight frames. CPU scopes and GPU pass timestamps are in nanoseconds,
 along with counters for candidates, draws and uniform writes. GPU timestamps require
 the adapter to support the feature. The `visibility-only` variant keeps visibility
 filtering and uses individual uniform writes for the orbit control. The
@@ -78,6 +79,9 @@ Use `ILETKI_ASSEMBLY_STYLE=edges` for shaded edges and
 `ILETKI_ASSEMBLY_STYLE=edges-section` for shaded edges and a rotating section plane.
 The adapter chooses raster clipping when clip distances are available. Set
 `ILETKI_ASSEMBLY_SAMPLED_SECTION=1` to exercise the sampled shader.
+Set `ILETKI_ASSEMBLY_NO_SECTION_CULL=1` for a raster control run that submits whole chunks
+to the GPU even when they lie outside a section plane. The `scene.section_culled_chunks`
+and `scene.section_culled_triangles` counters report the geometry skipped by the CPU.
 `ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
 Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
 adds an orthographic view to a model run and records both reference image hashes.

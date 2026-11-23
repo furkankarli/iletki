@@ -35,6 +35,7 @@ mod native {
 
     type Error = Box<dyn std::error::Error>;
     const SIZE: [u32; 2] = [1024, 768];
+    const ORBIT_PERIOD: u32 = 30;
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -89,7 +90,8 @@ mod native {
                     Vec3::new(63.0, f64::from(self.chunks.div_ceil(64)), 0.0),
                     |model| model.0,
                 );
-                let angle = f64::from(frame % 30) * std::f64::consts::TAU / 30.0;
+                let angle = f64::from(frame % ORBIT_PERIOD) * std::f64::consts::TAU
+                    / f64::from(ORBIT_PERIOD);
                 if let Some(plane) =
                     Plane::from_normal_point(Vec3::new(angle.sin(), angle.cos(), 0.15), center)
                 {
@@ -100,7 +102,8 @@ mod native {
         }
 
         fn orbit_camera(self, frame: u32, secondary: bool) -> Camera {
-            let angle = f64::from(frame % 30) * std::f64::consts::TAU / 30.0;
+            let angle =
+                f64::from(frame % ORBIT_PERIOD) * std::f64::consts::TAU / f64::from(ORBIT_PERIOD);
             if let Some((focus, radius)) = self.model {
                 if secondary {
                     return Camera::ortho_3d(
@@ -262,6 +265,9 @@ mod native {
             mut scene: Scene3DLayer,
             edits: &[(Chunk3DId, Vec3)],
         ) -> Result<(), Error> {
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_CULL").is_some() {
+                scene.set_profile_section_culling(false);
+            }
             self.record_memory(case, "before-targets")?;
             let host = || {
                 ViewportHost::new_with_adapter(
@@ -369,9 +375,14 @@ mod native {
             let long = case.primary() || case.acceptance_wide() || case.model.is_some();
             let samples = if long { 360 } else { 60 };
             let profile = std::env::var_os("ILETKI_PROFILE").is_some() && long;
+            let traces = match (profile, case.style) {
+                (true, Style::Section) => ORBIT_PERIOD,
+                (true, _) => 8,
+                (false, _) => 0,
+            };
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
-            for frame in 0..12 + samples + if profile { 8 } else { 0 } {
+            for frame in 0..12 + samples + traces {
                 let start = Instant::now();
                 let edited = (edit_scene || edit_visibility) && frame % 6 == 0;
                 if edited {

@@ -3,7 +3,9 @@
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
 use crate::face_batch::{self, PageBuilder, VertexRange};
-use crate::objects::{PickVolume, PreparedObject, ViewObjects};
+use crate::objects::{
+    PickVolume, PreparedObject, SectionVolume, ViewObjects, bounds_cover_vertices,
+};
 use crate::outline_bounds::OutlineUpdate;
 use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
@@ -48,6 +50,7 @@ struct ChunkEntry {
     pick_buf: Option<wgpu::Buffer>,
     has_picks: bool,
     pick_bounds_trusted: bool,
+    section_bounds_trusted: bool,
 }
 
 struct Pipelines {
@@ -106,6 +109,8 @@ pub struct Scene3DLayer {
     profile_batch_geometry: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_picking: bool,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_section_culling: bool,
 }
 
 impl std::fmt::Debug for Scene3DLayer {
@@ -135,6 +140,8 @@ impl Scene3DLayer {
             profile_batch_geometry: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_picking: true,
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_section_culling: true,
         }
     }
 
@@ -163,6 +170,15 @@ impl Scene3DLayer {
         self.profile_batch_picking = enabled;
     }
 
+    /// Enables conservative CPU rejection in raster sections for A/B profiling.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_section_culling(&mut self, enabled: bool) {
+        if self.profile_section_culling != enabled {
+            self.profile_section_culling = enabled;
+            self.revision.mark_static();
+        }
+    }
+
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
     pub fn insert(&mut self, mesh: Mesh3D) -> Chunk3DId {
         self.revision.mark_static();
@@ -181,6 +197,7 @@ impl Scene3DLayer {
             pick_buf: None,
             has_picks: false,
             pick_bounds_trusted: false,
+            section_bounds_trusted: false,
         };
         // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
         if let Some(Reverse(index)) = self.free_chunks.pop()
@@ -841,8 +858,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
         self.prune_closed_viewports();
         self.ensure_pipelines(ctx);
-        self.use_antialiased_section =
-            ctx.supports_section_antialiasing() && !ctx.camera.clip_planes().is_empty();
+        let section = SectionAa::for_viewport(ctx).filter(|_| !ctx.camera.clip_planes().is_empty());
+        self.use_antialiased_section = section.is_some();
         let Some(p) = &self.pipelines else {
             return false;
         };
@@ -885,7 +902,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
             if let Some(mesh) = chunk.pending_mesh.take() {
                 self.revision.mark_static();
-                chunk.pick_bounds_trusted = false;
+                let face_bounds = bounds_cover_vertices(chunk.local_bounds, &mesh.vertices);
+                chunk.pick_bounds_trusted = face_bounds;
+                chunk.section_bounds_trusted =
+                    face_bounds && bounds_cover_vertices(chunk.local_bounds, &mesh.edges);
                 if mesh.vertices.is_empty() {
                     chunk.vertex_buf = None;
                     chunk.vertex_count = 0;
@@ -922,12 +942,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             })
                     });
                     chunk.has_picks = picks.is_some();
-                    if chunk.has_picks {
-                        chunk.pick_bounds_trusted = crate::objects::pick_bounds_cover_vertices(
-                            chunk.local_bounds,
-                            &mesh.vertices,
-                        );
-                    }
                 }
                 if mesh.edges.is_empty() {
                     chunk.edge_buf = None;
@@ -1029,6 +1043,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let projection = ctx.camera.view_proj_relative(ctx.logical_size);
         let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
+        let cull_sections = picking.is_none() && section == Some(SectionAa::Raster);
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let cull_sections = cull_sections && self.profile_section_culling;
+        let section_volume = cull_sections.then(|| SectionVolume::new(ctx.camera));
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let (mut culled_chunks, mut culled_triangles) = (0_usize, 0_usize);
         for (index, chunk) in self.chunks.iter().enumerate() {
             let Some(chunk) = chunk else {
                 continue;
@@ -1053,9 +1073,19 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     continue;
                 }
             }
-            view.has_edges |= chunk.edge_count != 0;
+            let section_culled = chunk.section_bounds_trusted
+                && section_volume
+                    .as_ref()
+                    .is_some_and(|volume| volume.excludes(chunk.local_bounds, offset_rel));
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            if section_culled {
+                culled_chunks += 1;
+                culled_triangles += chunk.vertex_count as usize / 3;
+            }
+            view.has_edges |= chunk.edge_count != 0 && !section_culled;
             view.draws.push(PreparedObject {
                 chunk: index,
+                section_culled,
                 direct_slot: None,
                 uniforms: ObjectUniforms {
                     offset_rel,
@@ -1090,10 +1120,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     || (picking.is_none() && chunk.selected && !packed_mask);
                 if packed_layout.is_some() {
                     if let Some(geometry) = &chunk.vertex_buf {
+                        // A direct face can still be selected even when its opaque draw is culled.
                         direct |= matches!(geometry, VertexRange::Direct(_));
-                        view.faces.push(geometry, object.uniforms, index);
+                        if !object.section_culled {
+                            view.faces.push(geometry, object.uniforms, index);
+                        }
                     }
                     if picking.is_none()
+                        && !object.section_culled
                         && let Some(geometry) = &chunk.edge_buf
                     {
                         direct |= matches!(geometry, VertexRange::Direct(_));
@@ -1114,6 +1148,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         if iletki_wgpu::profiling::active() {
             iletki_wgpu::profiling::count("scene.scanned_slots", self.chunks.len());
             iletki_wgpu::profiling::count("scene.candidates", view.draws.len());
+            iletki_wgpu::profiling::count("scene.section_culled_chunks", culled_chunks);
+            iletki_wgpu::profiling::count("scene.section_culled_triangles", culled_triangles);
             let pass = if picking.is_some() {
                 "scene.pick_draws"
             } else {
@@ -1128,6 +1164,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             } else {
                 view.draws
                     .iter()
+                    .filter(|object| !object.section_culled)
                     .filter_map(|object| self.chunks.get(object.chunk)?.as_ref())
                     .map(|chunk| {
                         usize::from(chunk.vertex_buf.is_some())
@@ -1218,6 +1255,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         let Some(object) = view.draws.get(index) else {
                             return;
                         };
+                        if object.section_culled {
+                            return;
+                        }
                         let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                             return;
                         };

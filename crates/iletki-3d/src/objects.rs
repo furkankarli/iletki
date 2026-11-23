@@ -2,7 +2,7 @@
 
 use crate::{Vertex3D, face_batch::PackedDraws};
 use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
-use iletki_core::{Bounds3, Mat4, Vec4, ViewportId};
+use iletki_core::{Bounds3, Camera, MAX_CLIP_PLANES, Mat4, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
 
@@ -12,6 +12,7 @@ const PAGE_BYTES: usize = 1024 * 1024;
 pub(crate) struct PreparedObject {
     pub(crate) chunk: usize,
     pub(crate) uniforms: ObjectUniforms,
+    pub(crate) section_culled: bool,
     pub(crate) direct_slot: Option<usize>,
 }
 
@@ -170,7 +171,7 @@ impl ViewObjects {
     }
 }
 
-pub(crate) fn pick_bounds_cover_vertices(bounds: Bounds3, vertices: &[Vertex3D]) -> bool {
+pub(crate) fn bounds_cover_vertices(bounds: Bounds3, vertices: &[Vertex3D]) -> bool {
     if bounds.is_empty() {
         return false;
     }
@@ -184,6 +185,73 @@ pub(crate) fn pick_bounds_cover_vertices(bounds: Bounds3, vertices: &[Vertex3D])
             .zip(min.into_iter().zip(max))
             .all(|(value, (lo, hi))| value >= lo && value <= hi)
     })
+}
+
+/// Bounds rounded with the same camera-relative translation as the 3D vertex shaders.
+fn rounded_bounds(bounds: Bounds3, [ox, oy, oz]: [f32; 3]) -> Option<([f64; 3], [f64; 3])> {
+    if bounds.is_empty() {
+        return None;
+    }
+    let [min_x, min_y, min_z] = bounds.min.to_f32();
+    let [max_x, max_y, max_z] = bounds.max.to_f32();
+    let lo = [min_x + ox, min_y + oy, min_z + oz].map(f64::from);
+    let hi = [max_x + ox, max_y + oy, max_z + oz].map(f64::from);
+    lo.into_iter()
+        .chain(hi)
+        .all(f64::is_finite)
+        .then_some((lo, hi))
+}
+
+/// Conservative rejection for the raster clip-distance path.
+pub(crate) struct SectionVolume {
+    planes: [[f64; 4]; MAX_CLIP_PLANES],
+    count: usize,
+}
+
+impl SectionVolume {
+    pub(crate) fn new(camera: &Camera) -> Self {
+        let mut planes = [[0.0; 4]; MAX_CLIP_PLANES];
+        for (dst, plane) in planes.iter_mut().zip(camera.clip_planes()) {
+            let coefficients = plane.to_camera_relative_f32(camera.position_3d());
+            let [x, y, z, d] = coefficients;
+            // Public plane fields can bypass normalization. Keep planes whose normals might
+            // amplify subnormal inputs or be flushed to zero by the GPU out of this test.
+            if d.is_finite()
+                && [x, y, z]
+                    .into_iter()
+                    .all(|n| n == 0.0 || (n.is_normal() && n.abs() <= 1.0))
+            {
+                *dst = coefficients.map(f64::from);
+            }
+        }
+        Self {
+            planes,
+            count: camera.clip_planes().len(),
+        }
+    }
+
+    pub(crate) fn excludes(&self, bounds: Bounds3, offset: [f32; 3]) -> bool {
+        let Some(([lx, ly, lz], [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
+            return false;
+        };
+        let [mx, my, mz] = [
+            lx.abs().max(hx.abs()),
+            ly.abs().max(hy.abs()),
+            lz.abs().max(hz.abs()),
+        ];
+        self.planes.iter().take(self.count).any(|&[x, y, z, d]| {
+            let support = x * if x >= 0.0 { hx } else { lx }
+                + y * if y >= 0.0 { hy } else { ly }
+                + z * if z >= 0.0 { hz } else { lz }
+                + d;
+            let magnitude = x.abs() * mx + y.abs() * my + z.abs() * mz + d.abs();
+            // The raster shader adds the camera WGSL clip tolerance. Account for all f32
+            // arithmetic (including fused evaluation) before rejecting a whole primitive.
+            let tolerance = f64::from(1e-4_f32);
+            let error = (magnitude + tolerance) * (16.0 * f64::from(f32::EPSILON));
+            magnitude < f64::from(f32::MAX) * 0.5 && support + error < -tolerance
+        })
+    }
 }
 
 /// Four homogeneous side planes for the pick rectangle. Testing the camera-relative f32
@@ -236,19 +304,10 @@ impl PickVolume {
         }
     }
 
-    pub(crate) fn intersects(&self, bounds: Bounds3, [ox, oy, oz]: [f32; 3]) -> bool {
-        if bounds.is_empty() {
+    pub(crate) fn intersects(&self, bounds: Bounds3, offset: [f32; 3]) -> bool {
+        let Some(([lx, ly, lz], [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
             return true;
-        }
-        let [min_x, min_y, min_z] = bounds.min.to_f32();
-        let [max_x, max_y, max_z] = bounds.max.to_f32();
-        let lo = [min_x + ox, min_y + oy, min_z + oz].map(f64::from);
-        let hi = [max_x + ox, max_y + oy, max_z + oz].map(f64::from);
-        if !lo.into_iter().chain(hi).all(f64::is_finite) {
-            return true;
-        }
-        let [lx, ly, lz] = lo;
-        let [hx, hy, hz] = hi;
+        };
         let [mx, my, mz] = [
             lx.abs().max(hx.abs()),
             ly.abs().max(hy.abs()),
@@ -263,5 +322,50 @@ impl PickVolume {
             // Uncertain precision or overflow always keeps the object in the candidate set.
             !distance.is_finite() || magnitude >= f64::from(f32::MAX) * 0.5 || distance >= -rounding
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iletki_core::{Plane, Vec3};
+
+    #[test]
+    fn raster_section_keeps_crossing_and_uncertain_bounds_at_large_coordinates() {
+        let origin = Vec3::new(1e9, 2e9, 3e9);
+        let mut camera =
+            Camera::perspective_3d(origin - Vec3::Y * 8.0, origin, Vec3::Z, 0.75, 0.05);
+        camera.set_clip_planes(&[
+            Plane::from_normal_point(Vec3::X, origin).unwrap(),
+            Plane::from_normal_point(-Vec3::Z, origin + Vec3::Z).unwrap(),
+        ]);
+        let offset = (origin - camera.position_3d()).to_f32();
+        let section = SectionVolume::new(&camera);
+        let bounds =
+            |lo, hi| Bounds3::from_corners(Vec3::new(lo, -1.0, 0.0), Vec3::new(hi, 1.0, 2.0));
+        assert!(section.excludes(bounds(-3.0, -2.0), offset));
+        assert!(section.excludes(bounds(0.0, 1.0), [0.0, 8.0, 2.0]));
+        assert!(!section.excludes(bounds(-2.0, -0.00005), offset));
+        assert!(!section.excludes(bounds(-1.0, 1.0), offset));
+        assert!(!section.excludes(bounds(-3.0, -2.0), [f32::INFINITY, 8.0, 0.0]));
+        assert!(!section.excludes(Bounds3::EMPTY, offset));
+    }
+
+    #[test]
+    fn raster_section_leaves_subnormal_clip_inputs_to_the_shader() {
+        let mut camera = Camera::perspective_3d(-Vec3::Y * 8.0, Vec3::ZERO, Vec3::Z, 0.75, 0.05);
+        let bounds =
+            |lo, hi| Bounds3::from_corners(Vec3::new(lo, -1.0, 0.0), Vec3::new(hi, 1.0, 2.0));
+        let offset = [0.0, 8.0, 0.0];
+        camera.set_clip_planes(&[Plane {
+            normal: Vec3::X * f64::from(f32::MAX),
+            d: 0.0,
+        }]);
+        assert!(!SectionVolume::new(&camera).excludes(bounds(-1e-38, -1e-39), offset));
+        camera.set_clip_planes(&[Plane {
+            normal: Vec3::X * (f64::from(f32::MIN_POSITIVE) * 0.5),
+            d: 0.0,
+        }]);
+        assert!(!SectionVolume::new(&camera).excludes(bounds(-2e37, -1e37), offset));
     }
 }
