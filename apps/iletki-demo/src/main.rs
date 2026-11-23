@@ -23,6 +23,7 @@
 #[path = "../../../crates/iletki/examples/assembly_fixture/mod.rs"]
 mod assembly_fixture;
 mod latency;
+mod preview;
 
 use iletki::gpu::wgpu;
 use iletki::{
@@ -45,6 +46,8 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
 
 const MARQUEE_SHADER: &str = r#"
 @vertex
@@ -201,6 +204,7 @@ struct GpuState {
     pick_epoch: u64,
     pending_pick: Option<(PendingPick, PickRequest)>,
     queued_pick: Option<PickRequest>,
+    preview_pacing: preview::PreviewPacing,
     latency: Option<latency::Trace>,
     #[cfg(feature = "profiling")]
     pick_profile: bool,
@@ -374,6 +378,11 @@ impl GpuState {
             .collect();
         let visible_selection = committed_selection.clone();
         let marquee_border = marquee_pipeline(&device, format);
+        let preview_pacing = preview::PreviewPacing::new(
+            window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz()),
+        );
         let mut state = Self {
             window,
             surface,
@@ -417,6 +426,7 @@ impl GpuState {
             pick_epoch: 0,
             pending_pick: None,
             queued_pick: None,
+            preview_pacing,
             latency,
             #[cfg(feature = "profiling")]
             pick_profile,
@@ -678,6 +688,8 @@ impl GpuState {
 
     fn update_marquee(&mut self, origin: Vec2, kind: PickKind, now: Instant) {
         let rect = self.marquee_at(origin, self.last_cursor);
+        let redraw_border =
+            kind != PickKind::Preview || self.marquee_rect.is_none() || rect.is_none();
         if kind == PickKind::Preview {
             if rect == self.marquee_rect {
                 return;
@@ -702,7 +714,9 @@ impl GpuState {
         } else {
             self.cancel_selection();
         }
-        self.window.request_redraw();
+        if redraw_border {
+            self.window.request_redraw();
+        }
     }
 
     fn cancel_selection(&mut self) {
@@ -713,6 +727,11 @@ impl GpuState {
     }
 
     fn invalidate_picks(&mut self) {
+        self.preview_pacing = preview::PreviewPacing::new(
+            self.window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz()),
+        );
         self.pick_epoch = self.pick_epoch.wrapping_add(1);
         if let Some(queued) = self.queued_pick.take() {
             self.pick_status(queued.event, "cancelled", None);
@@ -722,6 +741,7 @@ impl GpuState {
 
     fn clear_preview(&mut self, status: &'static str) {
         if self.preview_view.take().is_some() {
+            self.preview_pacing.frame_started();
             if let Some(trace) = &mut self.latency {
                 trace.invalidate_selection_frame(status);
             }
@@ -744,20 +764,52 @@ impl GpuState {
             kind,
             epoch: self.pick_epoch,
         };
-        if self.pending_pick.is_some() {
-            if kind == PickKind::Preview
-                && self
-                    .queued_pick
-                    .as_ref()
-                    .is_some_and(|queued| queued.kind == PickKind::Commit)
+        let now = Instant::now();
+        if kind == PickKind::Preview {
+            self.preview_pacing.input(now);
+            if self
+                .queued_pick
+                .as_ref()
+                .is_some_and(|queued| queued.kind == PickKind::Commit)
             {
                 self.pick_status(event, "coalesced-before-submit", None);
-            } else if let Some(old) = self.queued_pick.replace(request) {
-                self.pick_status(old.event, "coalesced-before-submit", None);
+                return;
             }
-        } else {
-            self.begin_pick(request);
         }
+        if let Some(old) = self.queued_pick.replace(request) {
+            self.pick_status(old.event, "coalesced-before-submit", None);
+        }
+        self.submit_queued_pick(now);
+    }
+
+    fn submit_queued_pick(&mut self, now: Instant) {
+        if self.pending_pick.is_some()
+            || self
+                .queued_pick_deadline()
+                .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        let Some(request) = self.queued_pick.take() else {
+            return;
+        };
+        if request.epoch == self.pick_epoch
+            && (request.kind == PickKind::Commit || request.view == self.pick_view(request.kind))
+        {
+            if request.kind == PickKind::Preview {
+                self.preview_pacing.submitted(now);
+            }
+            self.begin_pick(request);
+        } else {
+            self.pick_status(request.event, "stale-before-submit", None);
+        }
+    }
+
+    fn queued_pick_deadline(&self) -> Option<Instant> {
+        self.queued_pick
+            .as_ref()
+            .filter(|request| request.kind == PickKind::Preview)?;
+        self.preview_pacing.deadline()
     }
 
     fn begin_pick(&mut self, mut request: PickRequest) {
@@ -846,26 +898,27 @@ impl GpuState {
             }
             self.pick_status(request.event, "stale", None);
         } else if let Ok(hits) = result {
+            let event = request.event;
+            let preview = request.kind == PickKind::Preview;
             if let Some(trace) = &mut self.latency
-                && let Some(id) = request.event
+                && let Some(id) = event
             {
                 trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
-                trace.selection_redraw(id);
             }
             self.apply_pick(&hits, request);
+            if let Some(trace) = &mut self.latency
+                && let Some(id) = event
+            {
+                trace.selection_redraw(id);
+            }
+            if preview {
+                self.preview_pacing.request_frame(Instant::now());
+            }
+            self.window.request_redraw();
         } else {
             self.pick_status(request.event, "error", None);
             if request.kind == PickKind::Commit {
                 self.clear_preview("cancelled");
-            }
-        }
-        if let Some(queued) = self.queued_pick.take() {
-            if queued.epoch == self.pick_epoch
-                && (queued.kind == PickKind::Commit || queued.view == self.pick_view(queued.kind))
-            {
-                self.begin_pick(queued);
-            } else {
-                self.pick_status(queued.event, "stale-before-submit", None);
             }
         }
     }
@@ -946,7 +999,6 @@ impl GpuState {
             }
             self.last_pick_text = String::from("Empty background");
         }
-        self.window.request_redraw();
     }
 
     fn update_title(&self) {
@@ -1165,16 +1217,27 @@ impl GpuState {
                 started: trace.ns(started),
                 acquired: trace.ns(Instant::now()),
                 encoded: 0,
+                viewport_encoded: 0,
                 submitted: 0,
                 presented: 0,
                 status,
                 streaming: false,
+                dynamic_drawn: false,
             });
         }
     }
 
     fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
+        self.preview_pacing.frame_started();
+        #[cfg(feature = "profiling")]
+        if self.pick_profile
+            && self.latency.as_ref().is_some_and(|trace| trace.ticks >= 65)
+            && self.vp_main.dirty().contains(DirtyFlags::SELECTION)
+            && !iletki::gpu::profiling::active()
+        {
+            iletki::gpu::profiling::begin(&self.device);
+        }
         let dt = self.last_frame_time.elapsed().as_secs_f64().min(0.1);
         self.last_frame_time = frame_start;
         if self.transition.is_active() {
@@ -1219,6 +1282,7 @@ impl GpuState {
 
         self.clear_stale_preview();
         let mut streaming = false;
+        let mut dynamic_drawn = false;
         if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
             let qw = (w / 2) as f32;
             let qh = (h / 2) as f32;
@@ -1238,16 +1302,16 @@ impl GpuState {
             ];
             let count = if self.bench_dual { 2 } else { 4 };
             for (viewport, _) in views.iter_mut().take(count) {
-                streaming |= viewport
-                    .prepare_for_pass(
-                        &self.device,
-                        &self.queue,
-                        &mut enc,
-                        &(),
-                        &mut [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d],
-                        self.pass_desc,
-                    )?
-                    .streaming_pending;
+                let stats = viewport.prepare_for_pass(
+                    &self.device,
+                    &self.queue,
+                    &mut enc,
+                    &(),
+                    &mut [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d],
+                    self.pass_desc,
+                )?;
+                streaming |= stats.streaming_pending;
+                dynamic_drawn |= stats.dynamic_drawn;
             }
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-demo quad blit"),
@@ -1307,6 +1371,7 @@ impl GpuState {
                 }
             };
             streaming |= stats.streaming_pending;
+            dynamic_drawn |= stats.dynamic_drawn;
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-demo blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1329,6 +1394,7 @@ impl GpuState {
             }
         }
 
+        let viewport_encoded = self.latency.as_ref().map(|_| Instant::now());
         if let Some(trace) = &self.latency
             && w >= 48
             && h >= 8
@@ -1362,18 +1428,30 @@ impl GpuState {
             }
         }
         self.queue.present(output);
-        if let (Some(trace), Some(acquired), Some(encoded), Some(submitted)) =
-            (&mut self.latency, acquired, encoded, submitted)
-        {
+        if let (
+            Some(trace),
+            Some(acquired),
+            Some(viewport_encoded),
+            Some(encoded),
+            Some(submitted),
+        ) = (
+            &mut self.latency,
+            acquired,
+            viewport_encoded,
+            encoded,
+            submitted,
+        ) {
             trace.frame(latency::Frame {
                 id: trace.frame_id(),
                 started: trace.ns(frame_start),
                 acquired: trace.ns(acquired),
                 encoded: trace.ns(encoded),
+                viewport_encoded: trace.ns(viewport_encoded),
                 submitted: trace.ns(submitted),
                 presented: trace.ns(Instant::now()),
                 status: "present-called",
                 streaming,
+                dynamic_drawn,
             });
         }
 
@@ -1452,18 +1530,23 @@ impl ApplicationHandler for DemoApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
-            let now = Instant::now();
             state.poll_pick();
+            let now = Instant::now();
             state.replay_latency(now);
+            state.submit_queued_pick(Instant::now());
             let mut deadline = state
                 .pending_pick
                 .as_ref()
-                .map(|_| Instant::now() + Duration::from_millis(1));
+                .map(|_| Instant::now() + PICK_POLL_INTERVAL)
+                .or_else(|| state.queued_pick_deadline());
             if let Some(trace) = &state.latency {
                 if trace.pending_gpu() {
                     let _ = state.device.poll(wgpu::PollType::Poll);
                 }
-                if trace.finished(now, state.pending_pick.is_some()) {
+                if trace.finished(
+                    now,
+                    state.pending_pick.is_some() || state.queued_pick.is_some(),
+                ) {
                     if let Err(error) = trace.write(&state.window, state.vp_main.camera()) {
                         eprintln!("latency trace write failed: {error}");
                     }
@@ -1482,6 +1565,10 @@ impl ApplicationHandler for DemoApp {
         let Some(s) = &mut self.state else {
             return;
         };
+        let replay = s
+            .latency
+            .as_ref()
+            .is_some_and(|trace| trace.options.action != latency::Action::Live);
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(trace) = &s.latency
@@ -1502,12 +1589,12 @@ impl ApplicationHandler for DemoApp {
                 s.cancel_selection();
                 s.resize_viewports();
             }
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(false) if !replay => {
                 s.press_pos = None;
                 s.cancel_selection();
                 s.dispatch_input(&ViewportInput::FocusLost);
             }
-            WindowEvent::ModifiersChanged(m) => {
+            WindowEvent::ModifiersChanged(m) if !replay => {
                 let st = m.state();
                 s.modifiers = Modifiers {
                     shift: st.shift_key(),
@@ -1517,6 +1604,12 @@ impl ApplicationHandler for DemoApp {
                 };
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if replay {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                        event_loop.exit();
+                    }
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
                         KeyCode::Escape
@@ -1578,7 +1671,7 @@ impl ApplicationHandler for DemoApp {
                     s.window.request_redraw();
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if !replay => {
                 let mapped = match button {
                     MouseButton::Middle | MouseButton::Right => Some(PointerButton::Middle),
                     MouseButton::Left => Some(PointerButton::Primary),
@@ -1634,7 +1727,7 @@ impl ApplicationHandler for DemoApp {
                     s.window.request_redraw();
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if !replay => {
                 let started = Instant::now();
                 let dpi = s.window.scale_factor();
                 let pos = Vec2::new(position.x / dpi, position.y / dpi);
@@ -1659,7 +1752,7 @@ impl ApplicationHandler for DemoApp {
                     s.window.request_redraw();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !replay => {
                 let started = Instant::now();
                 s.transition.cancel();
                 let (d, unit) = match delta {

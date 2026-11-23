@@ -103,6 +103,7 @@ size, output and active refresh rate. The replay runs at approximately 60 input
 events per second. Actions are `orbit`, `pan`, `zoom`, `click`, `marquee` and `edit`.
 The edit action orbits while moving every hundredth part once every six events.
 `--action live` records OS input from dragging, scrolling and releasing a pick button.
+Scripted replay owns camera and selection input for the duration of a capture.
 Use Shift + left drag in the single 3D viewport to preview a visible-object selection
 and release to commit it. Escape cancels the gesture and restores the committed selection.
 `--dual` adds an orthographic view for camera and edit replays.
@@ -112,8 +113,12 @@ output directories. Use `--region boundary` and `--region empty` for separate co
 The default `mixed` region alternates center and left rectangles for historical comparison.
 Use `--rect-size 512` for large rectangles and `--motion orbit|section|edit` for invalidation
 under camera moves, live section changes or 1% part edits. Section motion requires
-`--style edges-section`. Replay requests run on a 60 Hz schedule and write a separate final
-release event.
+`--style edges-section`. Replay requests default to a 60 Hz schedule and write a separate
+final release event. Set `--input-hz 240 --samples 1440` or
+`--input-hz 500 --samples 3000` to replay six seconds of input faster than the display.
+During a burst, the demo keeps the newest pending preview and schedules GPU work against
+the window's nominal refresh interval. A ready preview gets a redraw opportunity before
+the next preview is encoded. Release requests take priority.
 
 ```sh
 cargo run --release -p iletki-demo -- --latency-bench out/marquee/radeon/filled/1 \
@@ -125,7 +130,10 @@ Use 16.67 ms p95, 33.3 ms p99 and at least 57 applied preview frames per schedul
 as the fixed-view, filled 256×256 software gate. Check the highlighted object count to
 distinguish dense, boundary and empty requests. Leave `ILETKI_PICK_PROFILE` unset for latency
 gates. Build the demo with `--features profiling` and set `ILETKI_PICK_PROFILE=1` in a separate
-run to log CPU phases, GPU passes and draw counts. Set `ILETKI_DIRECT_PICK=1` in that build
+run to log CPU phases, GPU passes and draw counts, including the outline mask and bounds.
+Compare the intervals between adjacent applied previews independently of input latency.
+The software pacing targets for fixed-view previews are 18.33 ms p95 and 25 ms p99.
+Set `ILETKI_DIRECT_PICK=1` in the profiling build
 to A/B the per-chunk pick path while keeping the same preview and contour code.
 
 For a controlled presentation comparison, select `--present fifo` or `--present mailbox`,
@@ -134,7 +142,9 @@ callback. Baseline runs omit these overrides. Each frame records surface acquisi
 encode, queue submit and present return timestamps. GPU completion uses callbacks
 observed during nonblocking polling. The event CSV tracks the frame using each input
 or pick result, the rectangle, raw hits and highlighted objects, and timestamps for
-pick encode start, submission and observed completion. It distinguishes requests
+pick encode start, submission, observed completion, highlight application and redraw requests.
+The frame start is recorded when the redraw handler begins. The frame trace includes viewport
+encoding completion and whether the dynamic pass ran. It distinguishes requests
 coalesced before submission, results coalesced before a frame and stale results.
 Compare the release digest between packed and direct runs using the same binary and adapter.
 The digest includes the ordered hit IDs, depth bits and reconstructed world positions.
@@ -152,6 +162,22 @@ are 12 ms p95 and 16.67 ms p99
 for the 20,000-part workload with edges and a live section. The physical targets are
 33.3/50 ms for camera p95/p99 and 50/66.7 ms from either a click or a marquee release to
 the changed contour.
+
+Export one CSV row per synchronized trigger. Use the demo event ID, the trigger and
+first visible change times in nanoseconds on the optical capture clock, and the raw
+16-bit Gray marker read alongside that change. Use blank change and marker fields for
+a trigger with no observed change. Space trials so a frame carrying each change can
+be identified before the next trial. The acceptance tool reports missed and unmatched
+trials along with latency percentiles for each recorded action.
+
+```csv
+event,trigger_ns,changed_ns,gray16
+60,1000000000,1035000000,0x002B
+```
+
+```sh
+python3 docs/benchmarks/repro/summarize-optical.py out/interaction/live capture.csv
+```
 
 ### Tessellated IFC and STEP models
 

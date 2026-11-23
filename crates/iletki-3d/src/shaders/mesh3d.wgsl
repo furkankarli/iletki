@@ -79,13 +79,17 @@ fn vs_edge(v: VertIn) -> ColorOut {
     return edge_vertex(v);
 }
 
-@vertex
-fn vs_mask(v: VertIn) -> MaskOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn mask_vertex(v: VertIn, placement: ObjectUniforms) -> MaskOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: MaskOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
     return out;
+}
+
+@vertex
+fn vs_mask(v: VertIn) -> MaskOut {
+    return mask_vertex(v, object);
 }
 
 fn pick_vertex(v: VertIn, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {

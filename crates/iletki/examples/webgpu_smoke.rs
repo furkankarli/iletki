@@ -159,6 +159,7 @@ mod web {
         host.camera_mut().clear_clip_planes();
         // Enough visible geometry to exercise the packed path. Keep these quads behind the
         // original surface so the center retains its expected shading and pick ID.
+        let mut packed_chunks = vec![chunk];
         for i in 1..=128 {
             let mut mesh = Mesh3D::at_origin(Vec3::new(0.0, f64::from(i) * 0.01, 0.0));
             mesh.push_quad(
@@ -169,7 +170,7 @@ mod web {
                 [255, 0, 0, 255],
                 PickId::new(ID.layer, i, 0),
             );
-            scene.insert(mesh);
+            packed_chunks.push(scene.insert(mesh));
         }
         let center =
             render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
@@ -200,6 +201,16 @@ mod web {
         {
             return Err(format!(
                 "unexpected WebGPU packed section pixels: {packed_cut:?}"
+            ));
+        }
+        for id in packed_chunks {
+            scene.set_selected(id, true);
+        }
+        let packed_outline =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        if packed_outline != pixels {
+            return Err(format!(
+                "unexpected WebGPU packed outline: {packed_outline:?}"
             ));
         }
         Ok(())

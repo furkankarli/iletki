@@ -1,7 +1,7 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
-use crate::scene::ObjectUniforms;
 use crate::{Vertex3D, face_batch::PackedDraws};
+use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
 use iletki_core::{Bounds3, Mat4, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
@@ -23,11 +23,14 @@ struct UniformPage {
 
 pub(crate) struct ViewObjects {
     pub(crate) id: ViewportId,
+    pub(crate) picking: bool,
     pub(crate) lifetime: ViewportLifetime,
     pub(crate) draws: Vec<PreparedObject>,
     pub(crate) has_edges: bool,
     pub(crate) faces: PackedDraws,
     pub(crate) edges: PackedDraws,
+    pub(crate) mask: PackedDraws,
+    pub(crate) outline_bounds: OutlineBounds,
     pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
     staging: Vec<u8>,
@@ -36,7 +39,7 @@ pub(crate) struct ViewObjects {
 }
 
 impl ViewObjects {
-    pub(crate) fn new<W>(ctx: &PrepareCtx<'_, W>, batch: bool) -> Self {
+    pub(crate) fn new<W>(ctx: &PrepareCtx<'_, W>, batch: bool, picking: bool) -> Self {
         let limits = ctx.device.limits();
         let alignment = limits.min_uniform_buffer_offset_alignment as usize;
         let stride = OBJECT_BYTES.div_ceil(alignment.max(1)) * alignment.max(1);
@@ -49,11 +52,14 @@ impl ViewObjects {
         };
         Self {
             id: ctx.viewport_id,
+            picking,
             lifetime: ctx.viewport_lifetime(),
             draws: Vec::new(),
             has_edges: false,
             faces: PackedDraws::default(),
             edges: PackedDraws::default(),
+            mask: PackedDraws::default(),
+            outline_bounds: OutlineBounds::default(),
             direct_uniforms: Vec::new(),
             pages: Vec::new(),
             staging: Vec::new(),

@@ -25,6 +25,7 @@ static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum readback allocation cap (256 MiB) to guard against hostile sizes.
 const MAX_READBACK_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CACHED_PICK_BYTES: u64 = 512 * 512 * 12;
 
 /// Descriptor of an external host `wgpu::RenderPass` for [`ViewportHost::prepare_for_pass`] and
 /// [`ViewportHost::paint_into_pass`].
@@ -138,6 +139,7 @@ pub struct ViewportHost {
     outline: Option<OutlineEngine>,
     pick_targets: Option<PickTargets>,
     depth_copy: Option<DepthCopyPipeline>,
+    pick_readback: PickBufferCache,
     active_output: ActiveOutput,
     static_valid: bool,
     pending_reallocated: bool,
@@ -229,6 +231,7 @@ impl ViewportHost {
             outline: None,
             pick_targets: None,
             depth_copy: None,
+            pick_readback: Arc::default(),
             active_output: ActiveOutput::StaticCache,
             static_valid: false,
             pending_reallocated: false,
@@ -687,6 +690,7 @@ impl ViewportHost {
         layers: &[&mut dyn ViewportLayer<W>],
         ctx: &PaintCtx<'_, W>,
     ) -> Option<[u32; 4]> {
+        let _profile = crate::trace::scope("outline.bounds");
         let [aw, ah] = ctx.active_px;
         let mut min_x = aw;
         let mut min_y = ah;
@@ -736,6 +740,7 @@ impl ViewportHost {
         let [aw, ah] = paint_ctx.active_px;
         let [x, y, w, h] = rect;
         {
+            let _profile = crate::trace::scope("outline.mask_encode");
             let (view, resolve_target) = engine.mask_color_views();
             let gpu_timer = crate::trace::pass("iletki outline mask");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -772,6 +777,7 @@ impl ViewportHost {
                 }
             }
         }
+        let _profile = crate::trace::scope("outline.jump_flood_encode");
         engine.run_jump_flood(
             queue,
             encoder,
@@ -1059,8 +1065,8 @@ impl ViewportHost {
             device: device.clone(),
             camera: self.camera.clone(),
             dpi_scale: self.dpi_scale,
-            id_map: request_staging_map(&staged.id_buf),
-            depth_map: request_staging_map(&staged.depth_buf),
+            id_map: request_staging_map(&staged.buffers.ids),
+            depth_map: request_staging_map(&staged.buffers.depth),
             staged: Some(staged),
         })
     }
@@ -1097,18 +1103,11 @@ impl ViewportHost {
         let (id_bytes, depth_bytes) = {
             let _profile = crate::trace::scope("pick.readback");
             (
-                map_staging_blocking(device, &staged.id_buf, staged.id_layout)?,
-                map_staging_blocking(device, &staged.depth_buf, staged.depth_layout)?,
+                map_staging_blocking(device, &staged.buffers.ids, staged.id_layout)?,
+                map_staging_blocking(device, &staged.buffers.depth, staged.depth_layout)?,
             )
         };
-        Ok(decode_pick_hits(
-            &self.camera,
-            staged.logical,
-            self.dpi_scale,
-            staged.rect,
-            &id_bytes,
-            &depth_bytes,
-        ))
+        Ok(staged.decode(&self.camera, self.dpi_scale, &id_bytes, &depth_bytes))
     }
 
     fn submit_pick_rect<W>(
@@ -1209,26 +1208,44 @@ impl ViewportHost {
         };
 
         // Copy both ID and depth sub-rects into staging buffers in the SAME command submission.
-        let id_buf = encode_texture_to_staging(
-            device,
+        let buffers = self
+            .pick_readback
+            .lock()
+            .ok()
+            .and_then(|mut available| {
+                if available.as_ref().is_some_and(|buffers| {
+                    buffers.ids.size() >= id_layout.total_bytes as u64
+                        && buffers.depth.size() >= depth_layout.total_bytes as u64
+                }) {
+                    available.take()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| PickBuffers {
+                ids: readback_buffer(device, id_layout),
+                depth: readback_buffer(device, depth_layout),
+            });
+        encode_texture_readback(
             &mut encoder,
             pick.id_texture(),
             [x0, y0, w, h],
             id_layout,
+            &buffers.ids,
         );
-        let depth_buf = encode_texture_to_staging(
-            device,
+        encode_texture_readback(
             &mut encoder,
             &depth_r32f,
             [0, 0, w, h],
             depth_layout,
+            &buffers.depth,
         );
         queue.submit(std::iter::once(encoder.finish()));
 
         Ok(StagedPick {
-            id_buf,
+            buffers,
+            cache: Arc::clone(&self.pick_readback),
             id_layout,
-            depth_buf,
             depth_layout,
             rect: [x0, y0, w, h],
             logical,
@@ -1277,29 +1294,61 @@ impl StagingLayout {
     }
 }
 
+struct PickBuffers {
+    ids: wgpu::Buffer,
+    depth: wgpu::Buffer,
+}
+
+type PickBufferCache = Arc<Mutex<Option<PickBuffers>>>;
+
 struct StagedPick {
-    id_buf: wgpu::Buffer,
+    buffers: PickBuffers,
+    cache: PickBufferCache,
     id_layout: StagingLayout,
-    depth_buf: wgpu::Buffer,
     depth_layout: StagingLayout,
     rect: [u32; 4],
     logical: Vec2,
 }
 
-fn encode_texture_to_staging(
-    device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
-    texture: &wgpu::Texture,
-    rect: [u32; 4],
-    layout: StagingLayout,
-) -> wgpu::Buffer {
-    let [x, y, width, height] = rect;
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+impl StagedPick {
+    // Both buffers have been read and unmapped by the caller. A dropped or failed request never
+    // returns its buffers to the cache.
+    fn decode(self, camera: &Camera, dpi_scale: f32, ids: &[u8], depths: &[u8]) -> Vec<PickHit> {
+        let size = self
+            .buffers
+            .ids
+            .size()
+            .saturating_add(self.buffers.depth.size());
+        if size <= MAX_CACHED_PICK_BYTES
+            && let Ok(mut available) = self.cache.lock()
+            && available.as_ref().is_none_or(|buffers| {
+                self.buffers.ids.size() >= buffers.ids.size()
+                    && self.buffers.depth.size() >= buffers.depth.size()
+            })
+        {
+            *available = Some(self.buffers);
+        }
+        decode_pick_hits(camera, self.logical, dpi_scale, self.rect, ids, depths)
+    }
+}
+
+fn readback_buffer(device: &wgpu::Device, layout: StagingLayout) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("iletki readback staging"),
         size: layout.total_bytes as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
-    });
+    })
+}
+
+fn encode_texture_readback(
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    rect: [u32; 4],
+    layout: StagingLayout,
+    staging: &wgpu::Buffer,
+) {
+    let [x, y, width, height] = rect;
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -1308,7 +1357,7 @@ fn encode_texture_to_staging(
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
-            buffer: &staging,
+            buffer: staging,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(layout.padded_row),
@@ -1321,7 +1370,6 @@ fn encode_texture_to_staging(
             depth_or_array_layers: 1,
         },
     );
-    staging
 }
 
 fn extract_mapped_rows(
@@ -1414,13 +1462,11 @@ impl PendingPick {
         }
 
         let staged = self.staged.take().ok_or(ViewportError::PickAlreadyRead)?;
-        let id_bytes = extract_mapped_rows(&staged.id_buf, staged.id_layout)?;
-        let depth_bytes = extract_mapped_rows(&staged.depth_buf, staged.depth_layout)?;
-        Poll::Ready(Ok(decode_pick_hits(
+        let id_bytes = extract_mapped_rows(&staged.buffers.ids, staged.id_layout)?;
+        let depth_bytes = extract_mapped_rows(&staged.buffers.depth, staged.depth_layout)?;
+        Poll::Ready(Ok(staged.decode(
             &self.camera,
-            staged.logical,
             self.dpi_scale,
-            staged.rect,
             &id_bytes,
             &depth_bytes,
         )))
@@ -1499,61 +1545,55 @@ fn decode_pick_hits(
 ) -> Vec<PickHit> {
     let _profile = crate::trace::scope("pick.decode");
     let [x0, y0, w, h] = rect;
+    let width = w as usize;
     let mut indices = HashMap::new();
-    let mut winners = Vec::<(PickId, f32, u32, u32)>::new();
+    let mut winners = Vec::<(u64, f32, usize)>::new();
     let inv_dpi = 1.0 / f64::from(dpi_scale);
+    let (ids, _) = id_bytes.as_chunks::<8>();
+    let (depths, _) = depth_bytes.as_chunks::<4>();
 
-    for row in 0..h {
-        for col in 0..w {
-            let px_index = (row as usize)
-                .saturating_mul(w as usize)
-                .saturating_add(col as usize);
-            let id_off = px_index.saturating_mul(8);
-            let depth_off = px_index.saturating_mul(4);
-            let (Some(id_slice), Some(d_slice)) = (
-                id_bytes.get(id_off..id_off.saturating_add(8)),
-                depth_bytes.get(depth_off..depth_off.saturating_add(4)),
-            ) else {
-                continue;
-            };
-            let (Ok(lo_arr), Ok(hi_arr), Ok(d_arr)) = (
-                <[u8; 4]>::try_from(id_slice.get(0..4).unwrap_or_default()),
-                <[u8; 4]>::try_from(id_slice.get(4..8).unwrap_or_default()),
-                <[u8; 4]>::try_from(d_slice),
-            ) else {
-                continue;
-            };
-            let id = PickId::from_rg32u([u32::from_le_bytes(lo_arr), u32::from_le_bytes(hi_arr)]);
-            if id.is_none() {
-                continue;
-            }
-            let depth = f32::from_le_bytes(d_arr);
-            let index = *indices.entry(id).or_insert_with(|| {
-                let index = winners.len();
-                winners.push((id, depth, col, row));
-                index
-            });
-            // Keep the first pixel at equal depths and retain encounter order across IDs.
-            if let Some(winner) = winners.get_mut(index)
-                && depth > winner.1
-            {
-                *winner = (id, depth, col, row);
-            }
+    for (pixel, (id, depth)) in ids
+        .iter()
+        .zip(depths)
+        .take(width.saturating_mul(h as usize))
+        .enumerate()
+    {
+        let id = u64::from_le_bytes(*id);
+        if id == 0 {
+            continue;
+        }
+        let depth = f32::from_le_bytes(*depth);
+        let index = *indices.entry(id).or_insert_with(|| {
+            let index = winners.len();
+            winners.push((id, depth, pixel));
+            index
+        });
+        // Keep the first pixel at equal depths and retain encounter order across IDs.
+        if let Some(winner) = winners.get_mut(index)
+            && depth > winner.1
+        {
+            *winner = (id, depth, pixel);
         }
     }
     // Sort nearest-first (highest Reversed-Z depth first).
     winners.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if winners.is_empty() {
+        return Vec::new();
+    }
+    let unproject = camera.depth_unprojector(logical);
     winners
         .into_iter()
-        .map(|(id, depth, col, row)| {
+        .map(|(id, depth, pixel)| {
+            let col = (pixel % width) as u32;
+            let row = (pixel / width) as u32;
             let screen_pt = Vec2::new(
                 (f64::from(x0.saturating_add(col)) + 0.5) * inv_dpi,
                 (f64::from(y0.saturating_add(row)) + 0.5) * inv_dpi,
             );
             PickHit {
-                id,
+                id: PickId::from_u64(id),
                 depth,
-                world_pos: camera.unproject_depth(screen_pt, depth, logical),
+                world_pos: unproject(screen_pt, depth),
             }
         })
         .collect()
@@ -1577,7 +1617,8 @@ fn readback_texture_2d_blocking(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("iletki readback copy"),
     });
-    let staging = encode_texture_to_staging(device, &mut encoder, texture, rect, layout);
+    let staging = readback_buffer(device, layout);
+    encode_texture_readback(&mut encoder, texture, rect, layout, &staging);
     queue.submit(std::iter::once(encoder.finish()));
     map_staging_blocking(device, &staging, layout)
 }

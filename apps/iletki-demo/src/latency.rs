@@ -11,8 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const PERIOD: Duration = Duration::from_nanos(16_666_667);
-const WARMUP: u32 = 60;
+const DEFAULT_INPUT_HZ: u32 = 60;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -78,6 +77,7 @@ pub(crate) struct Options {
     pub(crate) present: Option<wgpu::PresentMode>,
     pub(crate) depth: Option<u32>,
     pub(crate) samples: u32,
+    pub(crate) input_hz: u32,
     pub(crate) region: Region,
     pub(crate) motion: Motion,
     pub(crate) rect_size: u32,
@@ -102,6 +102,7 @@ impl Options {
             present: None,
             depth: None,
             samples: 360,
+            input_hz: DEFAULT_INPUT_HZ,
             region: Region::Mixed,
             motion: Motion::Static,
             rect_size: 256,
@@ -152,6 +153,12 @@ impl Options {
                         (Some("--motion"), "edit") => config.motion = Motion::Edit,
                         (Some("--rect-size"), "256") => config.rect_size = 256,
                         (Some("--rect-size"), "512") => config.rect_size = 512,
+                        (Some("--input-hz"), _) => {
+                            config.input_hz = value.parse().map_err(|_| "invalid input rate")?;
+                            if !(1..=1000).contains(&config.input_hz) {
+                                return Err("input rate must be between 1 and 1000 Hz".into());
+                            }
+                        }
                         (Some("--samples"), _) => {
                             config.samples = value.parse().map_err(|_| "invalid sample count")?;
                             if !(1..=10_000).contains(&config.samples) {
@@ -176,6 +183,9 @@ impl Options {
         }
         if config.motion == Motion::Section && config.style != Style::Section {
             return Err("section motion requires --style edges-section".into());
+        }
+        if config.action == Action::Live && config.input_hz != DEFAULT_INPUT_HZ {
+            return Err("input rate applies only to scripted replay".into());
         }
         Ok(Some(config))
     }
@@ -215,6 +225,7 @@ pub(crate) struct Event {
     encoding: Option<u128>,
     submitted: Option<u128>,
     ready: Option<u128>,
+    highlight_applied: Option<u128>,
     frame: Option<u32>,
     hits: Option<usize>,
     rect: Option<[u32; 4]>,
@@ -230,10 +241,12 @@ pub(crate) struct Frame {
     pub(crate) started: u128,
     pub(crate) acquired: u128,
     pub(crate) encoded: u128,
+    pub(crate) viewport_encoded: u128,
     pub(crate) submitted: u128,
     pub(crate) presented: u128,
     pub(crate) status: &'static str,
     pub(crate) streaming: bool,
+    pub(crate) dynamic_drawn: bool,
 }
 
 pub(crate) struct Trace {
@@ -242,6 +255,8 @@ pub(crate) struct Trace {
     pub(crate) ticks: u32,
     pub(crate) marker: wgpu::RenderPipeline,
     epoch: Instant,
+    period: Duration,
+    warmup: u32,
     end: Option<Instant>,
     events: Vec<Event>,
     pending_frames: Vec<usize>,
@@ -303,12 +318,17 @@ impl Trace {
             cache: None,
         });
         let epoch = Instant::now();
+        let input_hz = u64::from(options.input_hz);
+        let period = Duration::from_nanos((1_000_000_000 + input_hz / 2) / input_hz);
+        let warmup = options.input_hz.max(DEFAULT_INPUT_HZ);
         Self {
             options,
             next: epoch,
             ticks: 0,
             marker,
             epoch,
+            period,
+            warmup,
             end: None,
             events: Vec::new(),
             pending_frames: Vec::new(),
@@ -327,7 +347,7 @@ impl Trace {
             return None;
         }
         let scheduled = self.next;
-        self.next += PERIOD;
+        self.next += self.period;
         let tick = self.ticks;
         let id = self.event(self.options.action.name(), now, scheduled);
         Some((tick, id))
@@ -348,6 +368,7 @@ impl Trace {
             encoding: None,
             submitted: None,
             ready: None,
+            highlight_applied: None,
             frame: None,
             hits: None,
             rect: None,
@@ -355,10 +376,10 @@ impl Trace {
             release_digest: None,
             hit: None,
             status: "pending",
-            warmup: self.ticks < WARMUP,
+            warmup: self.ticks < self.warmup,
         });
         self.ticks += 1;
-        if self.ticks >= WARMUP + self.options.samples {
+        if self.ticks >= self.warmup + self.options.samples {
             self.end = Some(now + Duration::from_secs(1));
         }
         event
@@ -400,8 +421,10 @@ impl Trace {
     }
 
     pub(crate) fn highlighted(&mut self, id: usize, count: usize) {
+        let time = self.ns(Instant::now());
         if let Some(event) = self.events.get_mut(id) {
             event.highlighted = Some(count);
+            event.highlight_applied = Some(time);
         }
     }
 
@@ -427,7 +450,7 @@ impl Trace {
     }
 
     pub(crate) fn replay_release(&mut self, now: Instant) -> Option<usize> {
-        (self.ticks == WARMUP + self.options.samples)
+        (self.ticks == self.warmup + self.options.samples)
             .then(|| self.event("marquee-release", now, now))
     }
 
@@ -531,6 +554,9 @@ impl Trace {
             monitor.and_then(|monitor| monitor.refresh_rate_millihertz())
         )?;
         writeln!(info, "final_camera={camera:?}")?;
+        if self.options.action != Action::Live {
+            writeln!(info, "replay_input_hz={}", self.options.input_hz)?;
+        }
         let completed: std::collections::HashMap<_, _> = self
             .completed
             .lock()
@@ -539,7 +565,7 @@ impl Trace {
         let mut frames = BufWriter::new(File::create(self.options.directory.join("frames.csv"))?);
         writeln!(
             frames,
-            "frame,start_ns,acquire_ns,encode_ns,submit_ns,gpu_observed_ns,present_return_ns,status,streaming"
+            "frame,start_ns,acquire_ns,encode_ns,submit_ns,gpu_observed_ns,present_return_ns,status,streaming,viewport_encoded_ns,dynamic_drawn"
         )?;
         for frame in &self.frames {
             let gpu = completed
@@ -548,7 +574,7 @@ impl Trace {
                 .unwrap_or_default();
             writeln!(
                 frames,
-                "{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{}",
                 frame.id,
                 frame.started,
                 frame.acquired,
@@ -557,13 +583,15 @@ impl Trace {
                 gpu,
                 frame.presented,
                 frame.status,
-                frame.streaming
+                frame.streaming,
+                frame.viewport_encoded,
+                frame.dynamic_drawn,
             )?;
         }
         let mut events = BufWriter::new(File::create(self.options.directory.join("events.csv"))?);
         writeln!(
             events,
-            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest"
+            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest,highlight_applied_ns"
         )?;
         for (id, event) in self.events.iter().enumerate() {
             fn field<T: ToString>(value: Option<T>) -> String {
@@ -575,7 +603,7 @@ impl Trace {
                 .unwrap_or_default();
             writeln!(
                 events,
-                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{}",
+                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{},{}",
                 event.kind,
                 event.warmup,
                 event.scheduled,
@@ -590,6 +618,7 @@ impl Trace {
                 field(event.encoding),
                 field(event.highlighted),
                 field(event.release_digest),
+                field(event.highlight_applied),
             )?;
         }
         events.flush()?;

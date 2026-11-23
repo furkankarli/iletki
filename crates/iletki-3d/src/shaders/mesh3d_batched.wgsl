@@ -16,3 +16,8 @@ fn vs_edge_batched(v: VertIn, @location(3) slot: u32) -> ColorOut {
 fn vs_pick_batched(v: VertIn, @location(3) slot: u32, @location(4) id: vec2<u32>) -> PickOut {
     return pick_vertex(v, page_objects[slot], id);
 }
+
+@vertex
+fn vs_mask_batched(v: VertIn, @location(3) slot: u32) -> MaskOut {
+    return mask_vertex(v, page_objects[slot]);
+}

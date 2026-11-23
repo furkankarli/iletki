@@ -42,6 +42,8 @@ def summary(directory, frames, kind, events):
             "input-to-submit": (start, frame["submit_ns"]),
             "input-to-present-return": (start, frame["present_return_ns"]),
             "pick-ready-to-present-return": (event["pick_ready_ns"], frame["present_return_ns"]),
+            "pick-ready-to-highlight": (event["pick_ready_ns"], event.get("highlight_applied_ns", "")),
+            "redraw-request-to-redraw-event": (event["redraw_ns"], frame["start_ns"]),
         }
         if event.get("first_hit"):
             updates["input-to-contour-frame-return"] = (start, frame["present_return_ns"])
@@ -50,6 +52,7 @@ def summary(directory, frames, kind, events):
             updates.update({
                 "surface-acquire": (frame["start_ns"], frame["acquire_ns"]),
                 "encode-after-acquire": (frame["acquire_ns"], frame["encode_ns"]),
+                "viewport-encode": (frame["acquire_ns"], frame.get("viewport_encoded_ns", "")),
                 "submit-to-observed-gpu": (frame["submit_ns"], frame["gpu_observed_ns"]),
                 "present-api": (frame["submit_ns"], frame["present_return_ns"]),
             })
@@ -65,6 +68,9 @@ def summary(directory, frames, kind, events):
         duration += duration / (len(events) - 1)
         if duration > 0:
             print(f"  applied previews or inputs per scheduled second: {len(seen_frames) / duration:.2f}")
+            submitted = sum(bool(row["pick_submit_ns"]) for row in events)
+            if submitted:
+                print(f"  picks submitted per scheduled second: {submitted / duration:.2f}")
     counts = [int(row["highlighted"]) for row in events if row.get("highlighted") and row["frame"]]
     if counts:
         print(f"  highlighted objects, min / p50 / max: {min(counts)} / {quantiles(counts)[0]} / {max(counts)}")

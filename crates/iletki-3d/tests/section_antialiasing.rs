@@ -90,6 +90,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             Vec3::new(0.06, 0.0, 0.0),
         )
         .unwrap()]);
+        let mut selection_updates = Vec::new();
         for i in 0..169 {
             let x = (f64::from(i % 13) - 6.0) * 0.45;
             let z = (f64::from(i / 13) - 6.0) * 0.45;
@@ -109,9 +110,16 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
                 mesh.pick_ids.fill([0, 0]);
             }
             let chunk = scene.insert(mesh);
-            if i == 85 {
+            if i % 11 != 0 {
                 scene.set_selected(chunk, true);
             }
+            if (100..109).contains(&i) {
+                selection_updates.push(chunk);
+            }
+        }
+        render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
+        for id in selection_updates {
+            scene.set_selected(id, false);
         }
         let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
         let area = [0, 0, SIZE, SIZE];

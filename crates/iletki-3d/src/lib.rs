@@ -16,6 +16,7 @@ pub mod gizmo;
 pub mod grid;
 pub mod instanced;
 mod objects;
+mod outline_bounds;
 pub mod scene;
 mod section;
 pub mod vertex;

@@ -4,10 +4,11 @@
 
 use crate::face_batch::{self, PageBuilder, VertexRange};
 use crate::objects::{PickVolume, PreparedObject, ViewObjects};
+use crate::outline_bounds::OutlineUpdate;
 use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
 use bytemuck::{Pod, Zeroable};
-use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, Vec4};
+use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
@@ -72,6 +73,9 @@ struct PackedPipelines {
     base: ColorPipelines,
     section: Option<ColorPipelines>,
     pick: Option<wgpu::RenderPipeline>,
+    mask: wgpu::RenderPipeline,
+    multisampled_mask: Option<wgpu::RenderPipeline>,
+    section_mask: Option<wgpu::RenderPipeline>,
 }
 
 struct SectionPipelines {
@@ -247,6 +251,7 @@ impl Scene3DLayer {
             for view in &mut self.views {
                 view.faces.clear();
                 view.edges.clear();
+                view.mask.clear();
             }
             self.revision.mark_static();
         }
@@ -448,6 +453,46 @@ impl Scene3DLayer {
             &pipeline_layout,
             &[Some(vert_layout.clone()), Some(pick_layout)],
         );
+        let make_mask = |shader: &wgpu::ShaderModule,
+                         vertex,
+                         fragment,
+                         count,
+                         layout: &wgpu::PipelineLayout,
+                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d outline mask"),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(fragment),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: OUTLINE_MASK_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count,
+                        ..Default::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
         let packed = PageBuilder::supports(ctx.device).then(|| {
             let layout = face_batch::bind_layout(ctx.device);
             let pipeline_layout =
@@ -498,7 +543,25 @@ impl Scene3DLayer {
                 "vs_edge_batched",
                 "fs_edge",
             );
-            let section = section_aa.map(|aa| {
+            let mask = make_mask(
+                &shader,
+                "vs_mask_batched",
+                "fs_mask",
+                1,
+                &pipeline_layout,
+                &buffers,
+            );
+            let multisampled_mask = (ctx.msaa_samples == 4).then(|| {
+                make_mask(
+                    &shader,
+                    "vs_mask_batched",
+                    "fs_mask",
+                    4,
+                    &pipeline_layout,
+                    &buffers,
+                )
+            });
+            let (section, section_mask) = section_aa.map_or((None, None), |aa| {
                 let sampled = concat!(
                     include_str!("shaders/mesh3d_sampled.wgsl"),
                     "\n",
@@ -510,7 +573,7 @@ impl Scene3DLayer {
                     include_str!("shaders/mesh3d_batched_raster.wgsl")
                 );
                 let shader = aa.shader(ctx.device, &source, sampled, raster);
-                match aa {
+                let color = match aa {
                     SectionAa::Sampled => pipelines(
                         &shader,
                         "vs_mesh_batched_sampled",
@@ -525,7 +588,22 @@ impl Scene3DLayer {
                         "vs_edge_batched_raster",
                         "fs_unlit",
                     ),
-                }
+                };
+                let (vertex, fragment) = match aa {
+                    SectionAa::Sampled => ("vs_mesh_batched_sampled", "fs_mask_sampled"),
+                    SectionAa::Raster => ("vs_mesh_batched_raster", "fs_mask_unclipped"),
+                };
+                (
+                    Some(color),
+                    Some(make_mask(
+                        &shader,
+                        vertex,
+                        fragment,
+                        4,
+                        &pipeline_layout,
+                        &buffers,
+                    )),
+                )
             });
             let limits = ctx.device.limits();
             let pick =
@@ -550,47 +628,30 @@ impl Scene3DLayer {
                 layout,
                 base,
                 section,
+                mask,
+                multisampled_mask,
+                section_mask,
             }
         });
 
-        let make_mask = |shader: &wgpu::ShaderModule, vertex, fragment, count| {
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("iletki-3d outline mask"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some(vertex),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers: &[Some(vert_layout.clone())],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some(fragment),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: OUTLINE_MASK_FORMAT,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count,
-                        ..Default::default()
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-        };
-        let mask = make_mask(&shader, "vs_mask", "fs_mask", 1);
-        let multisampled_mask =
-            (ctx.msaa_samples == 4).then(|| make_mask(&shader, "vs_mask", "fs_mask", 4));
+        let mask = make_mask(
+            &shader,
+            "vs_mask",
+            "fs_mask",
+            1,
+            &pipeline_layout,
+            &face_layout,
+        );
+        let multisampled_mask = (ctx.msaa_samples == 4).then(|| {
+            make_mask(
+                &shader,
+                "vs_mask",
+                "fs_mask",
+                4,
+                &pipeline_layout,
+                &face_layout,
+            )
+        });
 
         let section = section_aa.map(|aa| {
             let shader = aa.shader(
@@ -617,7 +678,14 @@ impl Scene3DLayer {
                         &face_layout,
                         true,
                     ),
-                    multisampled_mask: make_mask(&shader, "vs_mesh_sampled", "fs_mask_sampled", 4),
+                    multisampled_mask: make_mask(
+                        &shader,
+                        "vs_mesh_sampled",
+                        "fs_mask_sampled",
+                        4,
+                        &pipeline_layout,
+                        &face_layout,
+                    ),
                 },
                 SectionAa::Raster => SectionPipelines {
                     lit: make_color(
@@ -636,7 +704,14 @@ impl Scene3DLayer {
                         &face_layout,
                         true,
                     ),
-                    multisampled_mask: make_mask(&shader, "vs_mesh_raster", "fs_mask_unclipped", 4),
+                    multisampled_mask: make_mask(
+                        &shader,
+                        "vs_mesh_raster",
+                        "fs_mask_unclipped",
+                        4,
+                        &pipeline_layout,
+                        &face_layout,
+                    ),
                 },
             }
         });
@@ -657,29 +732,74 @@ impl Scene3DLayer {
         });
     }
 
+    fn prepare_packed_mask<W>(
+        ctx: &PrepareCtx<'_, W>,
+        layout: &wgpu::BindGroupLayout,
+        chunks: &[Option<ChunkEntry>],
+        view: &mut ViewObjects,
+    ) -> bool {
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let _scope = iletki_wgpu::profiling::scope("scene.outline_mask_prepare");
+        let selected = view.draws.iter().enumerate().filter_map(|(index, object)| {
+            let chunk = chunks.get(object.chunk)?.as_ref()?;
+            if !chunk.selected {
+                return None;
+            }
+            Some((index, object.uniforms, chunk.vertex_buf.as_ref()?))
+        });
+        if selected.clone().take(128).count() < 128 {
+            return false;
+        }
+        view.mask.clear();
+        for (index, uniforms, geometry) in selected {
+            view.mask
+                .push(ctx.device, layout, geometry, uniforms, index);
+        }
+        view.mask.upload(ctx.queue);
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        iletki_wgpu::profiling::count("scene.outline_mask_draws", view.mask.counts().0);
+        true
+    }
+
     fn paint_outline_mask<W>(
         &self,
         pipeline: &wgpu::RenderPipeline,
+        packed: Option<&wgpu::RenderPipeline>,
         pass: &mut wgpu::RenderPass<'_>,
         ctx: &PaintCtx<'_, W>,
     ) {
         let Some(p) = &self.pipelines else {
             return;
         };
-        let Some(view) = self.views.iter().find(|view| view.id == ctx.viewport_id) else {
+        let Some(view) = self
+            .views
+            .iter()
+            .find(|view| view.id == ctx.viewport_id && !view.picking)
+        else {
             return;
         };
-        pass.set_pipeline(pipeline);
-        for (index, object) in view.draws.iter().enumerate() {
-            let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
-                continue;
-            };
-            if chunk.selected
-                && let Some(vbuf) = &chunk.vertex_buf
+        let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
+            if let Some(object) = view.draws.get(index)
+                && let Some(Some(chunk)) = self.chunks.get(object.chunk)
+                && chunk.selected
+                && let Some(vertices) = &chunk.vertex_buf
                 && view.bind(pass, index, p.dynamic_uniforms)
             {
-                pass.set_vertex_buffer(0, vbuf.slice());
+                pass.set_vertex_buffer(0, vertices.slice());
                 pass.draw(0..chunk.vertex_count, 0..1);
+            }
+        };
+        if let Some(packed) = packed
+            && view.mask.has_packed()
+        {
+            view.mask.paint(pass, packed, false, |pass, index| {
+                pass.set_pipeline(pipeline);
+                draw_direct(pass, index);
+            });
+        } else {
+            pass.set_pipeline(pipeline);
+            for index in 0..view.draws.len() {
+                draw_direct(pass, index);
             }
         }
     }
@@ -851,27 +971,60 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let batch = p.dynamic_uniforms;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let batch = batch && self.profile_batch_uniforms;
+        let picking = ctx.picking_rect_px();
         let index = self
             .views
             .iter()
-            .position(|view| view.id == ctx.viewport_id)
+            .position(|view| view.id == ctx.viewport_id && view.picking == picking.is_some())
             .unwrap_or_else(|| {
                 let index = self.views.len();
-                self.views.push(ViewObjects::new(ctx, batch));
+                self.views
+                    .push(ViewObjects::new(ctx, batch, picking.is_some()));
                 index
             });
         let Some(view) = self.views.get_mut(index) else {
             return pending;
         };
+        if picking.is_none() {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let _scope = iletki_wgpu::profiling::scope("scene.outline_bounds_prepare");
+            let update = view.outline_bounds.update(
+                ctx,
+                self.revision,
+                self.chunks.len(),
+                self.chunks.iter().enumerate().filter_map(|(index, chunk)| {
+                    let chunk = chunk.as_ref()?;
+                    (chunk.selected && chunk.visible && chunk.vertex_count != 0).then_some((
+                        index,
+                        chunk.local_bounds,
+                        chunk.origin,
+                    ))
+                }),
+            );
+            match update {
+                OutlineUpdate::Unchanged => return pending,
+                OutlineUpdate::Selection if pack_geometry && view.faces.has_packed() => {
+                    if let Some(packed) = &p.packed
+                        && Self::prepare_packed_mask(ctx, &packed.layout, &self.chunks, view)
+                    {
+                        // A dense mask uses the cached face ranges and its own uniform pages.
+                        // Direct face draws already have their own transform slots.
+                        return pending;
+                    }
+                }
+                OutlineUpdate::Selection | OutlineUpdate::View => {}
+            }
+        }
+
         view.draws.clear();
         view.has_edges = false;
         view.faces.clear();
         view.edges.clear();
+        view.mask.clear();
         view.direct_uniforms.clear();
 
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let visibility = iletki_wgpu::profiling::scope("scene.visibility");
-        let picking = ctx.picking_rect_px();
         let projection = ctx.camera.view_proj_relative(ctx.logical_size);
         let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
@@ -922,6 +1075,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             .as_ref()
             .filter(|packed| use_packed && (picking.is_none() || packed.pick.is_some()))
             .map(|packed| &packed.layout);
+        let packed_mask = picking.is_none()
+            && packed_layout
+                .is_some_and(|layout| Self::prepare_packed_mask(ctx, layout, &self.chunks, view));
         {
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             let _profile = iletki_wgpu::profiling::scope("scene.geometry_batch");
@@ -929,7 +1085,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                     continue;
                 };
-                let mut direct = packed_layout.is_none() || (picking.is_none() && chunk.selected);
+                let mut direct = packed_layout.is_none()
+                    || (picking.is_none() && chunk.selected && !packed_mask);
                 if let Some(layout) = packed_layout {
                     if let Some(geometry) = &chunk.vertex_buf {
                         direct |= matches!(geometry, VertexRange::Direct(_));
@@ -1004,113 +1161,32 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             .map(|section| &section.multisampled_mask)
             .or(p.multisampled_mask.as_ref());
         if let Some(mask) = mask {
-            self.paint_outline_mask(mask, pass, ctx);
+            let packed = p.packed.as_ref().and_then(|packed| {
+                packed
+                    .section_mask
+                    .as_ref()
+                    .filter(|_| self.use_antialiased_section)
+                    .or(packed.multisampled_mask.as_ref())
+            });
+            self.paint_outline_mask(mask, packed, pass, ctx);
         }
     }
 
     fn outline_mask_rect(&self, ctx: &PaintCtx<'_, W>) -> Option<[u32; 4]> {
-        let projection = ctx.camera.view_proj_relative(ctx.logical_size);
-        let camera_pos = ctx.camera.position_3d();
-        let [width, height] = ctx.active_px.map(f64::from);
-        let mut min = [width, height];
-        let mut max = [0.0_f64; 2];
-        let error_rows = [
-            [
-                projection.c0.x,
-                projection.c1.x,
-                projection.c2.x,
-                projection.c3.x,
-            ],
-            [
-                projection.c0.y,
-                projection.c1.y,
-                projection.c2.y,
-                projection.c3.y,
-            ],
-            [
-                projection.c0.w,
-                projection.c1.w,
-                projection.c2.w,
-                projection.c3.w,
-            ],
-        ];
-        for chunk in self
-            .chunks
+        self.views
             .iter()
-            .flatten()
-            .filter(|chunk| chunk.selected && chunk.visible && chunk.vertex_count != 0)
-        {
-            let bounds = chunk.local_bounds;
-            if bounds.is_empty() {
-                return None;
-            }
-            let [ox, oy, oz] = (chunk.origin - camera_pos).to_f32();
-            for x in [bounds.min.x, bounds.max.x] {
-                for y in [bounds.min.y, bounds.max.y] {
-                    for z in [bounds.min.z, bounds.max.z] {
-                        // Use the same rounded local coordinates and origin as the vertex shader.
-                        let point = Vec4::new(
-                            f64::from(x as f32 + ox),
-                            f64::from(y as f32 + oy),
-                            f64::from(z as f32 + oz),
-                            1.0,
-                        );
-                        let clip = projection.mul_vec4(point);
-                        // Bound f32 uniform and dot-product rounding before the perspective divide.
-                        let [x_error, y_error, w_error] = error_rows.map(|[a, b, c, d]| {
-                            let magnitude = (a * point.x).abs()
-                                + (b * point.y).abs()
-                                + (c * point.z).abs()
-                                + d.abs();
-                            magnitude * (16.0 * f64::from(f32::EPSILON))
-                                + f64::from(f32::MIN_POSITIVE)
-                        });
-                        if ![clip.x, clip.y, clip.z, clip.w]
-                            .into_iter()
-                            .all(f64::is_finite)
-                            || clip.w <= w_error
-                            || clip.w >= f64::from(f32::MAX) * 0.5
-                            || x_error.max(y_error) > 1.0
-                        {
-                            return None;
-                        }
-                        let nx = clip.x / clip.w;
-                        let ny = clip.y / clip.w;
-                        let dx = (x_error + nx.abs() * w_error) / (clip.w - w_error);
-                        let dy = (y_error + ny.abs() * w_error) / (clip.w - w_error);
-                        let [left, top] = [
-                            (nx - dx + 1.0) * width * 0.5,
-                            (1.0 - ny - dy) * height * 0.5,
-                        ];
-                        let [right, bottom] = [
-                            (nx + dx + 1.0) * width * 0.5,
-                            (1.0 - ny + dy) * height * 0.5,
-                        ];
-                        let [l, t] = min;
-                        let [r, b] = max;
-                        min = [l.min(left), t.min(top)];
-                        max = [r.max(right), b.max(bottom)];
-                    }
-                }
-            }
-        }
-        let [left, top] = min.map(f64::floor);
-        let [right, bottom] = max.map(f64::ceil);
-        let x = left.clamp(0.0, width) as u32;
-        let y = top.clamp(0.0, height) as u32;
-        Some([
-            x,
-            y,
-            (right.clamp(0.0, width) as u32).saturating_sub(x),
-            (bottom.clamp(0.0, height) as u32).saturating_sub(y),
-        ])
+            .find(|view| view.id == ctx.viewport_id && !view.picking)?
+            .outline_bounds
+            .rect()
     }
 
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {
         let Some(p) = &self.pipelines else {
             return;
         };
-        let Some(view) = self.views.iter().find(|view| view.id == ctx.viewport_id) else {
+        let Some(view) = self.views.iter().find(|view| {
+            view.id == ctx.viewport_id && view.picking == (phase == DrawPhase::Picking)
+        }) else {
             return;
         };
 
@@ -1171,7 +1247,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     }
                 }
             }
-            DrawPhase::OutlineMask => self.paint_outline_mask(&p.mask, pass, ctx),
+            DrawPhase::OutlineMask => {
+                self.paint_outline_mask(
+                    &p.mask,
+                    p.packed.as_ref().map(|packed| &packed.mask),
+                    pass,
+                    ctx,
+                );
+            }
             DrawPhase::Picking => {
                 let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
                     if let Some(object) = view.draws.get(index)
