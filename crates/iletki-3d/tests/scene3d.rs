@@ -381,3 +381,55 @@ fn shared_scene_releases_bindings_for_closed_viewports() {
     drop(active);
     assert_eq!(scene.prune_closed_viewports(), 1);
 }
+
+#[test]
+fn interactive_lod_preserves_near_views_pick_geometry_and_idle_image() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    let id = PickId::new(1, 29, 7);
+    let [a, b, c, d] = [
+        Vec3::new(-1.0, -1.0, 0.0),
+        Vec3::new(1.0, -1.0, 0.0),
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(-1.0, 1.0, 0.0),
+    ];
+    let mut full = Mesh3D::at_origin(Vec3::ZERO);
+    full.push_quad(a, b, c, d, [30, 235, 70, 255], id);
+    full.push_quad(a, b, c, d, [30, 235, 70, 255], id);
+    let mut coarse = Mesh3D::at_origin(Vec3::ZERO);
+    coarse.push_quad(a, b, c, d, [210, 50, 30, 255], PickId::NONE);
+    let mut scene = Scene3DLayer::new(1);
+    scene.insert_with_lod(full, coarse, 0.1);
+    let camera = |span| Camera::ortho_3d(Vec3::Z * 10.0, Vec3::ZERO, Vec3::Y, span, 0.05, 100.0);
+    let render = |scene: &mut Scene3DLayer, host: &mut ViewportHost, span| {
+        *host.camera_mut() = camera(span);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
+        queue.submit([encoder.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap().pixels
+    };
+    let pick = |scene: &mut Scene3DLayer, host: &mut ViewportHost| {
+        host.pick_rect_blocking(&device, &queue, &(), &mut [scene], [62, 62, 5, 5])
+            .unwrap()
+    };
+
+    let near = render(&mut scene, &mut host, 4.0);
+    let far = render(&mut scene, &mut host, 64.0);
+    let hits = pick(&mut scene, &mut host);
+    assert_eq!(hits.first().unwrap().id, id);
+    scene.set_interactive_lod(Some(0.5));
+    assert_eq!(near, render(&mut scene, &mut host, 4.0));
+    assert_ne!(far, render(&mut scene, &mut host, 64.0));
+    assert_eq!(hits, pick(&mut scene, &mut host));
+    scene.set_interactive_lod(None);
+    assert_eq!(far, render(&mut scene, &mut host, 64.0));
+}

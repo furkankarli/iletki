@@ -309,3 +309,24 @@ driver, visible geometry, camera, lighting, MSAA and output format. Measure init
 steady-state rendering, cache hits and presentation as separate workloads. Use enough samples for
 any tail percentiles you publish. Large-world precision requires a measured coordinate or
 projection error over a camera path.
+
+### Interactive geometry detail
+
+The optional coarse fixture keeps each chunk's object ID and origin. The converter
+reports a world-space error bound to pass explicitly to the benchmark. It retains
+collapsed triangles whose snapped point or edge has no support in the coarse mesh.
+The renderer uses coarse faces only under the active half-pixel budget and checks
+the error separately for each viewport. Edges, outlines, and picking use full geometry.
+
+```sh
+python3 docs/benchmarks/repro/convert-model.py lod out/hospital/hospital-lod.iltmesh \
+  out/hospital/hospital.iltmesh --cell-size 0.05
+```
+
+Use `ILETKI_ASSEMBLY_LOD` and `ILETKI_ASSEMBLY_LOD_ERROR` for the headless benchmark.
+Set `ILETKI_ASSEMBLY_IMAGES=1` to save row-major RGBA8 frames at three orbit
+positions for each viewport after timing. The image filenames include their dimensions.
+For the window benchmark, pass `--scene` with the full fixture alongside
+`--lod-fixture` and `--lod-world-error`. The demo switches back to full geometry
+when the drag ends or after 120 ms without camera motion. Report the LOD and
+full-geometry measurements separately. The opted-in scene holds both representations.

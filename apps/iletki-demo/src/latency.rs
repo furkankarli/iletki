@@ -76,6 +76,8 @@ pub(crate) struct Options {
     pub(crate) style: Style,
     pub(crate) dual: bool,
     pub(crate) full_hd: bool,
+    pub(crate) lod_fixture: Option<PathBuf>,
+    pub(crate) lod_error: Option<f64>,
     pub(crate) notify: bool,
     pub(crate) present: Option<wgpu::PresentMode>,
     pub(crate) depth: Option<u32>,
@@ -102,6 +104,8 @@ impl Options {
             style: Style::Faces,
             dual: false,
             full_hd: false,
+            lod_fixture: None,
+            lod_error: None,
             notify: false,
             present: None,
             depth: None,
@@ -116,6 +120,10 @@ impl Options {
                 Some("--dual") => config.dual = true,
                 Some("--1080p") => config.full_hd = true,
                 Some("--notify-present") => config.notify = true,
+                Some("--lod-fixture") => {
+                    config.lod_fixture =
+                        Some(args.next().ok_or("missing LOD fixture path")?.into());
+                }
                 Some("--scene") => {
                     let value = args.next().ok_or("missing scene")?;
                     config.scene = match value.to_str() {
@@ -158,6 +166,13 @@ impl Options {
                         (Some("--motion"), "section") => config.motion = Motion::Section,
                         (Some("--motion"), "edit") => config.motion = Motion::Edit,
                         (Some("--motion"), "combined") => config.motion = Motion::Combined,
+                        (Some("--lod-world-error"), _) => {
+                            let error: f64 = value.parse().map_err(|_| "invalid LOD error")?;
+                            if !error.is_finite() || error < 0.0 {
+                                return Err("LOD error must be finite and nonnegative".into());
+                            }
+                            config.lod_error = Some(error);
+                        }
                         (Some("--rect-size"), "256") => config.rect_size = 256,
                         (Some("--rect-size"), "512") => config.rect_size = 512,
                         (Some("--input-hz"), _) => {
@@ -179,6 +194,11 @@ impl Options {
         }
         if config.action == Action::Edit && matches!(config.scene, Scene::Demo) {
             return Err("edit replay requires the wide or model scene".into());
+        }
+        if config.lod_fixture.is_some() != config.lod_error.is_some()
+            || (config.lod_fixture.is_some() && !matches!(config.scene, Scene::Model(_)))
+        {
+            return Err("LOD requires a model scene, --lod-fixture, and --lod-world-error".into());
         }
         if config.motion != Motion::Static
             && (config.action != Action::Marquee || matches!(config.scene, Scene::Demo))

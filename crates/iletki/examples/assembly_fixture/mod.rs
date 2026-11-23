@@ -94,3 +94,22 @@ pub(super) fn load(path: &Path) -> io::Result<Fixture> {
     }
     Ok(fixture)
 }
+
+pub(super) fn load_lod(path: &Path, full: &Fixture) -> io::Result<Vec<Mesh3D>> {
+    let coarse = load(path)?;
+    if coarse.meshes.len() != full.meshes.len()
+        || !coarse
+            .meshes
+            .iter()
+            .zip(&full.meshes)
+            .all(|(coarse, full)| {
+                coarse.origin == full.origin && coarse.pick_ids.first() == full.pick_ids.first()
+            })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LOD fixture IDs and origins must match the full fixture",
+        ));
+    }
+    Ok(coarse.meshes)
+}

@@ -15,6 +15,7 @@ mod face_batch;
 pub mod gizmo;
 pub mod grid;
 pub mod instanced;
+mod lod;
 mod objects;
 mod outline_bounds;
 pub mod scene;

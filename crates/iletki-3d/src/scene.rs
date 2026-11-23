@@ -3,6 +3,7 @@
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
 use crate::face_batch::{self, PageBuilder, VertexRange};
+use crate::lod::LodProjection;
 use crate::objects::{
     PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume, ViewObjects,
     bounds_cover_vertices,
@@ -59,6 +60,28 @@ struct ChunkEntry {
     pick_bounds_trusted: bool,
     section_bounds_trusted: bool,
     small_packed: bool,
+    lod: Option<Box<ChunkLod>>,
+}
+
+struct ChunkLod {
+    pending: Vec<Vertex3D>,
+    vertex_buf: Option<VertexRange>,
+    vertex_count: u32,
+    max_world_error: f64,
+}
+
+impl ChunkEntry {
+    fn color_faces(&self, use_lod: bool) -> Option<(&VertexRange, u32)> {
+        if use_lod
+            && let Some(lod) = &self.lod
+            && let Some(vertices) = &lod.vertex_buf
+        {
+            return Some((vertices, lod.vertex_count));
+        }
+        self.vertex_buf
+            .as_ref()
+            .map(|vertices| (vertices, self.vertex_count))
+    }
 }
 
 struct Pipelines {
@@ -253,6 +276,7 @@ pub struct Scene3DLayer {
     selected_slots: BTreeSet<usize>,
     pending_meshes: usize,
     has_repeated_pages: bool,
+    interactive_lod: Option<f64>,
     section_groups: Vec<Option<SectionGroup>>,
     section_relations: Vec<(SectionRelation, bool)>,
     views: Vec<ViewObjects>,
@@ -295,6 +319,7 @@ impl Scene3DLayer {
             selected_slots: BTreeSet::new(),
             pending_meshes: 0,
             has_repeated_pages: false,
+            interactive_lod: None,
             section_groups: Vec::new(),
             section_relations: Vec::new(),
             views: Vec::new(),
@@ -394,6 +419,7 @@ impl Scene3DLayer {
             pick_bounds_trusted: false,
             section_bounds_trusted: false,
             small_packed: false,
+            lod: None,
         };
         // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
         if let Some(Reverse(index)) = self.free_chunks.pop()
@@ -405,6 +431,53 @@ impl Scene3DLayer {
         let index = self.chunks.len();
         self.chunks.push(Some(entry));
         Chunk3DId { index, generation }
+    }
+
+    /// Inserts a mesh with an optional lower-detail copy for interactive color rendering.
+    ///
+    /// Supply a conservative bound on the geometric error in world units. The coarse mesh
+    /// must share the full mesh's origin and stay inside its bounds. Its faces are used only
+    /// while an interactive pixel-error budget is active. Edges, outlines and picking use
+    /// the original mesh. Invalid or non-reducing coarse meshes fall back to the original.
+    pub fn insert_with_lod(
+        &mut self,
+        mesh: Mesh3D,
+        coarse: Mesh3D,
+        max_world_error: f64,
+    ) -> Chunk3DId {
+        let compatible = max_world_error.is_finite()
+            && max_world_error >= 0.0
+            && mesh.origin == coarse.origin
+            && coarse.vertices.len() < mesh.vertices.len()
+            && !coarse.vertices.is_empty()
+            && coarse.vertices.len().is_multiple_of(3)
+            && bounds_cover_vertices(mesh.local_bounds, &coarse.vertices);
+        let id = self.insert(mesh);
+        if compatible
+            && let Ok(vertex_count) = u32::try_from(coarse.vertices.len())
+            && let Some(chunk) = self.chunk_mut(id)
+        {
+            chunk.lod = Some(Box::new(ChunkLod {
+                pending: coarse.vertices,
+                vertex_buf: None,
+                vertex_count,
+                max_world_error,
+            }));
+        }
+        id
+    }
+
+    /// Sets the maximum projected error in physical pixels while the camera is moving.
+    ///
+    /// Pass `None` when movement stops to restore the full geometry on the next redraw.
+    /// All viewports sharing this scene evaluate the budget with their own camera and size.
+    /// The default is full geometry.
+    pub fn set_interactive_lod(&mut self, max_pixel_error: Option<f64>) {
+        let budget = max_pixel_error.filter(|value| value.is_finite() && *value > 0.0);
+        if self.interactive_lod != budget {
+            self.interactive_lod = budget;
+            self.revision.mark_static();
+        }
     }
 
     /// Updates a chunk's world origin (for moving 3D objects without re-uploading vertices).
@@ -999,6 +1072,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let mut uploaded_faces = Vec::new();
         let mut edge_builder = PageBuilder::new(repeat_pages);
         let mut uploaded_edges = Vec::new();
+        let mut lod_builder = PageBuilder::new(false);
+        let mut uploaded_lods = Vec::new();
 
         let upload_slots = if self.pending_meshes == 0 {
             0
@@ -1026,6 +1101,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     // A shared face page can contain both pickable and unpickable chunks.
                     bytes = bytes
                         .saturating_add(mesh.vertices.len().saturating_mul(size_of::<[u32; 2]>()));
+                }
+                if let Some(lod) = &chunk.lod {
+                    bytes = bytes.saturating_add(
+                        lod.pending
+                            .len()
+                            .saturating_mul(size_of::<Vertex3D>() + size_of::<u32>()),
+                    );
                 }
                 if !ctx.uploads.reserve(bytes) {
                     pending = true;
@@ -1109,6 +1191,28 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         )));
                     }
                 }
+                if let Some(lod) = &mut chunk.lod {
+                    let vertices = std::mem::take(&mut lod.pending);
+                    if pack_geometry && PageBuilder::can_pack(&vertices, 3) {
+                        lod_builder.push(
+                            chunk_index,
+                            &vertices,
+                            None,
+                            ctx.device,
+                            &mut uploaded_lods,
+                        );
+                    } else if (size_of_val(vertices.as_slice()) as u64)
+                        <= ctx.device.limits().max_buffer_size
+                    {
+                        lod.vertex_buf = Some(VertexRange::Direct(ctx.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("iletki-3d coarse vertices"),
+                                contents: bytemuck::cast_slice(&vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            },
+                        )));
+                    }
+                }
                 ctx.uploads.finish_upload();
             }
         }
@@ -1125,6 +1229,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             self.has_repeated_pages |= edges.repeats();
             if let Some(Some(chunk)) = self.chunks.get_mut(index) {
                 chunk.edge_buf = Some(edges);
+            }
+        }
+        lod_builder.flush(ctx.device, &mut uploaded_lods);
+        for (index, vertices) in uploaded_lods {
+            if let Some(Some(chunk)) = self.chunks.get_mut(index)
+                && let Some(lod) = &mut chunk.lod
+            {
+                lod.vertex_buf = Some(vertices);
             }
         }
 
@@ -1198,6 +1310,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let visibility = iletki_wgpu::profiling::scope("scene.visibility");
         let projection = ctx.camera.view_proj_relative(ctx.logical_size);
+        let lod_projection = if picking.is_none() {
+            self.interactive_lod
+                .map(|error| LodProjection::new(projection, ctx.active_px, error))
+        } else {
+            None
+        };
         let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
         let cull_sections = picking.is_none() && section == Some(SectionAa::Raster);
@@ -1250,6 +1368,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let mut opaque_triangles = 0;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let mut deferred_chunks = 0;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let mut lod_chunks = 0;
         for (group_index, chunks) in self.chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
             let (relation, inside_frustum) = self
                 .section_relations
@@ -1305,9 +1425,31 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             })
                         }
                     };
+                let use_lod = !section_culled
+                    && chunk.pick_bounds_trusted
+                    && lod_projection.as_ref().is_some_and(|projection| {
+                        chunk.lod.as_ref().is_some_and(|lod| {
+                            let [x, y, z] = offset_rel.map(f64::from);
+                            lod.vertex_buf.is_some()
+                                && projection.allows(
+                                    chunk.local_bounds,
+                                    Vec3::new(x, y, z),
+                                    lod.max_world_error,
+                                )
+                        })
+                    });
                 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                 if profiling && picking.is_none() {
-                    let triangles = chunk.vertex_count as usize / 3;
+                    let triangles = if use_lod {
+                        lod_chunks += 1;
+                        chunk
+                            .lod
+                            .as_ref()
+                            .map_or(chunk.vertex_count, |lod| lod.vertex_count)
+                    } else {
+                        chunk.vertex_count
+                    } as usize
+                        / 3;
                     if section_culled {
                         culled_chunks += 1;
                         culled_triangles += triangles;
@@ -1319,6 +1461,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 view.draws.push(PreparedObject {
                     chunk: group_index * SECTION_GROUP_SIZE + slot,
                     section_culled,
+                    use_lod,
                     bridge_section_gap: bridge_group,
                     direct_slot: None,
                     uniforms: ObjectUniforms {
@@ -1353,9 +1496,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     continue;
                 };
                 let mut direct = packed_layout.is_none()
-                    || (picking.is_none() && chunk.selected && !packed_mask);
+                    || (picking.is_none() && chunk.selected && !packed_mask)
+                    || matches!(chunk.vertex_buf, Some(VertexRange::Direct(_)));
                 if packed_layout.is_some() {
-                    if let Some(geometry) = &chunk.vertex_buf {
+                    if let Some((geometry, _)) = chunk.color_faces(object.use_lod) {
                         // A direct face can still be selected even when its opaque draw is culled.
                         direct |= matches!(geometry, VertexRange::Direct(_));
                         view.faces.push_color(
@@ -1403,6 +1547,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             iletki_wgpu::profiling::count("scene.section_crossing_groups", crossing_groups);
             iletki_wgpu::profiling::count("scene.section_chunk_tests", section_tests);
             iletki_wgpu::profiling::count("scene.section_deferred_chunks", deferred_chunks);
+            iletki_wgpu::profiling::count("scene.lod_chunks", lod_chunks);
             iletki_wgpu::profiling::count("scene.frustum_chunk_tests", frustum_tests);
             iletki_wgpu::profiling::count(
                 "scene.opaque_triangles",
@@ -1535,12 +1680,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                             return;
                         };
-                        let (geometry, count) = if edges {
-                            (&chunk.edge_buf, chunk.edge_count)
+                        let faces = if edges {
+                            chunk.edge_buf.as_ref().map(|edge| (edge, chunk.edge_count))
                         } else {
-                            (&chunk.vertex_buf, chunk.vertex_count)
+                            chunk.color_faces(object.use_lod)
                         };
-                        if let Some(buffer) = geometry
+                        if let Some((buffer, count)) = faces
                             && view.bind(pass, index, p.dynamic_uniforms)
                         {
                             pass.set_vertex_buffer(0, buffer.slice());

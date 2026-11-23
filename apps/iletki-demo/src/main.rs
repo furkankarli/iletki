@@ -49,6 +49,7 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
 const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
+const LOD_IDLE_DELAY: Duration = Duration::from_millis(120);
 
 const MARQUEE_SHADER: &str = r#"
 @vertex
@@ -212,6 +213,8 @@ struct GpuState {
     bench_fit: Option<(Vec3, f64)>,
     bench_edits: Vec<(Chunk3DId, Vec3)>,
     bench_dual: bool,
+    lod_enabled: bool,
+    lod_until: Option<Instant>,
     last_pick_text: String,
     timing_samples: u8,
     title_updated_at: Instant,
@@ -329,6 +332,7 @@ impl GpuState {
                 let style = bench.as_ref().map_or(latency::Style::Faces, |b| b.style);
                 bench_scene(
                     (0..20_000).map(|index| latency::wide_mesh(index, style)),
+                    None,
                     &mut bench_edits,
                 )
             }
@@ -342,11 +346,21 @@ impl GpuState {
                     order
                         .into_iter()
                         .map(|index| latency::wide_mesh(index, style)),
+                    None,
                     &mut bench_edits,
                 )
             }
             Some(latency::Scene::Model(path)) => {
                 let fixture = assembly_fixture::load(path).map_err(|error| error.to_string())?;
+                let lod = bench
+                    .as_ref()
+                    .and_then(|options| options.lod_fixture.as_ref().zip(options.lod_error))
+                    .map(|(proxy, error)| {
+                        assembly_fixture::load_lod(proxy, &fixture)
+                            .map(|meshes| (meshes.into_iter(), error))
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?;
                 let center = fixture.bounds.center().ok_or("model bounds are empty")?;
                 let radius = fixture.bounds.radius() * 2.6;
                 if !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
@@ -358,7 +372,7 @@ impl GpuState {
                     fixture.meshes.len(),
                     fixture.triangles
                 );
-                bench_scene(fixture.meshes, &mut bench_edits)
+                bench_scene(fixture.meshes, lod, &mut bench_edits)
             }
             _ => build_arch_3d(),
         };
@@ -376,6 +390,9 @@ impl GpuState {
             scene_2d.upload_static_mesh(&device, &queue, &mesh_2d);
         }
         let bench_dual = bench.as_ref().is_some_and(|options| options.dual);
+        let lod_enabled = bench
+            .as_ref()
+            .is_some_and(|options| options.lod_fixture.is_some());
         let clip_enabled = bench
             .as_ref()
             .is_some_and(|options| options.style == latency::Style::Section);
@@ -448,6 +465,8 @@ impl GpuState {
             bench_fit,
             bench_edits,
             bench_dual,
+            lod_enabled,
+            lod_until: None,
             last_pick_text: String::from("Click any 3D object to pick"),
             timing_samples: 0,
             title_updated_at: Instant::now(),
@@ -1084,14 +1103,32 @@ impl GpuState {
     }
 
     fn dispatch_input(&mut self, event: &ViewportInput) -> bool {
+        let before = self.lod_enabled.then(|| self.vp_main.camera().clone());
         let outcome = if self.active_scene == DemoScene::Cad2D {
             self.vp_main.on_input(event, &mut self.cad2d_rig)
         } else {
             self.vp_main.on_input(event, &mut self.orbit_rig)
         };
+        if before.is_some_and(|camera| camera != *self.vp_main.camera()) {
+            self.camera_moved(Instant::now());
+        }
         outcome
             .iter()
             .any(|command| matches!(command, iletki::ViewportCommand::RequestRedraw))
+    }
+
+    fn camera_moved(&mut self, now: Instant) {
+        if self.lod_enabled && self.active_scene == DemoScene::Arch3D {
+            self.scene_3d.set_interactive_lod(Some(0.5));
+            self.lod_until = Some(now + LOD_IDLE_DELAY);
+        }
+    }
+
+    fn restore_full_detail(&mut self) {
+        if self.lod_until.take().is_some() {
+            self.scene_3d.set_interactive_lod(None);
+            self.window.request_redraw();
+        }
     }
 
     fn track_live_input(&mut self, kind: &'static str, started: Instant) {
@@ -1163,6 +1200,7 @@ impl GpuState {
                         55_f64.to_radians(),
                         radius / 1500.0,
                     );
+                    self.camera_moved(now);
                 }
                 if matches!(motion, latency::Motion::Edit | latency::Motion::Combined)
                     && tick.is_multiple_of(6)
@@ -1206,6 +1244,7 @@ impl GpuState {
                 }
                 self.request_pick(rect, PickKind::Preview, Some(event));
                 if let Some(release) = release {
+                    self.restore_full_detail();
                     self.request_pick(rect, PickKind::Commit, Some(release));
                 }
                 return;
@@ -1298,6 +1337,11 @@ impl GpuState {
             let changed = self.transition.tick(dt, self.vp_main.camera_mut());
             if changed {
                 self.vp_main.mark_dirty(DirtyFlags::CAMERA);
+                if self.transition.is_active() {
+                    self.camera_moved(frame_start);
+                } else {
+                    self.restore_full_detail();
+                }
             }
         }
         let output = match self.surface.get_current_texture() {
@@ -1593,12 +1637,18 @@ impl ApplicationHandler for DemoApp {
             state.poll_pick();
             let now = Instant::now();
             state.replay_latency(now);
+            if state.lod_until.is_some_and(|deadline| now >= deadline) {
+                state.restore_full_detail();
+            }
             state.submit_queued_pick(Instant::now());
             let mut deadline = state
                 .pending_pick
                 .as_ref()
                 .map(|_| Instant::now() + PICK_POLL_INTERVAL)
                 .or_else(|| state.queued_pick_deadline());
+            if let Some(next) = state.lod_until {
+                deadline = Some(deadline.map_or(next, |existing| existing.min(next)));
+            }
             if let Some(trace) = &state.latency {
                 if trace.pending_gpu() {
                     let _ = state.device.poll(wgpu::PollType::Poll);
@@ -1652,6 +1702,7 @@ impl ApplicationHandler for DemoApp {
             WindowEvent::Focused(false) if !replay => {
                 s.press_pos = None;
                 s.cancel_selection();
+                s.restore_full_detail();
                 s.dispatch_input(&ViewportInput::FocusLost);
             }
             WindowEvent::ModifiersChanged(m) if !replay => {
@@ -1740,6 +1791,9 @@ impl ApplicationHandler for DemoApp {
                 if let Some(btn) = mapped {
                     if btn == PointerButton::Middle && state == ElementState::Pressed {
                         s.transition.cancel();
+                    }
+                    if btn == PointerButton::Middle && state == ElementState::Released {
+                        s.restore_full_detail();
                     }
                     if btn == PointerButton::Primary {
                         if state == ElementState::Pressed
@@ -1848,6 +1902,7 @@ impl ApplicationHandler for DemoApp {
 
 fn bench_scene(
     meshes: impl IntoIterator<Item = Mesh3D>,
+    mut lod: Option<(std::vec::IntoIter<Mesh3D>, f64)>,
     edits: &mut Vec<(Chunk3DId, Vec3)>,
 ) -> (Scene3DLayer, Vec<ChunkMeta>) {
     let mut scene = Scene3DLayer::new(1);
@@ -1855,7 +1910,13 @@ fn bench_scene(
     for (index, mesh) in meshes.into_iter().enumerate() {
         let origin = mesh.origin;
         let pick = mesh.pick_ids.first().copied().map(PickId::from_rg32u);
-        let id = scene.insert(mesh);
+        let id = if let Some((proxies, error)) = &mut lod
+            && let Some(proxy) = proxies.next()
+        {
+            scene.insert_with_lod(mesh, proxy, *error)
+        } else {
+            scene.insert(mesh)
+        };
         if index % 100 == 0 {
             edits.push((id, origin));
         }

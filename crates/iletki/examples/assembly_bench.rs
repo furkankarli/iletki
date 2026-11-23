@@ -20,7 +20,7 @@ mod assembly_fixture;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use iletki::gpu::{profiling, wgpu};
+    use iletki::gpu::{RgbaImage, profiling, wgpu};
     use iletki::{
         Camera, Chunk3DId, Mesh3D, PickHit, PickId, Plane, Scene3DLayer, Vec3, ViewportConfig,
         ViewportHost,
@@ -28,7 +28,7 @@ mod native {
     use std::fs::{self, File};
     use std::future::Future;
     use std::io::{BufWriter, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
@@ -273,6 +273,7 @@ mod native {
         samples: BufWriter<File>,
         profile: BufWriter<File>,
         memory: Option<BufWriter<File>>,
+        images: Option<PathBuf>,
         run: u32,
         variant: String,
         size: [u32; 2],
@@ -419,7 +420,8 @@ mod native {
                 (true, _) => 8,
                 (false, _) => 0,
             };
-            let signatures = std::env::var_os("ILETKI_ASSEMBLY_SIGNATURES").is_some();
+            let signatures =
+                self.images.is_some() || std::env::var_os("ILETKI_ASSEMBLY_SIGNATURES").is_some();
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
             let overlap = std::env::var_os("ILETKI_ASSEMBLY_OVERLAP").is_some();
@@ -493,9 +495,12 @@ mod native {
                         {
                             return Err("the model produced a uniform reference image".into());
                         }
+                        let phase = frame.saturating_sub(trace_end);
+                        self.record_image(case, phase, "main", &image)?;
                         let hash = hash_bytes(image.pixels);
                         if let Some(second) = second.as_ref() {
                             let image = second.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
+                            self.record_image(case, phase, "second", &image)?;
                             format!("{hash:016x}/{:016x}", hash_bytes(image.pixels))
                         } else {
                             format!("{hash:016x}")
@@ -519,6 +524,25 @@ mod native {
                         }
                     }
                 }
+            }
+            Ok(())
+        }
+
+        fn record_image(
+            &self,
+            case: Case,
+            phase: u32,
+            view: &str,
+            image: &RgbaImage,
+        ) -> Result<(), Error> {
+            if let Some(directory) = &self.images
+                && phase.is_multiple_of(10)
+            {
+                let filename = format!(
+                    "{}-{}-{phase:02}-{view}-{}x{}.rgba",
+                    case.chunks, case.view, image.width, image.height,
+                );
+                fs::write(directory.join(filename), &image.pixels)?;
             }
             Ok(())
         }
@@ -651,11 +675,19 @@ mod native {
         } else {
             None
         };
+        let images = if std::env::var_os("ILETKI_ASSEMBLY_IMAGES").is_some() {
+            let directory = output.join("images");
+            fs::create_dir_all(&directory)?;
+            Some(directory)
+        } else {
+            None
+        };
         let mut bench = Benchmark {
             gpu: &gpu,
             samples: BufWriter::new(File::create(output.join("frames.csv"))?),
             profile: BufWriter::new(File::create(output.join("profile.csv"))?),
             memory,
+            images,
             run,
             variant,
             size: viewport_size()?,
@@ -673,6 +705,18 @@ mod native {
         if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
             let started = Instant::now();
             let fixture = crate::assembly_fixture::load(Path::new(&path))?;
+            let lod = std::env::var_os("ILETKI_ASSEMBLY_LOD")
+                .map(|path| crate::assembly_fixture::load_lod(Path::new(&path), &fixture))
+                .transpose()?;
+            let lod_error = if lod.is_some() {
+                let error: f64 = std::env::var("ILETKI_ASSEMBLY_LOD_ERROR")?.parse()?;
+                if !error.is_finite() || error < 0.0 {
+                    return Err("LOD error must be finite and nonnegative".into());
+                }
+                error
+            } else {
+                0.0
+            };
             let decoded_ms = elapsed_ms(started);
             let chunks = u32::try_from(fixture.meshes.len())?;
             let focus = fixture.bounds.center().ok_or("model has no bounds")?;
@@ -695,10 +739,18 @@ mod native {
             let insert_started = Instant::now();
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_geometry(pack);
+            if lod.is_some() {
+                scene.set_interactive_lod(Some(0.5));
+            }
+            let mut lod = lod.map(Vec::into_iter);
             let mut edits = Vec::new();
             for (index, mesh) in fixture.meshes.into_iter().enumerate() {
                 let origin = mesh.origin;
-                let id = scene.insert(mesh);
+                let id = if let Some(proxy) = lod.as_mut().and_then(Iterator::next) {
+                    scene.insert_with_lod(mesh, proxy, lod_error)
+                } else {
+                    scene.insert(mesh)
+                };
                 if index % 100 == 0 {
                     edits.push((id, origin));
                 }
