@@ -157,8 +157,9 @@ For simultaneous orbit, live section, scene edits, and marquee previews, use
 the window between an orthographic view on the left and the perspective view on
 the right. The replay picks in right-panel pixels and shows the selection in both
 views. Use `--1080p` to run borderless on a 1920×1080 display and
-`--scene shuffled-100k` for the 100,000-part permutation. Confirm the actual drawable
-size in `monitor.txt`. The replay holds its final camera and scene
+`--scene shuffled-100k` for the 100,000-part permutation. Use `--monitor NAME` with
+`--1080p` to pin paired runs to the same output. Confirm the output, refresh rate,
+and drawable size in `monitor.txt`. The replay holds its final camera and scene
 while the release request finishes. Compare the applied preview rate, the input
 to present-return percentiles, and the release digest between builds.
 

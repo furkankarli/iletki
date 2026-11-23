@@ -207,7 +207,7 @@ fn translated_corner(local: Vec3, [ox, oy, oz]: [f32; 3]) -> [f32; 3] {
     [x + ox, y + oy, z + oz]
 }
 
-/// Conservative rejection for the raster clip-distance path.
+/// Conservative rejection for the color and picking section passes.
 pub(crate) struct SectionVolume {
     planes: [[f64; 4]; MAX_CLIP_PLANES],
     count: usize,
@@ -328,8 +328,8 @@ impl SectionVolume {
             let (near_y, far_y) = if y >= 0.0 { (ly, hy) } else { (hy, ly) };
             let (near_z, far_z) = if z >= 0.0 { (lz, hz) } else { (hz, lz) };
             let magnitude = x.abs() * mx + y.abs() * my + z.abs() * mz + d.abs();
-            // The raster shader adds the camera WGSL clip tolerance. Account for all f32
-            // arithmetic (including fused evaluation) before rejecting a whole primitive.
+            // The shader adds the camera WGSL clip tolerance. Allow for f32 interpolation
+            // and dot-product rounding before rejecting a whole primitive.
             let tolerance = f64::from(1e-4_f32);
             let error = (magnitude + tolerance) * (16.0 * f64::from(f32::EPSILON));
             if magnitude >= f64::from(f32::MAX) * 0.5 {
@@ -405,8 +405,13 @@ impl PickVolume {
         }
     }
 
-    pub(crate) fn intersects(&self, bounds: Bounds3, offset: [f32; 3]) -> bool {
-        let Some(([lx, ly, lz], [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
+    pub(crate) fn intersects(
+        &self,
+        bounds: Bounds3,
+        offset: [f32; 3],
+        section: Option<&SectionVolume>,
+    ) -> bool {
+        let Some((lo @ [lx, ly, lz], hi @ [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
             return true;
         };
         let [mx, my, mz] = [
@@ -422,7 +427,8 @@ impl PickVolume {
                 magnitude * (16.0 * f64::from(f32::EPSILON)) + f64::from(f32::MIN_POSITIVE);
             // Uncertain precision or overflow always keeps the object in the candidate set.
             !distance.is_finite() || magnitude >= f64::from(f32::MAX) * 0.5 || distance >= -rounding
-        })
+        }) && section
+            .is_none_or(|volume| volume.classify(lo, hi, false) != SectionRelation::Outside)
     }
 }
 

@@ -1612,9 +1612,21 @@ impl ApplicationHandler for DemoApp {
         let mut attrs = WindowAttributes::default()
             .with_title("iletki-demo")
             .with_inner_size(PhysicalSize::new(width, height));
-        if self.bench.as_ref().is_some_and(|bench| bench.full_hd) {
-            attrs =
-                attrs.with_fullscreen(Some(Fullscreen::Borderless(event_loop.primary_monitor())));
+        if let Some(bench) = self.bench.as_ref().filter(|bench| bench.full_hd) {
+            let monitor = if let Some(name) = &bench.monitor {
+                let Some(monitor) = event_loop
+                    .available_monitors()
+                    .find(|monitor| monitor.name().as_ref() == Some(name))
+                else {
+                    eprintln!("latency benchmark monitor not found: {name}");
+                    event_loop.exit();
+                    return;
+                };
+                Some(monitor)
+            } else {
+                event_loop.primary_monitor()
+            };
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         }
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();

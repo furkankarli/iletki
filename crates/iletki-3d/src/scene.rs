@@ -371,7 +371,7 @@ impl Scene3DLayer {
         self.profile_repeated_pages = enabled;
     }
 
-    /// Enables conservative CPU rejection in raster sections for A/B profiling.
+    /// Enables conservative CPU rejection in color and picking sections for A/B profiling.
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     pub fn set_profile_section_culling(&mut self, enabled: bool) {
         if self.profile_section_culling != enabled {
@@ -1318,10 +1318,11 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         };
         let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
-        let cull_sections = picking.is_none() && section == Some(SectionAa::Raster);
+        let cull_sections = !ctx.camera.clip_planes().is_empty()
+            && (picking.is_some() || section == Some(SectionAa::Raster));
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let cull_sections = cull_sections && self.profile_section_culling;
-        let bridge_sections = cull_sections && pack_geometry;
+        let bridge_sections = picking.is_none() && cull_sections && pack_geometry;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let bridge_sections = bridge_sections && self.profile_section_bridging;
         let section_volume = cull_sections.then(|| SectionVolume::new(ctx.camera));
@@ -1347,7 +1348,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     bounds
                 });
                 let relation = group.section_relation(volume, cam_pos);
-                let inside_frustum = group.inside_frustum(&frustum, cam_pos);
+                let inside_frustum = picking.is_none() && group.inside_frustum(&frustum, cam_pos);
                 crossing_groups +=
                     usize::from(relation == SectionRelation::Crossing && inside_frustum);
                 self.section_relations.push((relation, inside_frustum));
@@ -1378,6 +1379,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 .unwrap_or((SectionRelation::Crossing, false));
             let bridge_group = bridge_sections && relation == SectionRelation::Crossing;
             let defer_small = bridge_group && inside_frustum;
+            let pick_section = section_volume
+                .as_ref()
+                .filter(|_| relation != SectionRelation::Inside);
             for (slot, chunk) in chunks.iter().enumerate() {
                 let Some(chunk) = chunk else { continue };
                 if !chunk.visible || (chunk.vertex_count == 0 && chunk.edge_count == 0) {
@@ -1386,8 +1390,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 let offset_rel = (chunk.origin - cam_pos).to_f32();
                 if let Some(volume) = &pick_volume {
                     if !chunk.has_picks
+                        || (relation == SectionRelation::Outside && chunk.section_bounds_trusted)
                         || (chunk.pick_bounds_trusted
-                            && !volume.intersects(chunk.local_bounds, offset_rel))
+                            && !volume.intersects(chunk.local_bounds, offset_rel, pick_section))
                     {
                         continue;
                     }
@@ -1404,7 +1409,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         continue;
                     }
                 }
-                let section_culled = chunk.section_bounds_trusted
+                let section_culled = picking.is_none()
+                    && chunk.section_bounds_trusted
                     && match relation {
                         SectionRelation::Outside => true,
                         SectionRelation::Inside => false,

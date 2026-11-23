@@ -76,6 +76,7 @@ pub(crate) struct Options {
     pub(crate) style: Style,
     pub(crate) dual: bool,
     pub(crate) full_hd: bool,
+    pub(crate) monitor: Option<String>,
     pub(crate) lod_fixture: Option<PathBuf>,
     pub(crate) lod_error: Option<f64>,
     pub(crate) notify: bool,
@@ -104,6 +105,7 @@ impl Options {
             style: Style::Faces,
             dual: false,
             full_hd: false,
+            monitor: None,
             lod_fixture: None,
             lod_error: None,
             notify: false,
@@ -146,6 +148,7 @@ impl Options {
                         (Some("--action"), "marquee") => config.action = Action::Marquee,
                         (Some("--action"), "edit") => config.action = Action::Edit,
                         (Some("--action"), "live") => config.action = Action::Live,
+                        (Some("--monitor"), _) => config.monitor = Some(value),
                         (Some("--style"), "faces") => config.style = Style::Faces,
                         (Some("--style"), "edges") => config.style = Style::Edges,
                         (Some("--style"), "edges-section") => config.style = Style::Section,
@@ -194,6 +197,9 @@ impl Options {
         }
         if config.action == Action::Edit && matches!(config.scene, Scene::Demo) {
             return Err("edit replay requires the wide or model scene".into());
+        }
+        if config.monitor.is_some() && !config.full_hd {
+            return Err("--monitor requires --1080p".into());
         }
         if config.lod_fixture.is_some() != config.lod_error.is_some()
             || (config.lod_fixture.is_some() && !matches!(config.scene, Scene::Model(_)))

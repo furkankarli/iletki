@@ -342,6 +342,35 @@ fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
     let point = hit.world_pos.unwrap();
     assert!((point - (center + Vec3::Y * 0.2)).length() < 1e-5);
 
+    // Exercise grouped rejection while keeping a face within the shader's clip tolerance.
+    for _ in 0..128 {
+        let mut hidden = Mesh3D::at_origin(center - Vec3::Y);
+        hidden.push_box(
+            Vec3::new(-0.2, -0.2, -0.2),
+            Vec3::new(0.2, 0.2, 0.2),
+            [255; 4],
+            PickId::new(1, 11, 0),
+            false,
+        );
+        scene.insert(hidden);
+    }
+    let mut boundary = Mesh3D::at_origin(center);
+    let y = -0.00005;
+    boundary.push_quad(
+        Vec3::new(-0.2, y, -0.2),
+        Vec3::new(0.2, y, -0.2),
+        Vec3::new(0.2, y, 0.2),
+        Vec3::new(-0.2, y, 0.2),
+        [255; 4],
+        PickId::new(1, 12, 0),
+    );
+    let boundary = scene.insert(boundary);
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
+        .unwrap();
+    assert_eq!(hits.first().unwrap().id, PickId::new(1, 12, 0));
+    scene.remove(boundary);
+
     // Direct Mesh3D edits can leave an AABB that excludes the uploaded triangles.
     let mut stale_bounds = Mesh3D::at_origin(center);
     stale_bounds.push_box(
@@ -352,7 +381,7 @@ fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
         false,
     );
     stale_bounds.local_bounds =
-        Bounds3::from_corners(Vec3::new(500.0, 0.0, 0.0), Vec3::new(501.0, 1.0, 1.0));
+        Bounds3::from_corners(Vec3::new(500.0, -2.0, 0.0), Vec3::new(501.0, -1.0, 1.0));
     scene.insert(stale_bounds);
     let hits = host
         .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
