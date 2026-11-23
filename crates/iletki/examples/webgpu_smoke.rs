@@ -88,7 +88,7 @@ mod web {
         }
         check_section(&adapter, &device, &queue).await?;
         Ok(format!(
-            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section and outline coverage",
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline and packed geometry",
             info.backend, info.name
         ))
     }
@@ -153,6 +153,43 @@ mod web {
         };
         if outside < 220 || !(95..=160).contains(&edge) || inside > 16 {
             return Err(format!("unexpected WebGPU outline pixels: {pixels:?}"));
+        }
+
+        scene.set_selected(chunk, false);
+        host.camera_mut().clear_clip_planes();
+        // Enough visible geometry to exercise the packed path. Keep these quads behind the
+        // original surface so the center retains its expected shading and pick ID.
+        for i in 1..=128 {
+            let mut mesh = Mesh3D::at_origin(Vec3::new(0.0, f64::from(i) * 0.01, 0.0));
+            mesh.push_quad(
+                Vec3::new(-0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, 0.5),
+                Vec3::new(-0.5, 0.0, 0.5),
+                [255, 0, 0, 255],
+                PickId::NONE,
+            );
+            scene.insert(mesh);
+        }
+        let center =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if !matches!(center.as_slice(), [r, g, b, 255] if *g > 32 && g > r && g > b) {
+            return Err(format!(
+                "unexpected WebGPU packed geometry pixel: {center:?}"
+            ));
+        }
+        let hits = host
+            .pick_rect_async(
+                device,
+                queue,
+                &(),
+                &mut [&mut scene],
+                [SIZE / 2, SIZE / 2, 1, 1],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(hits.as_slice(), [hit] if hit.id == ID) {
+            return Err(format!("unexpected WebGPU packed geometry pick: {hits:?}"));
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
-use crate::Vertex3D;
 use crate::scene::ObjectUniforms;
+use crate::{Vertex3D, face_batch::FaceDraws};
 use iletki_core::{Bounds3, Mat4, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
@@ -25,6 +25,7 @@ pub(crate) struct ViewObjects {
     pub(crate) lifetime: ViewportLifetime,
     pub(crate) draws: Vec<PreparedObject>,
     pub(crate) has_edges: bool,
+    pub(crate) faces: FaceDraws,
     pages: Vec<UniformPage>,
     staging: Vec<u8>,
     stride: usize,
@@ -48,6 +49,7 @@ impl ViewObjects {
             lifetime: ctx.viewport_lifetime(),
             draws: Vec::new(),
             has_edges: false,
+            faces: FaceDraws::default(),
             pages: Vec::new(),
             staging: Vec::new(),
             stride,

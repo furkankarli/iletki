@@ -3,6 +3,7 @@
 //! Run with `cargo run --release --locked -p iletki --features profiling --example assembly_bench
 //! -- <output-dir> <variant> <run>`. Set `ILETKI_PRIMARY_ONLY=1` to run the acceptance fixture.
 //! Set `ILETKI_ASSEMBLY_CASE=20000/wide` to isolate a particular size and view.
+//! Set `ILETKI_ASSEMBLY_MESH` to load a tessellated model fixture instead of the synthetic grid.
 
 #![allow(clippy::print_stderr)]
 
@@ -13,6 +14,9 @@ fn main() {}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     native::run()
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod assembly_fixture;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -30,8 +34,6 @@ mod native {
 
     type Error = Box<dyn std::error::Error>;
     const SIZE: [u32; 2] = [1024, 768];
-    const CLICK: [u32; 4] = [510, 382, 5, 5];
-    const MARQUEE: [u32; 4] = [384, 256, 256, 256];
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -48,6 +50,7 @@ mod native {
     struct Case {
         chunks: u32,
         view: &'static str,
+        model: Option<(Vec3, f64)>,
     }
 
     impl Case {
@@ -55,8 +58,23 @@ mod native {
             self.chunks == 4_000 && self.view == "near"
         }
 
+        fn acceptance_wide(self) -> bool {
+            self.chunks == 20_000 && self.view == "wide"
+        }
+
         fn camera(self, frame: u32, secondary: bool) -> Camera {
             let angle = f64::from(frame % 30) * std::f64::consts::TAU / 30.0;
+            if let Some((focus, radius)) = self.model {
+                let eye =
+                    focus + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius * 0.65);
+                return Camera::perspective_3d(
+                    eye,
+                    focus,
+                    Vec3::Z,
+                    55_f64.to_radians(),
+                    radius / 1500.0,
+                );
+            }
             let focus = Vec3::new(30.0, 4.0, 0.8);
             if self.view == "wide" {
                 let half_y = f64::from(self.chunks.div_ceil(64));
@@ -73,9 +91,10 @@ mod native {
             }
         }
 
-        fn make_scene(self, batch: bool) -> Scene3DLayer {
+        fn make_scene(self, batch: bool, pack_geometry: bool) -> Scene3DLayer {
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_uniforms(batch);
+            scene.set_profile_batch_geometry(pack_geometry);
             for i in 0..self.chunks {
                 let x = f64::from(i % 64) * 2.0;
                 let y = f64::from(i / 64) * 2.0;
@@ -166,9 +185,35 @@ mod native {
         profile: BufWriter<File>,
         run: u32,
         variant: String,
+        size: [u32; 2],
     }
 
     impl Benchmark<'_> {
+        fn run_case(&mut self, case: Case, mut scene: Scene3DLayer) -> Result<(), Error> {
+            let host = || {
+                ViewportHost::new(
+                    &self.gpu.device,
+                    ViewportConfig {
+                        initial_px: self.size,
+                        ..Default::default()
+                    },
+                )
+            };
+            let mut main = host()?;
+            let mut second = (case.view == "dual").then(host).transpose()?;
+            *main.camera_mut() = case.camera(0, false);
+            if let Some(second) = second.as_mut() {
+                *second.camera_mut() = case.camera(0, true);
+            }
+            self.orbit(case, &mut scene, &mut main, &mut second)?;
+            if (case.primary() || case.model.is_some()) && self.variant != "visibility-only" {
+                self.picking(case, &mut scene, &mut main)?;
+            }
+            self.samples.flush()?;
+            self.profile.flush()?;
+            Ok(())
+        }
+
         fn orbit(
             &mut self,
             case: Case,
@@ -177,6 +222,7 @@ mod native {
             second: &mut Option<ViewportHost>,
         ) -> Result<(), Error> {
             let gpu = self.gpu;
+            let stream_start = Instant::now();
             for frame in 0..=case.chunks {
                 let start = Instant::now();
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
@@ -195,14 +241,23 @@ mod native {
                     self.record(case, "first-frame", frame, 0.0, elapsed_ms(start), "")?;
                 }
                 if !streaming {
+                    self.record(
+                        case,
+                        "streaming-complete",
+                        frame,
+                        0.0,
+                        elapsed_ms(stream_start),
+                        "",
+                    )?;
                     break;
                 }
                 if frame == case.chunks {
                     return Err("scene is still streaming after preparation".into());
                 }
             }
-            let samples = if case.primary() { 360 } else { 60 };
-            let profile = std::env::var_os("ILETKI_PROFILE").is_some() && case.primary();
+            let long = case.primary() || case.acceptance_wide() || case.model.is_some();
+            let samples = if long { 360 } else { 60 };
+            let profile = std::env::var_os("ILETKI_PROFILE").is_some() && long;
             for frame in 0..12 + samples + if profile { 8 } else { 0 } {
                 *main.camera_mut() = case.camera(frame, false);
                 if let Some(second) = second.as_mut() {
@@ -230,10 +285,26 @@ mod native {
                 let wall = elapsed_ms(start);
                 if trace {
                     let capture = profiling::finish(&gpu.device, &gpu.queue)?;
-                    record_capture(&mut self.profile, "orbit", frame, capture)?;
+                    let label = if case.acceptance_wide() {
+                        "orbit-20000-wide"
+                    } else {
+                        "orbit"
+                    };
+                    record_capture(&mut self.profile, label, frame, capture)?;
                 } else if frame >= 12 {
                     let signature = if frame == 12 {
                         let image = main.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
+                        if case.model.is_some()
+                            && let Some(background) = image.pixels.get(..4)
+                            && image
+                                .pixels
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .all(|pixel| pixel == background)
+                        {
+                            return Err("the model produced a uniform reference image".into());
+                        }
                         format!("{:016x}", hash_bytes(image.pixels))
                     } else {
                         String::new()
@@ -252,9 +323,12 @@ mod native {
         ) -> Result<(), Error> {
             let gpu = self.gpu;
             *main.camera_mut() = case.camera(35, false);
-            let samples = if case.primary() { 360 } else { 30 };
-            let profile = std::env::var_os("ILETKI_PROFILE").is_some() && case.primary();
-            for (label, rect) in [("click", CLICK), ("marquee", MARQUEE), ("hover", CLICK)] {
+            let samples = 360;
+            let profile = std::env::var_os("ILETKI_PROFILE").is_some();
+            let [x, y] = self.size.map(|dimension| dimension / 2);
+            let click = [x.saturating_sub(2), y.saturating_sub(2), 5, 5];
+            let marquee = [x.saturating_sub(128), y.saturating_sub(128), 256, 256];
+            for (label, rect) in [("click", click), ("marquee", marquee), ("hover", click)] {
                 for frame in 0..12 + samples + if profile { 8 } else { 0 } {
                     let trace = frame >= 12 + samples;
                     if trace {
@@ -332,6 +406,18 @@ mod native {
         start.elapsed().as_secs_f64() * 1000.0
     }
 
+    fn viewport_size() -> Result<[u32; 2], Error> {
+        let Ok(value) = std::env::var("ILETKI_ASSEMBLY_SIZE") else {
+            return Ok(SIZE);
+        };
+        let (width, height) = value.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+        let size = [width.parse()?, height.parse()?];
+        if size.contains(&0) {
+            return Err("benchmark dimensions must be positive".into());
+        }
+        Ok(size)
+    }
+
     pub(super) fn run() -> Result<(), Error> {
         let mut args = std::env::args_os().skip(1);
         let output = args.next().ok_or("missing output directory")?;
@@ -353,18 +439,53 @@ mod native {
             profile: BufWriter::new(File::create(output.join("profile.csv"))?),
             run,
             variant,
+            size: viewport_size()?,
         };
         writeln!(
             bench.samples,
             "variant,run,chunks,view,workload,frame,cpu_ms,wall_ms,signature"
         )?;
         writeln!(bench.profile, "workload,frame,kind,label,value")?;
+        let pack = !matches!(
+            bench.variant.as_str(),
+            "geometry-direct" | "visibility-only"
+        );
+        if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
+            let started = Instant::now();
+            let fixture = crate::assembly_fixture::load(Path::new(&path))?;
+            let chunks = u32::try_from(fixture.meshes.len())?;
+            let focus = fixture.bounds.center().ok_or("model has no bounds")?;
+            let radius = fixture.bounds.radius() * 2.6;
+            if !focus.is_finite() || !radius.is_finite() || radius <= 0.0 {
+                return Err("invalid model camera bounds".into());
+            }
+            let case = Case {
+                chunks,
+                view: "model",
+                model: Some((focus, radius)),
+            };
+            let mut scene = Scene3DLayer::new(1);
+            scene.set_profile_batch_geometry(pack);
+            for mesh in fixture.meshes {
+                scene.insert(mesh);
+            }
+            eprintln!(
+                "model: {chunks} chunks, {} triangles, {:?} pixels",
+                fixture.triangles, bench.size
+            );
+            bench.record(case, "scene-load", 0, 0.0, elapsed_ms(started), "")?;
+            return bench.run_case(case, scene);
+        }
         let primary_only = std::env::var_os("ILETKI_PRIMARY_ONLY").is_some();
         let filter = std::env::var("ILETKI_ASSEMBLY_CASE").ok();
         let mut ran_case = false;
         for chunks in [1000, 4000, 20000] {
             for view in ["near", "wide", "dual"] {
-                let case = Case { chunks, view };
+                let case = Case {
+                    chunks,
+                    view,
+                    model: None,
+                };
                 if (primary_only && !case.primary())
                     || filter
                         .as_ref()
@@ -373,28 +494,8 @@ mod native {
                     continue;
                 }
                 ran_case = true;
-                let mut scene = case.make_scene(bench.variant != "visibility-only");
-                let host = || {
-                    ViewportHost::new(
-                        &gpu.device,
-                        ViewportConfig {
-                            initial_px: SIZE,
-                            ..Default::default()
-                        },
-                    )
-                };
-                let mut main = host()?;
-                let mut second = (view == "dual").then(host).transpose()?;
-                *main.camera_mut() = case.camera(0, false);
-                if let Some(second) = second.as_mut() {
-                    *second.camera_mut() = case.camera(0, true);
-                }
-                bench.orbit(case, &mut scene, &mut main, &mut second)?;
-                if case.primary() && bench.variant != "visibility-only" {
-                    bench.picking(case, &mut scene, &mut main)?;
-                }
-                bench.samples.flush()?;
-                bench.profile.flush()?;
+                let scene = case.make_scene(bench.variant != "visibility-only", pack);
+                bench.run_case(case, scene)?;
             }
         }
         if !ran_case {

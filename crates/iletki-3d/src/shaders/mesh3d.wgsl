@@ -39,14 +39,18 @@ struct PickOut {
     @location(1) @interpolate(flat) pick_id: vec2<u32>,
 };
 
-fn mesh_vertex(v: VertIn) -> ColorOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn mesh_vertex_with_object(v: VertIn, placement: ObjectUniforms) -> ColorOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: ColorOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
     out.normal = v.normal;
     out.color = v.color;
     return out;
+}
+
+fn mesh_vertex(v: VertIn) -> ColorOut {
+    return mesh_vertex_with_object(v, object);
 }
 
 @vertex

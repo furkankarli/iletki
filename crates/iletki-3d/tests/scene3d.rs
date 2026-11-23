@@ -189,6 +189,92 @@ fn removed_and_foreign_chunk_ids_cannot_modify_a_live_chunk() {
     assert!(!scene.is_selected(old));
 }
 
+#[cfg(feature = "profiling")]
+#[test]
+fn packed_faces_match_direct_across_views_and_chunk_edits() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let center = Vec3::new(1_000_000_000.25, -2_000_000_000.5, 20.0);
+    let mut scene = Scene3DLayer::new(1);
+    let cube = |origin, object| {
+        let mut mesh = Mesh3D::at_origin(origin);
+        mesh.push_box(
+            Vec3::new(-0.3, -0.3, -0.3),
+            Vec3::new(0.3, 0.3, 0.3),
+            [65, 195, 130, 255],
+            PickId::new(1, object, 0),
+            true,
+        );
+        mesh
+    };
+    let middle = scene.insert(cube(center, 1));
+    for i in 0..289 {
+        let x = f64::from(i % 17) - 8.0;
+        let y = f64::from(i / 17) - 8.0;
+        if i != 144 {
+            scene.insert(cube(center + Vec3::new(x, y, 0.0), i + 2));
+        }
+    }
+    let config = ViewportConfig {
+        initial_px: [128, 128],
+        upload_budget: iletki_core::UploadBudget::UNLIMITED,
+        ..ViewportConfig::default()
+    };
+    let mut top = ViewportHost::new(&device, config).unwrap();
+    let mut oblique = ViewportHost::new(&device, config).unwrap();
+    *top.camera_mut() = Camera::ortho_3d(center + Vec3::Z * 24.0, center, Vec3::Y, 24.0, 0.1, 60.0);
+    *oblique.camera_mut() = Camera::ortho_3d(
+        center + Vec3::new(8.0, -9.0, 24.0),
+        center,
+        Vec3::Z,
+        24.0,
+        0.1,
+        60.0,
+    );
+
+    let mut images = |scene: &mut Scene3DLayer, packed| {
+        scene.set_profile_batch_geometry(packed);
+        top.mark_dirty(DirtyFlags::CAMERA);
+        oblique.mark_dirty(DirtyFlags::CAMERA);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let top_frame = top.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
+        assert!(!top_frame.stats.streaming_pending);
+        let oblique_frame =
+            oblique.render_to_texture(&device, &queue, &mut encoder, &(), &mut [scene]);
+        assert!(!oblique_frame.stats.streaming_pending);
+        queue.submit([encoder.finish()]);
+        [
+            top.readback_rgba_blocking(&device, &queue).unwrap().pixels,
+            oblique
+                .readback_rgba_blocking(&device, &queue)
+                .unwrap()
+                .pixels,
+        ]
+    };
+    let visible = images(&mut scene, true);
+    assert!(visible == images(&mut scene, false));
+
+    scene.set_visible(middle, false);
+    let hidden = images(&mut scene, true);
+    assert!(hidden != visible && hidden == images(&mut scene, false));
+
+    scene.remove(middle);
+    let replacement = scene.insert(cube(center + Vec3::X * 0.2, 500));
+    scene.set_selected(replacement, true);
+    let selected = images(&mut scene, true);
+    assert!(selected != hidden && selected == images(&mut scene, false));
+
+    scene.set_origin(replacement, center + Vec3::X * 10.0);
+    let relocated = images(&mut scene, true);
+    assert!(relocated != selected && relocated == images(&mut scene, false));
+
+    let hits = top
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [115, 62, 5, 5])
+        .unwrap();
+    assert_eq!(hits.first().unwrap().id, PickId::new(1, 500, 0));
+}
+
 #[test]
 fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
     let Some((device, queue)) = create_headless_device() else {
