@@ -10,7 +10,21 @@ Run the interactive desktop demo from a checkout.
 cargo run --release --locked -p iletki-demo
 ```
 
-![Top, perspective, front, and side views of a shared scene with a selection outline and transform gizmo](docs/images/quad-view.webp)
+![Top, perspective, front, and right views of the same STEP parts, with an orange selection outline and transform gizmo](docs/images/quad-view.webp)
+
+## Real model demos
+
+| STEP orbit and selection | Live IFC section |
+| --- | --- |
+| ![The camera orbits two STEP parts, then an outline and transform gizmo mark the selected part](docs/images/step-selection.gif) | ![A moving horizontal section opens the West Riverside Hospital IFC model and reveals its interior](docs/images/ifc-section.gif) |
+
+The STEP captures use the NIST CTC-02 and CTC-04 parts, tessellated, recolored, and spaced
+for inspection. [NIST model source](https://www.nist.gov/ctl/smart-connected-systems-division/smart-connected-manufacturing-systems-group/mbe-pmi-0)
+
+The IFC clip shows the main building from Wawan Solihin's West Riverside Hospital
+architecture and structure models, hosted by the University of Auckland OpenIFC Model
+Repository. The models were tessellated, framed around the main building, and sectioned
+in iletki. [Model source](https://huggingface.co/datasets/sylvainHellin/ifc-bench/tree/ebacaf2de71cedd7226897497fcdf8b143c5b66f/projects/west_riverside_hospital) · [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)
 
 ## Why iletki?
 
@@ -100,6 +114,7 @@ The [Slint desktop example](examples/slint) uses the `iletki-slint` adapter to d
 
 The workspace also contains the unpublished `iletki-demo` desktop app and `xtask` development tool.
 See the [architecture guide](docs/architecture.md) for crate layering and renderer integration.
+See the [changelog](CHANGELOG.md) for release changes.
 
 ## Development and CI
 
@@ -113,10 +128,10 @@ cargo install --locked cargo-deny
 cargo xtask ci
 ```
 
-Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to build the archives used
-by the standalone egui example and run it from their extracted contents. The example needs a
-working `wgpu` adapter. Run `cargo package --locked -p iletki-slint` to verify the Slint adapter
-archive against the published iletki dependencies.
+Run `python3 .github/scripts/package-smoke.py` with Python 3.12 or later to build all seven
+publishable archives, verify their license files, and run the standalone egui example as a
+consumer of those archives. The test consumer also compiles the packaged Slint adapter.
+The example needs a working `wgpu` adapter.
 
 ## Platform tests
 

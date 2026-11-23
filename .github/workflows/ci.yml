@@ -80,7 +80,6 @@ jobs:
           SLINT_WGPU_CPU: '1'
           SLINT_SCALE_FACTOR: '2'
         run: |
-          cargo package --locked -p iletki-slint
           cargo fmt --manifest-path examples/slint/Cargo.toml --check
           cargo deny --manifest-path examples/slint/Cargo.toml --config examples/slint/deny.toml --locked check
           cargo clippy --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- -D warnings
@@ -127,3 +126,39 @@ jobs:
         run: |
           google-chrome --version
           node .github/scripts/webgpu-smoke.mjs
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, webgpu]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Publish release notes for the verified tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["workspace"]["package"]["version"]
+          if os.environ["RELEASE_TAG"] != f"v{version}":
+              raise SystemExit("The release tag must match the workspace version.")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          notes = changelog.partition(f"\n## {version}\n")[2].split("\n## ", 1)[0].strip()
+          if not notes:
+              raise SystemExit(f"No changelog entry for {version}.")
+          (Path(os.environ["RUNNER_TEMP"]) / "release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

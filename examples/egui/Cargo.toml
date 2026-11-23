@@ -7,5 +7,5 @@ publish = false
 [workspace]
 
 [dependencies]
-iletki = "=0.1.0"
-iletki-egui = "=0.1.0"
+iletki = "=0.1.1"
+iletki-egui = "=0.1.1"
