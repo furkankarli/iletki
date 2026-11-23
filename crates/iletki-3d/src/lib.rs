@@ -14,6 +14,7 @@
 pub mod gizmo;
 pub mod grid;
 pub mod instanced;
+mod objects;
 pub mod scene;
 mod section;
 pub mod vertex;

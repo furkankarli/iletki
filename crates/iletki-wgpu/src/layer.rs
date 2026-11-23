@@ -124,6 +124,7 @@ impl UploadTracker {
 pub struct PrepareCtx<'a, W = ()> {
     pub(crate) viewport_lifetime: &'a Arc<()>,
     pub(crate) section_antialiasing: bool,
+    pub(crate) picking_rect: Option<[u32; 4]>,
     /// Unique identifier of the viewport being prepared (use as key for per-viewport GPU buffers
     /// when one scene is shared across multiple split viewports).
     pub viewport_id: ViewportId,
@@ -156,6 +157,14 @@ pub struct PrepareCtx<'a, W = ()> {
 }
 
 impl<W> PrepareCtx<'_, W> {
+    /// Returns the clipped physical-pixel picking rectangle, or `None` when preparing a frame.
+    ///
+    /// Layers may use this hint to discard objects that cannot contribute to the pick pass.
+    #[must_use]
+    pub const fn picking_rect_px(&self) -> Option<[u32; 4]> {
+        self.picking_rect
+    }
+
     /// Returns whether this viewport can use antialiased 3D section clipping at 4× MSAA.
     #[must_use]
     pub const fn supports_section_antialiasing(&self) -> bool {

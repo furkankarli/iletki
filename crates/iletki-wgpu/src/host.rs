@@ -14,6 +14,7 @@ use iletki_core::{
     Camera, CameraRig, DirtyFlags, DrawPhase, DrawPhaseMask, OutlineConfig, PickHit, PickId,
     RigOutcome, TargetSize, Vec2, ViewportCommand, ViewportId, ViewportInput, ViewportMode,
 };
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -477,6 +478,7 @@ impl ViewportHost {
         world: &W,
         layers: &mut [&mut dyn ViewportLayer<W>],
     ) -> FrameStats {
+        let _profile = crate::trace::scope("frame.encode");
         let mut stats = FrameStats {
             target_reallocated: self.pending_reallocated,
             ..FrameStats::default()
@@ -494,7 +496,7 @@ impl ViewportHost {
         }
         self.camera_gpu.write(queue, cam_data);
 
-        let (pending, untracked_pending) = self.prepare_layers(device, queue, world, layers);
+        let (pending, untracked_pending) = self.prepare_layers(device, queue, world, layers, None);
         stats.streaming_pending = pending;
         let was_streaming = std::mem::replace(&mut self.streaming_pending, untracked_pending);
         if self.config.mode == ViewportMode::OnDemand {
@@ -602,12 +604,15 @@ impl ViewportHost {
         queue: &wgpu::Queue,
         world: &W,
         layers: &mut [&mut dyn ViewportLayer<W>],
+        picking_rect: Option<[u32; 4]>,
     ) -> (bool, bool) {
+        let _profile = crate::trace::scope("layers.prepare");
         let size = self.targets.size();
         let logical = self.logical_size();
         let mut prep_ctx = PrepareCtx {
             viewport_lifetime: &self.lifetime,
             section_antialiasing: self.section_antialiasing,
+            picking_rect,
             viewport_id: self.id,
             device,
             queue,
@@ -732,6 +737,7 @@ impl ViewportHost {
         let [x, y, w, h] = rect;
         {
             let (view, resolve_target) = engine.mask_color_views();
+            let gpu_timer = crate::trace::pass("iletki outline mask");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki outline mask"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -748,7 +754,7 @@ impl ViewportHost {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -785,6 +791,7 @@ impl ViewportHost {
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.static_color_views();
+        let gpu_timer = crate::trace::pass("iletki static scene");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki static scene"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -805,7 +812,7 @@ impl ViewportHost {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -835,6 +842,7 @@ impl ViewportHost {
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.output_color_views();
+        let gpu_timer = crate::trace::pass("iletki dynamic overlay");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki dynamic overlay"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -855,7 +863,7 @@ impl ViewportHost {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -910,6 +918,7 @@ impl ViewportHost {
                 m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
             });
         {
+            let gpu_timer = crate::trace::pass("iletki continuous scene");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki continuous scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -933,7 +942,7 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -952,6 +961,7 @@ impl ViewportHost {
         }
 
         if has_second_pass {
+            let gpu_timer = crate::trace::pass("iletki continuous gizmo/overlay");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki continuous gizmo/overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -971,7 +981,7 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1084,8 +1094,13 @@ impl ViewportHost {
         rect_px: [u32; 4],
     ) -> Result<Vec<PickHit>, ViewportError> {
         let staged = self.submit_pick_rect(device, queue, world, layers, rect_px)?;
-        let id_bytes = map_staging_blocking(device, &staged.id_buf, staged.id_layout)?;
-        let depth_bytes = map_staging_blocking(device, &staged.depth_buf, staged.depth_layout)?;
+        let (id_bytes, depth_bytes) = {
+            let _profile = crate::trace::scope("pick.readback");
+            (
+                map_staging_blocking(device, &staged.id_buf, staged.id_layout)?,
+                map_staging_blocking(device, &staged.depth_buf, staged.depth_layout)?,
+            )
+        };
         Ok(decode_pick_hits(
             &self.camera,
             staged.logical,
@@ -1104,6 +1119,7 @@ impl ViewportHost {
         layers: &mut [&mut dyn ViewportLayer<W>],
         rect_px: [u32; 4],
     ) -> Result<StagedPick, ViewportError> {
+        let _profile = crate::trace::scope("pick.submit");
         let size = self.targets.size();
         let [aw, ah] = size.active_px;
         let [rx, ry, rw, rh] = rect_px;
@@ -1121,7 +1137,9 @@ impl ViewportHost {
         let id_layout = StagingLayout::compute(w, h, 8, max_buffer_size)?;
         let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
 
-        self.streaming_pending |= self.prepare_layers(device, queue, world, layers).1;
+        self.streaming_pending |= self
+            .prepare_layers(device, queue, world, layers, Some([x0, y0, w, h]))
+            .1;
 
         let logical = self.logical_size();
         self.camera_gpu
@@ -1141,6 +1159,7 @@ impl ViewportHost {
                 logical_size: logical,
                 dpi_scale: self.dpi_scale,
             };
+            let gpu_timer = crate::trace::pass("iletki pick pass");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki pick pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1160,7 +1179,7 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1470,8 +1489,10 @@ fn decode_pick_hits(
     id_bytes: &[u8],
     depth_bytes: &[u8],
 ) -> Vec<PickHit> {
+    let _profile = crate::trace::scope("pick.decode");
     let [x0, y0, w, h] = rect;
-    let mut hits: Vec<PickHit> = Vec::new();
+    let mut indices = HashMap::new();
+    let mut winners = Vec::<(PickId, f32, u32, u32)>::new();
     let inv_dpi = 1.0 / f64::from(dpi_scale);
 
     for row in 0..h {
@@ -1499,30 +1520,35 @@ fn decode_pick_hits(
                 continue;
             }
             let depth = f32::from_le_bytes(d_arr);
-            let screen_pt = Vec2::new(
-                (f64::from(x0 + col) + 0.5) * inv_dpi,
-                (f64::from(y0 + row) + 0.5) * inv_dpi,
-            );
-            let world_pos = camera.unproject_depth(screen_pt, depth, logical);
-
-            if let Some(existing) = hits.iter_mut().find(|h| h.id == id) {
-                // Reversed-Z: larger depth is closer to the camera.
-                if depth > existing.depth {
-                    existing.depth = depth;
-                    existing.world_pos = world_pos;
-                }
-            } else {
-                hits.push(PickHit {
-                    id,
-                    depth,
-                    world_pos,
-                });
+            let index = *indices.entry(id).or_insert_with(|| {
+                let index = winners.len();
+                winners.push((id, depth, col, row));
+                index
+            });
+            // Keep the first pixel at equal depths and retain encounter order across IDs.
+            if let Some(winner) = winners.get_mut(index)
+                && depth > winner.1
+            {
+                *winner = (id, depth, col, row);
             }
         }
     }
     // Sort nearest-first (highest Reversed-Z depth first).
-    hits.sort_by(|a, b| b.depth.total_cmp(&a.depth));
-    hits
+    winners.sort_by(|a, b| b.1.total_cmp(&a.1));
+    winners
+        .into_iter()
+        .map(|(id, depth, col, row)| {
+            let screen_pt = Vec2::new(
+                (f64::from(x0.saturating_add(col)) + 0.5) * inv_dpi,
+                (f64::from(y0.saturating_add(row)) + 0.5) * inv_dpi,
+            );
+            PickHit {
+                id,
+                depth,
+                world_pos: camera.unproject_depth(screen_pt, depth, logical),
+            }
+        })
+        .collect()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1546,4 +1572,35 @@ fn readback_texture_2d_blocking(
     let staging = encode_texture_to_staging(device, &mut encoder, texture, rect, layout);
     queue.submit(std::iter::once(encoder.finish()));
     map_staging_blocking(device, &staging, layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iletki_core::Vec3;
+
+    #[test]
+    fn pick_decoding_keeps_nearest_pixels_and_preserves_ties() {
+        let a = PickId::new(1, 10, 20);
+        let b = PickId::new(1, 20, 30);
+        let ids: Vec<_> = [a, b, a, a]
+            .into_iter()
+            .flat_map(|id| id.to_u64().to_le_bytes())
+            .collect();
+        let depths: Vec<_> = [0.25_f32, 0.5, 0.5, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let camera =
+            Camera::perspective_3d(Vec3::new(0.0, -4.0, 0.0), Vec3::ZERO, Vec3::Z, 1.0, 0.1);
+        let logical = Vec2::new(16.0, 8.0);
+        let hits = decode_pick_hits(&camera, logical, 2.0, [2, 4, 4, 1], &ids, &depths);
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [a, b]);
+        let first = hits.first().unwrap();
+        assert_eq!(first.depth.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(
+            first.world_pos,
+            camera.unproject_depth(Vec2::new(2.25, 2.25), 0.5, logical)
+        );
+    }
 }

@@ -147,7 +147,7 @@ impl OutlineEngine {
             immediate_size: 0,
         });
 
-        let make_jfa = |label: &str, fs: &str| {
+        let make_jfa = |label: &'static str, fs: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipe_layout),
@@ -218,7 +218,7 @@ impl OutlineEngine {
             height: height.max(1),
             depth_or_array_layers: 1,
         };
-        let mk_tex = |label: &str, format: wgpu::TextureFormat| {
+        let mk_tex = |label: &'static str, format: wgpu::TextureFormat| {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size,
@@ -420,13 +420,14 @@ impl OutlineEngine {
     fn fullscreen_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        label: &str,
+        label: &'static str,
         dst_view: &wgpu::TextureView,
         pipeline: &wgpu::RenderPipeline,
         bg: &wgpu::BindGroup,
         [alloc_w, alloc_h]: [u32; 2],
         [x, y, w, h]: [u32; 4],
     ) {
+        let gpu_timer = crate::trace::pass(label);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -444,7 +445,7 @@ impl OutlineEngine {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

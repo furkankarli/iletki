@@ -378,6 +378,7 @@ impl DepthCopyPipeline {
                 },
             ],
         });
+        let gpu_timer = crate::trace::pass("iletki depth subrect copy");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki depth subrect copy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -390,7 +391,7 @@ impl DepthCopyPipeline {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

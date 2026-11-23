@@ -2,15 +2,16 @@
 //! planes, *Shaded with Edges* depth-offset wireframe overlays, Jump-Flood selection outline masks,
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
+use crate::objects::{PickVolume, PreparedObject, ViewObjects};
 use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
 use bytemuck::{Pod, Zeroable};
-use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, Vec4, ViewportId};
+use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, Vec4};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
     CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx,
-    PrepareCtx, ViewportLayer, ViewportLifetime,
+    PrepareCtx, ViewportLayer,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,13 +31,6 @@ pub struct Chunk3DId {
     generation: u64,
 }
 
-struct ViewportBinding {
-    id: ViewportId,
-    lifetime: ViewportLifetime,
-    buf: wgpu::Buffer,
-    bg: wgpu::BindGroup,
-}
-
 struct ChunkEntry {
     generation: u64,
     origin: Vec3,
@@ -50,13 +44,14 @@ struct ChunkEntry {
     edge_count: u32,
     pick_buf: Option<wgpu::Buffer>,
     has_picks: bool,
-    per_viewport: Vec<ViewportBinding>,
+    pick_bounds_trusted: bool,
 }
 
 struct Pipelines {
     format: wgpu::TextureFormat,
     msaa: u32,
     object_layout: wgpu::BindGroupLayout,
+    dynamic_uniforms: bool,
     lit: wgpu::RenderPipeline,
     section: Option<SectionPipelines>,
     edge: wgpu::RenderPipeline,
@@ -73,8 +68,9 @@ struct SectionPipelines {
 
 /// Camera-relative Reversed-Z 3D scene layer implementing [`ViewportLayer`].
 ///
-/// Each chunk keeps its own `f64` world origin; every frame `prepare` computes
-/// `(chunk.origin - camera_pos).to_f32()` into a per-[`ViewportId`] uniform buffer so 3D geometry
+/// Each chunk keeps its own `f64` world origin. Preparation computes
+/// `(chunk.origin - camera_pos).to_f32()` for visible chunks and uploads their uniforms in
+/// per-[`iletki_core::ViewportId`] pages so 3D geometry
 /// stays jitter-free even hundreds of kilometres from `(0, 0, 0)` and can be shared safely across
 /// simultaneous multi-viewport quad views in a single `CommandEncoder`.
 pub struct Scene3DLayer {
@@ -83,6 +79,9 @@ pub struct Scene3DLayer {
     pipelines: Option<Pipelines>,
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
+    views: Vec<ViewObjects>,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_batch_uniforms: bool,
 }
 
 impl std::fmt::Debug for Scene3DLayer {
@@ -104,6 +103,19 @@ impl Scene3DLayer {
             pipelines: None,
             use_antialiased_section: false,
             chunks: Vec::new(),
+            views: Vec::new(),
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_batch_uniforms: true,
+        }
+    }
+
+    /// Sets uniform upload batching for A/B profiling. Visibility filtering still applies.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_batch_uniforms(&mut self, enabled: bool) {
+        if self.profile_batch_uniforms != enabled {
+            self.profile_batch_uniforms = enabled;
+            self.views.clear();
+            self.revision.mark_static();
         }
     }
 
@@ -124,7 +136,7 @@ impl Scene3DLayer {
             edge_count: 0,
             pick_buf: None,
             has_picks: false,
-            per_viewport: Vec::new(),
+            pick_bounds_trusted: false,
         };
         if let Some((index, slot)) = self
             .chunks
@@ -206,21 +218,13 @@ impl Scene3DLayer {
             .filter(|entry| entry.generation == id.generation)
     }
 
-    /// Releases bindings for closed viewports and returns the number released.
+    /// Releases per-viewport binding sets for closed viewports and returns the number released.
     ///
     /// The layer also prunes closed bindings before preparing a viewport.
     pub fn prune_closed_viewports(&mut self) -> usize {
-        self.chunks
-            .iter_mut()
-            .flatten()
-            .map(|chunk| {
-                let previous = chunk.per_viewport.len();
-                chunk
-                    .per_viewport
-                    .retain(|binding| binding.lifetime.is_alive());
-                previous - chunk.per_viewport.len()
-            })
-            .sum()
+        let previous = self.views.len();
+        self.views.retain(|view| view.lifetime.is_alive());
+        previous - self.views.len()
     }
 
     fn ensure_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
@@ -239,6 +243,11 @@ impl Scene3DLayer {
                 label: Some("iletki-3d mesh shader"),
                 source: wgpu::ShaderSource::Wgsl(wgsl.as_str().into()),
             });
+        let dynamic_uniforms = ctx
+            .device
+            .limits()
+            .max_dynamic_uniform_buffers_per_pipeline_layout
+            > 0;
         let object_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -248,8 +257,11 @@ impl Scene3DLayer {
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: dynamic_uniforms,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                            ObjectUniforms,
+                        >()
+                            as u64),
                     },
                     count: None,
                 }],
@@ -461,13 +473,12 @@ impl Scene3DLayer {
                 cache: None,
             });
 
-        for chunk in self.chunks.iter_mut().flatten() {
-            chunk.per_viewport.clear();
-        }
+        self.views.clear();
         self.pipelines = Some(Pipelines {
             format: ctx.color_format,
             msaa: ctx.msaa_samples,
             object_layout,
+            dynamic_uniforms,
             lit,
             section,
             edge,
@@ -483,26 +494,21 @@ impl Scene3DLayer {
         pass: &mut wgpu::RenderPass<'_>,
         ctx: &PaintCtx<'_, W>,
     ) {
-        let frustum = ctx.camera.frustum(ctx.logical_size);
-        let cam_pos = ctx.camera.position_3d();
-        let vp_id = ctx.viewport_id;
+        let Some(p) = &self.pipelines else {
+            return;
+        };
+        let Some(view) = self.views.iter().find(|view| view.id == ctx.viewport_id) else {
+            return;
+        };
         pass.set_pipeline(pipeline);
-        for chunk in self.chunks.iter().flatten() {
-            if !chunk.visible || !chunk.selected || chunk.vertex_count == 0 {
-                continue;
-            }
-            let wb = Bounds3::from_corners(
-                chunk.origin + chunk.local_bounds.min,
-                chunk.origin + chunk.local_bounds.max,
-            );
-            if !wb.is_empty() && !frustum.intersects_bounds_world(wb, cam_pos) {
-                continue;
-            }
-            let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) else {
+        for (index, object) in view.draws.iter().enumerate() {
+            let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                 continue;
             };
-            if let Some(vbuf) = &chunk.vertex_buf {
-                pass.set_bind_group(1, &binding.bg, &[]);
+            if chunk.selected
+                && let Some(vbuf) = &chunk.vertex_buf
+                && view.bind(pass, index, p.dynamic_uniforms)
+            {
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.draw(0..chunk.vertex_count, 0..1);
             }
@@ -551,7 +557,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             return false;
         };
         let cam_pos = ctx.camera.position_3d();
-        let vp_id = ctx.viewport_id;
         let mut pending = false;
 
         for chunk in self.chunks.iter_mut().flatten() {
@@ -568,6 +573,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
             if let Some(mesh) = chunk.pending_mesh.take() {
                 self.revision.mark_static();
+                chunk.pick_bounds_trusted = false;
                 if mesh.vertices.is_empty() {
                     chunk.vertex_buf = None;
                     chunk.vertex_count = 0;
@@ -591,6 +597,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             },
                         ));
                         chunk.has_picks = true;
+                        chunk.pick_bounds_trusted = crate::objects::pick_bounds_cover_vertices(
+                            chunk.local_bounds,
+                            &mesh.vertices,
+                        );
                     } else {
                         chunk.pick_buf = None;
                         chunk.has_picks = false;
@@ -611,44 +621,88 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 }
                 ctx.uploads.finish_upload();
             }
+        }
 
-            if !chunk.per_viewport.iter().any(|b| b.id == vp_id) {
-                let buf = ctx
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("iletki-3d object uniforms"),
-                        contents: bytemuck::bytes_of(&ObjectUniforms {
-                            offset_rel: [0.0, 0.0, 0.0],
-                            scale: 1.0,
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-                let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("iletki-3d object bg"),
-                    layout: &p.object_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buf.as_entire_binding(),
-                    }],
-                });
-                chunk.per_viewport.push(ViewportBinding {
-                    id: vp_id,
-                    lifetime: ctx.viewport_lifetime(),
-                    buf,
-                    bg,
-                });
+        let batch = p.dynamic_uniforms;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let batch = batch && self.profile_batch_uniforms;
+        let index = self
+            .views
+            .iter()
+            .position(|view| view.id == ctx.viewport_id)
+            .unwrap_or_else(|| {
+                let index = self.views.len();
+                self.views.push(ViewObjects::new(ctx, batch));
+                index
+            });
+        let Some(view) = self.views.get_mut(index) else {
+            return pending;
+        };
+        view.draws.clear();
+        view.has_edges = false;
+
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let visibility = iletki_wgpu::profiling::scope("scene.visibility");
+        let picking = ctx.picking_rect_px();
+        let projection = ctx.camera.view_proj_relative(ctx.logical_size);
+        let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
+        let pick_volume = picking.map(|rect| PickVolume::new(projection, ctx.active_px, rect));
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            if !chunk.visible || (chunk.vertex_count == 0 && chunk.edge_count == 0) {
+                continue;
             }
-
-            if let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) {
-                let offset_rel = (chunk.origin - cam_pos).to_f32();
-                let u = ObjectUniforms {
+            let offset_rel = (chunk.origin - cam_pos).to_f32();
+            if let Some(volume) = &pick_volume {
+                if !chunk.has_picks
+                    || (chunk.pick_bounds_trusted
+                        && !volume.intersects(chunk.local_bounds, offset_rel))
+                {
+                    continue;
+                }
+            } else {
+                let bounds = Bounds3::from_corners(
+                    chunk.origin + chunk.local_bounds.min,
+                    chunk.origin + chunk.local_bounds.max,
+                );
+                if !bounds.is_empty() && !frustum.intersects_bounds_world(bounds, cam_pos) {
+                    continue;
+                }
+            }
+            view.has_edges |= chunk.edge_count != 0;
+            view.draws.push(PreparedObject {
+                chunk: index,
+                uniforms: ObjectUniforms {
                     offset_rel,
                     scale: 1.0,
-                };
-                ctx.queue
-                    .write_buffer(&binding.buf, 0, bytemuck::bytes_of(&u));
-            }
+                },
+            });
         }
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        drop(visibility);
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        if iletki_wgpu::profiling::active() {
+            iletki_wgpu::profiling::count("scene.scanned_slots", self.chunks.len());
+            iletki_wgpu::profiling::count("scene.candidates", view.draws.len());
+            let pass = if picking.is_some() {
+                "scene.pick_draws"
+            } else {
+                "scene.opaque_draws"
+            };
+            let draws = view
+                .draws
+                .iter()
+                .filter_map(|object| self.chunks.get(object.chunk)?.as_ref())
+                .map(|chunk| {
+                    usize::from(chunk.vertex_buf.is_some())
+                        + usize::from(picking.is_none() && chunk.edge_buf.is_some())
+                })
+                .sum();
+            iletki_wgpu::profiling::count(pass, draws);
+        }
+        view.upload(ctx.device, ctx.queue, &p.object_layout);
         pending
     }
 
@@ -779,9 +833,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let Some(p) = &self.pipelines else {
             return;
         };
-        let frustum = ctx.camera.frustum(ctx.logical_size);
-        let cam_pos = ctx.camera.position_3d();
-        let vp_id = ctx.viewport_id;
+        let Some(view) = self.views.iter().find(|view| view.id == ctx.viewport_id) else {
+            return;
+        };
 
         let (lit, edge) = p
             .section
@@ -791,71 +845,39 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         match phase {
             DrawPhase::Opaque => {
-                // 1. Solid shaded triangles
                 pass.set_pipeline(lit);
-                for chunk in self.chunks.iter().flatten() {
-                    if !chunk.visible || chunk.vertex_count == 0 {
-                        continue;
-                    }
-                    let wb = Bounds3::from_corners(
-                        chunk.origin + chunk.local_bounds.min,
-                        chunk.origin + chunk.local_bounds.max,
-                    );
-                    if !wb.is_empty() && !frustum.intersects_bounds_world(wb, cam_pos) {
-                        continue;
-                    }
-                    let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) else {
-                        continue;
-                    };
-                    if let Some(vbuf) = &chunk.vertex_buf {
-                        pass.set_bind_group(1, &binding.bg, &[]);
+                for (index, object) in view.draws.iter().enumerate() {
+                    if let Some(Some(chunk)) = self.chunks.get(object.chunk)
+                        && let Some(vbuf) = &chunk.vertex_buf
+                        && view.bind(pass, index, p.dynamic_uniforms)
+                    {
                         pass.set_vertex_buffer(0, vbuf.slice(..));
                         pass.draw(0..chunk.vertex_count, 0..1);
                     }
                 }
-                // 2. Crisp depth-offset CAD wireframe edges (*Shaded with Edges*)
-                let any_edges = self
-                    .chunks
-                    .iter()
-                    .flatten()
-                    .any(|c| c.visible && c.edge_count > 0);
-                if any_edges {
-                    pass.set_pipeline(edge);
-                    for chunk in self.chunks.iter().flatten() {
-                        if !chunk.visible || chunk.edge_count == 0 {
-                            continue;
-                        }
-                        let wb = Bounds3::from_corners(
-                            chunk.origin + chunk.local_bounds.min,
-                            chunk.origin + chunk.local_bounds.max,
-                        );
-                        if !wb.is_empty() && !frustum.intersects_bounds_world(wb, cam_pos) {
-                            continue;
-                        }
-                        let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id)
-                        else {
-                            continue;
-                        };
-                        if let Some(ebuf) = &chunk.edge_buf {
-                            pass.set_bind_group(1, &binding.bg, &[]);
-                            pass.set_vertex_buffer(0, ebuf.slice(..));
-                            pass.draw(0..chunk.edge_count, 0..1);
-                        }
+
+                if !view.has_edges {
+                    return;
+                }
+                pass.set_pipeline(edge);
+                for (index, object) in view.draws.iter().enumerate() {
+                    if let Some(Some(chunk)) = self.chunks.get(object.chunk)
+                        && let Some(ebuf) = &chunk.edge_buf
+                        && view.bind(pass, index, p.dynamic_uniforms)
+                    {
+                        pass.set_vertex_buffer(0, ebuf.slice(..));
+                        pass.draw(0..chunk.edge_count, 0..1);
                     }
                 }
             }
             DrawPhase::OutlineMask => self.paint_outline_mask(&p.mask, pass, ctx),
             DrawPhase::Picking => {
                 pass.set_pipeline(&p.pick);
-                for chunk in self.chunks.iter().flatten() {
-                    if !chunk.visible || !chunk.has_picks || chunk.vertex_count == 0 {
-                        continue;
-                    }
-                    let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) else {
-                        continue;
-                    };
-                    if let (Some(vbuf), Some(pbuf)) = (&chunk.vertex_buf, &chunk.pick_buf) {
-                        pass.set_bind_group(1, &binding.bg, &[]);
+                for (index, object) in view.draws.iter().enumerate() {
+                    if let Some(Some(chunk)) = self.chunks.get(object.chunk)
+                        && let (Some(vbuf), Some(pbuf)) = (&chunk.vertex_buf, &chunk.pick_buf)
+                        && view.bind(pass, index, p.dynamic_uniforms)
+                    {
                         pass.set_vertex_buffer(0, vbuf.slice(..));
                         pass.set_vertex_buffer(1, pbuf.slice(..));
                         pass.draw(0..chunk.vertex_count, 0..1);

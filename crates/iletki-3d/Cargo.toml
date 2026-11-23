@@ -10,6 +10,9 @@ repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/iletki-3d"
 
+[features]
+profiling = ["iletki-wgpu/profiling"]
+
 [dependencies]
 iletki-core.workspace = true
 iletki-wgpu.workspace = true

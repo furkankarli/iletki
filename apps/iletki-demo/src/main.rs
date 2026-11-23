@@ -23,15 +23,16 @@ use iletki::gpu::wgpu;
 use iletki::{
     Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DirtyFlags, DrawStyle2D,
     Grid3DConfig, GridStyle, InfiniteGrid3DLayer, Instance3D, InstancedMesh3DLayer, Mesh2D, Mesh3D,
-    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PickId, Plane, PointerButton, Projection,
-    Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView, TransformGizmoLayer, Vec2, Vec3,
-    ViewportConfig, ViewportHost, ViewportInput, ViewportLayer, ViewportMode, order_to_depth,
+    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PickHit, PickId, Plane,
+    PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
+    TransformGizmoLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
+    ViewportMode, order_to_depth,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -62,6 +63,14 @@ struct ChunkMeta {
     chunk_id: Chunk3DId,
     gizmo_pos: Vec3,
     name: &'static str,
+}
+
+#[derive(PartialEq)]
+struct PickView {
+    scene: DemoScene,
+    camera: Camera,
+    size: [u32; 2],
+    dpi: f64,
 }
 
 struct GpuState {
@@ -100,6 +109,8 @@ struct GpuState {
     modifiers: Modifiers,
     last_cursor: Vec2,
     press_pos: Option<Vec2>,
+    pending_pick: Option<(PendingPick, PickView)>,
+    queued_pick: Option<(Vec2, PickView)>,
     last_pick_text: String,
     frame_count: u32,
     fps_timer: Instant,
@@ -229,6 +240,8 @@ impl GpuState {
             modifiers: Modifiers::default(),
             last_cursor: Vec2::ZERO,
             press_pos: None,
+            pending_pick: None,
+            queued_pick: None,
             last_pick_text: String::from("Click any 3D object to pick"),
             frame_count: 0,
             fps_timer: Instant::now(),
@@ -380,70 +393,119 @@ impl GpuState {
         self.vp_main.mark_dirty(DirtyFlags::OVERLAY);
     }
 
+    fn pick_view(&self) -> PickView {
+        PickView {
+            scene: self.active_scene,
+            camera: self.vp_main.camera().clone(),
+            size: self.vp_main.size().active_px,
+            dpi: self.window.scale_factor(),
+        }
+    }
+
     fn handle_pick(&mut self, logical_pos: Vec2) {
         if self.quad_view {
             return;
         }
-        let dpi = f64::from(self.window.scale_factor() as f32);
-        let px = (logical_pos.x * dpi).round().max(0.0) as u32;
-        let py = (logical_pos.y * dpi).round().max(0.0) as u32;
+        let view = self.pick_view();
+        if self.pending_pick.is_some() {
+            self.queued_pick = Some((logical_pos, view));
+            return;
+        }
+        self.begin_pick(logical_pos, view);
+    }
+
+    fn begin_pick(&mut self, logical_pos: Vec2, view: PickView) {
+        let px = (logical_pos.x * view.dpi).round().max(0.0) as u32;
+        let py = (logical_pos.y * view.dpi).round().max(0.0) as u32;
         let rect = [px.saturating_sub(2), py.saturating_sub(2), 5, 5];
 
-        let hits = match self.active_scene {
+        let pick = match self.active_scene {
             DemoScene::Arch3D => {
                 let mut layers: [&mut dyn ViewportLayer<()>; 3] =
                     [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d];
                 self.vp_main
-                    .pick_rect_blocking(&self.device, &self.queue, &(), &mut layers, rect)
+                    .begin_pick_rect(&self.device, &self.queue, &(), &mut layers, rect)
             }
             DemoScene::Instanced100k => {
                 let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.instanced_3d];
                 self.vp_main
-                    .pick_rect_blocking(&self.device, &self.queue, &(), &mut layers, rect)
+                    .begin_pick_rect(&self.device, &self.queue, &(), &mut layers, rect)
             }
             DemoScene::Cad2D => {
                 let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut self.scene_2d];
                 self.vp_main
-                    .pick_rect_blocking(&self.device, &self.queue, &(), &mut layers, rect)
+                    .begin_pick_rect(&self.device, &self.queue, &(), &mut layers, rect)
             }
         };
 
-        if let Ok(hits) = hits {
-            if let Some(hit) = hits.first() {
-                if self.active_scene == DemoScene::Arch3D && hit.id.layer == 1 {
-                    self.scene_3d.clear_selection();
-                    if let Some(meta) = self
-                        .chunks_3d
-                        .iter()
-                        .find(|m| m.pick_object == hit.id.object)
-                    {
-                        self.scene_3d.set_selected(meta.chunk_id, true);
-                        self.gizmo_3d.origin = Some(meta.gizmo_pos);
-                        self.last_pick_text = format!(
-                            "Picked {} (obj={} face={})",
-                            meta.name, hit.id.object, hit.id.sub
-                        );
-                    }
-                    self.vp_main
-                        .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
-                } else {
+        if let Ok(pick) = pick {
+            self.pending_pick = Some((pick, view));
+        }
+    }
+
+    fn poll_pick(&mut self) {
+        let Some((pick, _)) = &mut self.pending_pick else {
+            return;
+        };
+        let Poll::Ready(result) = pick.try_read() else {
+            return;
+        };
+        let Some((_, picked_view)) = self.pending_pick.take() else {
+            return;
+        };
+        if self.quad_view {
+            self.queued_pick = None;
+            return;
+        }
+        let current = self.pick_view();
+        if let Some((position, queued_view)) = self.queued_pick.take()
+            && queued_view == current
+        {
+            self.begin_pick(position, queued_view);
+            return;
+        }
+        if picked_view == current
+            && let Ok(hits) = result
+        {
+            self.apply_pick(&hits);
+        }
+    }
+
+    fn apply_pick(&mut self, hits: &[PickHit]) {
+        if let Some(hit) = hits.first() {
+            if self.active_scene == DemoScene::Arch3D && hit.id.layer == 1 {
+                self.scene_3d.clear_selection();
+                if let Some(meta) = self
+                    .chunks_3d
+                    .iter()
+                    .find(|m| m.pick_object == hit.id.object)
+                {
+                    self.scene_3d.set_selected(meta.chunk_id, true);
+                    self.gizmo_3d.origin = Some(meta.gizmo_pos);
                     self.last_pick_text = format!(
-                        "Picked layer={} obj={} sub={}",
-                        hit.id.layer, hit.id.object, hit.id.sub
+                        "Picked {} (obj={} face={})",
+                        meta.name, hit.id.object, hit.id.sub
                     );
                 }
+                self.vp_main
+                    .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
             } else {
-                if self.active_scene == DemoScene::Arch3D {
-                    self.scene_3d.clear_selection();
-                    self.gizmo_3d.origin = None;
-                    self.vp_main
-                        .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
-                }
-                self.last_pick_text = String::from("Empty background");
+                self.last_pick_text = format!(
+                    "Picked layer={} obj={} sub={}",
+                    hit.id.layer, hit.id.object, hit.id.sub
+                );
             }
-            self.update_title();
-            self.window.request_redraw();
+        } else {
+            if self.active_scene == DemoScene::Arch3D {
+                self.scene_3d.clear_selection();
+                self.gizmo_3d.origin = None;
+                self.vp_main
+                    .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
+            }
+            self.last_pick_text = String::from("Empty background");
         }
+        self.update_title();
+        self.window.request_redraw();
     }
 
     fn update_title(&self) {
@@ -697,6 +759,18 @@ impl ApplicationHandler for DemoApp {
                 eprintln!("iletki-demo init failed: {err}");
                 event_loop.exit();
             }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(state) = &mut self.state {
+            state.poll_pick();
+            let flow = if state.pending_pick.is_some() {
+                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2))
+            } else {
+                ControlFlow::Wait
+            };
+            event_loop.set_control_flow(flow);
         }
     }
 

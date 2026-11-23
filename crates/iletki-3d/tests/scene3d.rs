@@ -9,7 +9,7 @@
 use iletki_3d::{
     GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Mesh3D, Scene3DLayer, TransformGizmoLayer,
 };
-use iletki_core::{Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
+use iletki_core::{Bounds3, Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
 use iletki_wgpu::{ViewportConfig, ViewportHost, ViewportLayer, wgpu};
 use std::future::Future;
 use std::pin::Pin;
@@ -187,6 +187,71 @@ fn removed_and_foreign_chunk_ids_cannot_modify_a_live_chunk() {
     scene.remove(foreign);
     assert!(scene.is_selected(current));
     assert!(!scene.is_selected(old));
+}
+
+#[test]
+fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let center = Vec3::new(1_000_000_000.25, -2_000_000_000.5, 20.0);
+    let mut host = ViewportHost::new(&device, ViewportConfig::default()).unwrap();
+    host.resize(&device, [127, 93], 1.75);
+    *host.camera_mut() = Camera::perspective_3d(
+        center - Vec3::Y * 2.0,
+        center,
+        Vec3::Z,
+        std::f64::consts::FRAC_PI_3,
+        0.1,
+    );
+    host.camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(Vec3::Y, center).unwrap()]);
+
+    let mut scene = Scene3DLayer::new(1);
+    for (offset, object) in [(0.0, 8), (3.0, 9)] {
+        let mut cube = Mesh3D::at_origin(center + Vec3::X * offset);
+        cube.push_box(
+            Vec3::new(-0.4, -1.95, -0.4),
+            Vec3::new(0.4, 0.2, 0.4),
+            [40, 220, 80, 255],
+            PickId::new(1, object, 0),
+            true,
+        );
+        scene.insert(cube);
+    }
+    let wide = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [52, 35, 23, 23])
+        .unwrap();
+    let pixel = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
+        .unwrap();
+    let [hit] = pixel.as_slice() else {
+        panic!("expected one hit at the viewport center, got {pixel:?}");
+    };
+    assert_eq!(hit.id, PickId::new(1, 8, 4));
+    assert!(
+        wide.iter()
+            .any(|other| other.id == hit.id && other.depth.to_bits() == hit.depth.to_bits())
+    );
+    let point = hit.world_pos.unwrap();
+    assert!((point - (center + Vec3::Y * 0.2)).length() < 1e-5);
+
+    // Direct Mesh3D edits can leave an AABB that excludes the uploaded triangles.
+    let mut stale_bounds = Mesh3D::at_origin(center);
+    stale_bounds.push_box(
+        Vec3::new(-0.2, -0.2, -0.2),
+        Vec3::new(0.2, 0.1, 0.2),
+        [255; 4],
+        PickId::new(1, 10, 0),
+        false,
+    );
+    stale_bounds.local_bounds =
+        Bounds3::from_corners(Vec3::new(500.0, 0.0, 0.0), Vec3::new(501.0, 1.0, 1.0));
+    scene.insert(stale_bounds);
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [63, 46, 1, 1])
+        .unwrap();
+    assert_eq!(hits.first().unwrap().id, PickId::new(1, 10, 0));
 }
 
 #[test]

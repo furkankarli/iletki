@@ -37,6 +37,42 @@ exclude presentation, image readback, PNG output and CPU work performed before t
 such as camera updates and crosshair mesh generation. These are synchronized offscreen latencies.
 The resize workload waits at the end of the batch. Each target set can contain multiple textures.
 
+## Independent 3D parts
+
+The assembly workload stores each part as a separate mesh chunk with a pick ID. It orbits
+1,000, 4,000 and 20,000 parts in near, wide and dual views at 1024×768 with 4× MSAA. The
+4,000-part near view also measures a blocking 5×5 pick, a blocking 256×256 marquee, and
+a moving asynchronous pick with one request in flight. For this near view the 60 Hz
+targets are 12 ms orbit, 8 ms blocking click, and 16.67 ms marquee at p95.
+
+```sh
+cargo build --release --locked -p iletki --features profiling --example assembly_bench
+for run in 1 2 3; do
+  ILETKI_PROFILE=1 target/release/examples/assembly_bench "out/assembly/$run" candidate "$run"
+done
+ILETKI_PRIMARY_ONLY=1 ILETKI_PROFILE=1 \
+  target/release/examples/assembly_bench out/assembly/visibility-only visibility-only 1
+```
+
+`frames.csv` includes the first submitted frame and steady-state samples. For orbit,
+`cpu_ms` covers encoding through command-buffer finalization and `wall_ms` also includes
+submission and waiting for GPU completion. For asynchronous picking, `cpu_ms` is the
+time through submission and `wall_ms` includes polling and decode. Orbit records a
+reference image hash per case and run. Picking records the ordered ID and depth hash
+of each request. Compare signatures on the same adapter and backend.
+
+`ILETKI_PROFILE=1` records eight additional frames per primary workload in `profile.csv`,
+outside the latency samples. CPU scopes and GPU pass timestamps are in nanoseconds,
+along with counters for candidates, draws and uniform writes. GPU timestamps require
+the adapter to support the feature. The `visibility-only` variant keeps visibility
+filtering and uses individual uniform writes for the orbit control.
+`ILETKI_ASSEMBLY_CASE=20000/wide` isolates one size and view. For revision A/B testing,
+build each checkout in a separate Cargo target directory and alternate their run order.
+
+The offscreen workloads exclude window acquisition, compositing and presentation. The
+asynchronous pick workload polls continuously to measure request readiness independently
+of the application's event loop or display refresh rate.
+
 Keep the CSVs in frame order and run several repetitions. When comparing renderers, fix the GPU,
 driver, visible geometry, camera, lighting, MSAA and output format. Measure initial setup,
 steady-state rendering, cache hits and presentation as separate workloads. Use enough samples for
