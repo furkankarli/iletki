@@ -33,6 +33,16 @@ impl LayerRevision {
     pub fn mark_dynamic(&mut self) {
         self.dynamic = NEXT_LAYER_REVISION.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Returns the revision without its dynamic component.
+    /// Compare this only for work known to ignore dynamic scene content.
+    #[must_use]
+    pub const fn static_only(self) -> Self {
+        Self {
+            static_scene: self.static_scene,
+            dynamic: 0,
+        }
+    }
 }
 
 /// Weak reference to a viewport's lifetime, for caches stored inside shared layers.

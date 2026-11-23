@@ -102,13 +102,19 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
                 PickId::new(1, i + 1, 0),
                 true,
             );
+            if i == 80 {
+                mesh.pick_ids.clear();
+            }
+            if i == 81 {
+                mesh.pick_ids.fill([0, 0]);
+            }
             let chunk = scene.insert(mesh);
             if i == 85 {
                 scene.set_selected(chunk, true);
             }
         }
         let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
-        let area = [46, 46, 48, 48];
+        let area = [0, 0, SIZE, SIZE];
         let packed = host
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
             .unwrap();
@@ -125,11 +131,11 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         assert_eq!(
             packed
                 .iter()
-                .map(|hit| (hit.id, hit.depth.to_bits()))
+                .map(|hit| (hit.id, hit.depth.to_bits(), hit.world_pos))
                 .collect::<Vec<_>>(),
             picks
                 .iter()
-                .map(|hit| (hit.id, hit.depth.to_bits()))
+                .map(|hit| (hit.id, hit.depth.to_bits(), hit.world_pos))
                 .collect::<Vec<_>>()
         );
     }

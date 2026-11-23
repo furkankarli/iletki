@@ -8,6 +8,7 @@
 //! Controls:
 //! - Middle/Right drag: Orbit (3D) or Pan (2D); hold Shift to Pan in 3D
 //! - Scroll wheel: Dolly / Zoom
+//! - Shift + Left drag: Select visible 3D objects within a rectangle
 //! - Left click: 64-bit GPU Pick (highlights selected 3D chunk with Jump-Flood outline + moves gizmo)
 //! - `1` : 3D Architectural Scene (Shaded with Edges + JFA Outline + Grid + Gizmo)
 //! - `2` : 2D National-Grid CAD Stress (500,000 segments at UTM 661km / 4491km)
@@ -32,6 +33,7 @@ use iletki::{
     TransformGizmoLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
     ViewportMode, order_to_depth,
 };
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,6 +45,66 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+const MARQUEE_SHADER: &str = r#"
+@vertex
+fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((index << 1u) & 2u);
+    let y = f32(index & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.48, 0.09, 1.0);
+}
+"#;
+
+fn marquee_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("marquee border"),
+        source: wgpu::ShaderSource::Wgsl(MARQUEE_SHADER.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("marquee border"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn marquee_border(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &wgpu::RenderPipeline,
+    rect: [u32; 4],
+) {
+    let [x, y, w, h] = rect;
+    pass.set_pipeline(pipeline);
+    for [x, y, w, h] in [
+        [x, y, w, 1],
+        [x, y + h - 1, w, 1],
+        [x, y, 1, h],
+        [x + w - 1, y, 1, h],
+    ] {
+        pass.set_scissor_rect(x, y, w, h);
+        pass.draw(0..3, 0..1);
+    }
+}
 
 fn block_on<F: Future>(fut: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
@@ -69,7 +131,7 @@ struct ChunkMeta {
     name: &'static str,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct PickView {
     scene: DemoScene,
     camera: Camera,
@@ -78,10 +140,19 @@ struct PickView {
     revision: iletki::gpu::LayerRevision,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickKind {
+    Click,
+    Preview,
+    Commit,
+}
+
 struct PickRequest {
     rect: [u32; 4],
     view: PickView,
     event: Option<usize>,
+    kind: PickKind,
+    epoch: u64,
 }
 
 struct GpuState {
@@ -107,6 +178,10 @@ struct GpuState {
     // Shared scene layers
     scene_3d: Scene3DLayer,
     chunks_3d: Vec<ChunkMeta>,
+    chunk_by_object: HashMap<u32, usize>,
+    committed_selection: HashSet<Chunk3DId>,
+    visible_selection: HashSet<Chunk3DId>,
+    preview_view: Option<PickView>,
     grid_3d: InfiniteGrid3DLayer,
     gizmo_3d: TransformGizmoLayer,
     instanced_3d: InstancedMesh3DLayer,
@@ -120,9 +195,15 @@ struct GpuState {
     modifiers: Modifiers,
     last_cursor: Vec2,
     press_pos: Option<Vec2>,
+    marquee_origin: Option<Vec2>,
+    marquee_rect: Option<[u32; 4]>,
+    marquee_border: wgpu::RenderPipeline,
+    pick_epoch: u64,
     pending_pick: Option<(PendingPick, PickRequest)>,
     queued_pick: Option<PickRequest>,
     latency: Option<latency::Trace>,
+    #[cfg(feature = "profiling")]
+    pick_profile: bool,
     bench_fit: Option<(Vec3, f64)>,
     bench_edits: Vec<(Chunk3DId, Vec3)>,
     bench_dual: bool,
@@ -154,9 +235,18 @@ impl GpuState {
         let info = adapter.get_info();
         println!("iletki-demo GPU: {} ({:?})", info.name, info.backend);
 
+        let features = wgpu::Features::CLIP_DISTANCES;
+        #[cfg(feature = "profiling")]
+        let pick_profile = std::env::var_os("ILETKI_PICK_PROFILE").is_some();
+        #[cfg(feature = "profiling")]
+        let features = if pick_profile {
+            features | wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            features
+        };
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("iletki-demo device"),
-            required_features: adapter.features() & wgpu::Features::CLIP_DISTANCES,
+            required_features: adapter.features() & features,
             ..wgpu::DeviceDescriptor::default()
         }))
         .map_err(|e| format!("request_device failed: {e}"))?;
@@ -272,6 +362,18 @@ impl GpuState {
             .is_some_and(|options| options.style == latency::Style::Section);
         let latency = bench.map(|options| latency::Trace::new(options, &device, format));
 
+        let chunk_by_object = chunks_3d
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| (chunk.pick_object, index))
+            .collect();
+        let committed_selection: HashSet<_> = chunks_3d
+            .iter()
+            .map(|chunk| chunk.chunk_id)
+            .filter(|&id| scene_3d.is_selected(id))
+            .collect();
+        let visible_selection = committed_selection.clone();
+        let marquee_border = marquee_pipeline(&device, format);
         let mut state = Self {
             window,
             surface,
@@ -294,6 +396,10 @@ impl GpuState {
             last_frame_time: Instant::now(),
             scene_3d,
             chunks_3d,
+            chunk_by_object,
+            committed_selection,
+            visible_selection,
+            preview_view: None,
             grid_3d,
             gizmo_3d,
             instanced_3d,
@@ -305,9 +411,15 @@ impl GpuState {
             modifiers: Modifiers::default(),
             last_cursor: Vec2::ZERO,
             press_pos: None,
+            marquee_origin: None,
+            marquee_rect: None,
+            marquee_border,
+            pick_epoch: 0,
             pending_pick: None,
             queued_pick: None,
             latency,
+            #[cfg(feature = "profiling")]
+            pick_profile,
             bench_fit,
             bench_edits,
             bench_dual,
@@ -316,6 +428,10 @@ impl GpuState {
             fps_timer: Instant::now(),
             smoothed_ms: 0.0,
         };
+        #[cfg(feature = "profiling")]
+        if std::env::var_os("ILETKI_DIRECT_PICK").is_some() {
+            state.scene_3d.set_profile_batch_picking(false);
+        }
         state.reset_cameras();
         if let Some((center, radius)) = state.bench_fit {
             *state.vp_main.camera_mut() = Camera::perspective_3d(
@@ -491,8 +607,11 @@ impl GpuState {
         self.vp_main.mark_dirty(DirtyFlags::OVERLAY);
     }
 
-    fn pick_view(&self) -> PickView {
+    fn pick_view(&self, kind: PickKind) -> PickView {
         let revision = match self.active_scene {
+            DemoScene::Arch3D if kind != PickKind::Click => {
+                ViewportLayer::<()>::revision(&self.scene_3d).static_only()
+            }
             DemoScene::Arch3D => ViewportLayer::<()>::revision(&self.scene_3d),
             // The demo's 2D geometry is immutable. Cursor overlay writes are unrelated to picks.
             DemoScene::Cad2D => iletki::gpu::LayerRevision::default(),
@@ -516,7 +635,11 @@ impl GpuState {
             .latency
             .as_mut()
             .and_then(|trace| trace.live("click", now));
-        self.request_pick([px.saturating_sub(2), py.saturating_sub(2), 5, 5], event);
+        self.request_pick(
+            [px.saturating_sub(2), py.saturating_sub(2), 5, 5],
+            PickKind::Click,
+            event,
+        );
     }
 
     fn pick_status(&mut self, event: Option<usize>, status: &'static str, hits: Option<usize>) {
@@ -527,19 +650,110 @@ impl GpuState {
         }
     }
 
-    fn request_pick(&mut self, rect: [u32; 4], event: Option<usize>) {
+    fn marquee_at(&self, origin: Vec2, cursor: Vec2) -> Option<[u32; 4]> {
+        if !origin.is_finite() || !cursor.is_finite() || origin == cursor {
+            return None;
+        }
+        let dpi = self.window.scale_factor();
+        let [w, h] = self.vp_main.size().active_px;
+        let x = (origin.x.min(cursor.x) * dpi)
+            .floor()
+            .clamp(0.0, f64::from(w)) as u32;
+        let y = (origin.y.min(cursor.y) * dpi)
+            .floor()
+            .clamp(0.0, f64::from(h)) as u32;
+        let right = (origin.x.max(cursor.x) * dpi)
+            .ceil()
+            .clamp(0.0, f64::from(w)) as u32;
+        let bottom = (origin.y.max(cursor.y) * dpi)
+            .ceil()
+            .clamp(0.0, f64::from(h)) as u32;
+        (right > x && bottom > y).then_some([
+            x,
+            y,
+            right.saturating_sub(x),
+            bottom.saturating_sub(y),
+        ])
+    }
+
+    fn update_marquee(&mut self, origin: Vec2, kind: PickKind, now: Instant) {
+        let rect = self.marquee_at(origin, self.last_cursor);
+        if kind == PickKind::Preview {
+            if rect == self.marquee_rect {
+                return;
+            }
+            self.marquee_rect = rect;
+        } else {
+            self.marquee_rect = None;
+        }
+        if let Some(rect) = rect {
+            let label = if kind == PickKind::Commit {
+                "marquee-release"
+            } else {
+                "marquee"
+            };
+            let event = self
+                .latency
+                .as_mut()
+                .and_then(|trace| trace.live(label, now));
+            self.request_pick(rect, kind, event);
+        } else if kind == PickKind::Preview {
+            self.invalidate_picks();
+        } else {
+            self.cancel_selection();
+        }
+        self.window.request_redraw();
+    }
+
+    fn cancel_selection(&mut self) {
+        self.marquee_origin = None;
+        self.marquee_rect = None;
+        self.invalidate_picks();
+        self.window.request_redraw();
+    }
+
+    fn invalidate_picks(&mut self) {
+        self.pick_epoch = self.pick_epoch.wrapping_add(1);
+        if let Some(queued) = self.queued_pick.take() {
+            self.pick_status(queued.event, "cancelled", None);
+        }
+        self.clear_preview("cancelled");
+    }
+
+    fn clear_preview(&mut self, status: &'static str) {
+        if self.preview_view.take().is_some() {
+            if let Some(trace) = &mut self.latency {
+                trace.invalidate_selection_frame(status);
+            }
+            self.sync_highlights(None);
+        }
+    }
+
+    fn request_pick(&mut self, rect: [u32; 4], kind: PickKind, event: Option<usize>) {
         if self.quad_view || self.bench_dual {
             self.pick_status(event, "unsupported-view", None);
             return;
         }
+        if let (Some(trace), Some(id)) = (&mut self.latency, event) {
+            trace.selection_rect(id, rect);
+        }
         let request = PickRequest {
             rect,
-            view: self.pick_view(),
+            view: self.pick_view(kind),
             event,
+            kind,
+            epoch: self.pick_epoch,
         };
         if self.pending_pick.is_some() {
-            if let Some(old) = self.queued_pick.replace(request) {
-                self.pick_status(old.event, "superseded", None);
+            if kind == PickKind::Preview
+                && self
+                    .queued_pick
+                    .as_ref()
+                    .is_some_and(|queued| queued.kind == PickKind::Commit)
+            {
+                self.pick_status(event, "coalesced-before-submit", None);
+            } else if let Some(old) = self.queued_pick.replace(request) {
+                self.pick_status(old.event, "coalesced-before-submit", None);
             }
         } else {
             self.begin_pick(request);
@@ -548,7 +762,25 @@ impl GpuState {
 
     fn begin_pick(&mut self, mut request: PickRequest) {
         let rect = request.rect;
+        #[cfg(feature = "profiling")]
+        if self.pick_profile
+            && self
+                .latency
+                .as_ref()
+                .is_some_and(|trace| trace.ticks >= 65 && trace.ticks.is_multiple_of(4))
+            && !iletki::gpu::profiling::active()
+        {
+            iletki::gpu::profiling::begin(&self.device);
+        }
+        self.pick_status(request.event, "encoding", None);
         let pick = match self.active_scene {
+            DemoScene::Arch3D if request.kind != PickKind::Click => self.vp_main.begin_pick_rect(
+                &self.device,
+                &self.queue,
+                &(),
+                &mut [&mut self.scene_3d],
+                rect,
+            ),
             DemoScene::Arch3D => {
                 let mut layers: [&mut dyn ViewportLayer<()>; 3] =
                     [&mut self.scene_3d, &mut self.grid_3d, &mut self.gizmo_3d];
@@ -568,74 +800,136 @@ impl GpuState {
         };
         if let Ok(pick) = pick {
             // Picking can itself finish progressive uploads during preparation.
-            request.view = self.pick_view();
+            request.view = self.pick_view(request.kind);
             self.pick_status(request.event, "submitted", None);
             self.pending_pick = Some((pick, request));
         } else {
             self.pick_status(request.event, "error", None);
+            if request.kind == PickKind::Commit {
+                self.clear_preview("cancelled");
+            }
+        }
+    }
+
+    fn clear_stale_preview(&mut self) {
+        if self
+            .preview_view
+            .as_ref()
+            .is_some_and(|view| *view != self.pick_view(PickKind::Preview))
+        {
+            self.clear_preview("stale-before-frame");
+            self.window.request_redraw();
         }
     }
 
     fn poll_pick(&mut self) {
+        self.clear_stale_preview();
         let Some((pick, _)) = &mut self.pending_pick else {
             return;
         };
         let Poll::Ready(result) = pick.try_read() else {
             return;
         };
-        let Some((_, request)) = self.pending_pick.take() else {
+        let Some((_, mut request)) = self.pending_pick.take() else {
             return;
         };
-        let current = self.pick_view();
-        if self.quad_view || self.bench_dual {
-            self.pick_status(request.event, "stale", None);
-            if let Some(queued) = self.queued_pick.take() {
-                self.pick_status(queued.event, "stale", None);
-            }
-            return;
+        if let Ok(hits) = &result {
+            self.pick_status(request.event, "ready", Some(hits.len()));
         }
-        if let Some(queued) = self.queued_pick.take() {
-            if queued.view == current {
-                self.pick_status(request.event, "superseded", None);
-                self.begin_pick(queued);
+        if request.epoch != self.pick_epoch || self.quad_view || self.bench_dual {
+            self.pick_status(request.event, "cancelled", None);
+        } else if request.view != self.pick_view(request.kind) {
+            if request.kind == PickKind::Commit {
+                request.view = self.pick_view(request.kind);
+                self.begin_pick(request);
                 return;
             }
-            self.pick_status(queued.event, "stale", None);
-        }
-        if request.view != current {
             self.pick_status(request.event, "stale", None);
         } else if let Ok(hits) = result {
-            self.pick_status(request.event, "ready", Some(hits.len()));
             if let Some(trace) = &mut self.latency
                 && let Some(id) = request.event
             {
                 trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
                 trace.selection_redraw(id);
             }
-            self.apply_pick(&hits);
+            self.apply_pick(&hits, request);
         } else {
             self.pick_status(request.event, "error", None);
+            if request.kind == PickKind::Commit {
+                self.clear_preview("cancelled");
+            }
+        }
+        if let Some(queued) = self.queued_pick.take() {
+            if queued.epoch == self.pick_epoch
+                && (queued.kind == PickKind::Commit || queued.view == self.pick_view(queued.kind))
+            {
+                self.begin_pick(queued);
+            } else {
+                self.pick_status(queued.event, "stale-before-submit", None);
+            }
         }
     }
 
-    fn apply_pick(&mut self, hits: &[PickHit]) {
-        if let Some(hit) = hits.first() {
+    fn sync_highlights(&mut self, preview: Option<HashSet<Chunk3DId>>) {
+        let desired = preview.as_ref().unwrap_or(&self.committed_selection);
+        for &id in self.visible_selection.difference(desired) {
+            self.scene_3d.set_selected(id, false);
+        }
+        for &id in desired.difference(&self.visible_selection) {
+            self.scene_3d.set_selected(id, true);
+        }
+        if self.visible_selection != *desired {
+            self.visible_selection = preview.unwrap_or_else(|| self.committed_selection.clone());
+            self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+        }
+    }
+
+    fn apply_pick(&mut self, hits: &[PickHit], request: PickRequest) {
+        if request.kind != PickKind::Click {
+            let selected: HashSet<_> = hits
+                .iter()
+                .filter(|hit| hit.id.layer == 1)
+                .filter_map(|hit| self.chunk_by_object.get(&hit.id.object))
+                .filter_map(|&index| self.chunks_3d.get(index))
+                .map(|chunk| chunk.chunk_id)
+                .collect();
+            if request.kind == PickKind::Commit {
+                self.preview_view = None;
+                self.committed_selection = selected;
+                self.sync_highlights(None);
+            } else {
+                self.preview_view = Some(request.view);
+                self.sync_highlights(Some(selected));
+            }
+            if request.kind == PickKind::Commit {
+                self.gizmo_3d.origin = None;
+                self.vp_main.mark_dirty(DirtyFlags::GIZMO);
+            }
+            self.last_pick_text = format!("{} selected", self.visible_selection.len());
+            if let (Some(trace), Some(event)) = (&mut self.latency, request.event) {
+                trace.highlighted(event, self.visible_selection.len());
+                if request.kind == PickKind::Commit {
+                    trace.release_digest(event, hits);
+                }
+            }
+        } else if let Some(hit) = hits.first() {
             if self.active_scene == DemoScene::Arch3D && hit.id.layer == 1 {
-                self.scene_3d.clear_selection();
+                self.preview_view = None;
+                self.committed_selection.clear();
                 if let Some(meta) = self
-                    .chunks_3d
-                    .iter()
-                    .find(|m| m.pick_object == hit.id.object)
+                    .chunk_by_object
+                    .get(&hit.id.object)
+                    .and_then(|&index| self.chunks_3d.get(index))
                 {
-                    self.scene_3d.set_selected(meta.chunk_id, true);
+                    self.committed_selection.insert(meta.chunk_id);
                     self.gizmo_3d.origin = Some(meta.gizmo_pos);
                     self.last_pick_text = format!(
                         "Picked {} (obj={} face={})",
                         meta.name, hit.id.object, hit.id.sub
                     );
                 }
-                self.vp_main
-                    .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
+                self.sync_highlights(None);
+                self.vp_main.mark_dirty(DirtyFlags::GIZMO);
             } else {
                 self.last_pick_text = format!(
                     "Picked layer={} obj={} sub={}",
@@ -644,14 +938,14 @@ impl GpuState {
             }
         } else {
             if self.active_scene == DemoScene::Arch3D {
-                self.scene_3d.clear_selection();
+                self.preview_view = None;
+                self.committed_selection.clear();
+                self.sync_highlights(None);
                 self.gizmo_3d.origin = None;
-                self.vp_main
-                    .mark_dirty(DirtyFlags::OVERLAY.union(DirtyFlags::GIZMO));
+                self.vp_main.mark_dirty(DirtyFlags::GIZMO);
             }
             self.last_pick_text = String::from("Empty background");
         }
-        self.update_title();
         self.window.request_redraw();
     }
 
@@ -732,6 +1026,14 @@ impl GpuState {
             return;
         };
         let action = trace.options.action;
+        let motion = trace.options.motion;
+        let region = trace.options.region;
+        let width = trace.options.rect_size;
+        let release = if action == latency::Action::Marquee {
+            trace.replay_release(now)
+        } else {
+            None
+        };
         let [w, h] = self.vp_main.size().active_px;
         let center = self.vp_main.logical_size() * 0.5;
         let sign = if tick % 2 == 0 { 1.0 } else { -1.0 };
@@ -740,20 +1042,67 @@ impl GpuState {
             ..Modifiers::default()
         };
         match action {
-            latency::Action::Click | latency::Action::Marquee => {
-                let width = if action == latency::Action::Click {
-                    5
-                } else {
-                    256
-                };
+            latency::Action::Click => {
                 let x = if tick % 2 == 0 { w / 2 } else { w / 8 };
+                self.request_pick(
+                    [x.saturating_sub(2), (h / 2).saturating_sub(2), 5, 5],
+                    PickKind::Click,
+                    Some(event),
+                );
+                return;
+            }
+            latency::Action::Marquee => {
+                if motion == latency::Motion::Orbit {
+                    if tick == 0 {
+                        self.dispatch_input(&ViewportInput::PointerDown {
+                            pos: center,
+                            button: PointerButton::Middle,
+                            modifiers,
+                        });
+                    }
+                    self.dispatch_input(&ViewportInput::PointerMove {
+                        pos: center,
+                        delta: Vec2::new(6.0 * sign, sign),
+                        modifiers,
+                    });
+                }
+                if motion == latency::Motion::Edit && tick % 6 == 0 {
+                    let offset = if tick % 12 == 0 { 0.2 } else { 0.0 };
+                    for &(id, origin) in &self.bench_edits {
+                        self.scene_3d.set_origin(id, origin + Vec3::X * offset);
+                    }
+                }
+                if motion == latency::Motion::Section {
+                    self.rotate_bench_section(tick);
+                }
+                let (x, y) = match region {
+                    latency::Region::Mixed => (if tick % 2 == 0 { w / 2 } else { w / 8 }, h / 2),
+                    region => {
+                        let x = match region {
+                            latency::Region::Filled => w / 2,
+                            latency::Region::Boundary => w / 3,
+                            _ => 0,
+                        };
+                        let offset = (tick % 32) as i32 - 16;
+                        (
+                            x.saturating_add_signed(offset),
+                            (h / 2).saturating_add_signed(offset / 2),
+                        )
+                    }
+                };
                 let rect = [
                     x.saturating_sub(width / 2),
-                    (h / 2).saturating_sub(width / 2),
-                    width,
-                    width,
+                    y.saturating_sub(width / 2),
+                    width.min(w),
+                    width.min(h),
                 ];
-                self.request_pick(rect, Some(event));
+                if motion != latency::Motion::Static {
+                    self.window.request_redraw();
+                }
+                self.request_pick(rect, PickKind::Preview, Some(event));
+                if let Some(release) = release {
+                    self.request_pick(rect, PickKind::Commit, Some(release));
+                }
                 return;
             }
             latency::Action::Live => return,
@@ -786,9 +1135,17 @@ impl GpuState {
                 });
             }
         }
-        if self.clip_enabled
-            && let Some((focus, _)) = self.bench_fit
-        {
+        if self.clip_enabled {
+            self.rotate_bench_section(tick);
+        }
+        if let Some(trace) = &mut self.latency {
+            trace.redraw(event);
+        }
+        self.window.request_redraw();
+    }
+
+    fn rotate_bench_section(&mut self, tick: u32) {
+        if let Some((focus, _)) = self.bench_fit {
             let angle = f64::from(tick % 60) * std::f64::consts::TAU / 60.0;
             if let Some(plane) =
                 Plane::from_normal_point(Vec3::new(angle.sin(), angle.cos(), 0.15), focus)
@@ -799,10 +1156,6 @@ impl GpuState {
                 }
             }
         }
-        if let Some(trace) = &mut self.latency {
-            trace.redraw(event);
-        }
-        self.window.request_redraw();
     }
 
     fn trace_surface_failure(&mut self, started: Instant, status: &'static str) {
@@ -864,6 +1217,7 @@ impl GpuState {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
 
+        self.clear_stale_preview();
         let mut streaming = false;
         if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
             let qw = (w / 2) as f32;
@@ -970,6 +1324,9 @@ impl GpuState {
                 multiview_mask: None,
             });
             self.vp_main.paint_into_pass(&mut pass, self.pass_desc);
+            if let Some(rect) = self.marquee_rect {
+                marquee_border(&mut pass, &self.marquee_border, rect);
+            }
         }
 
         if let Some(trace) = &self.latency
@@ -1018,6 +1375,24 @@ impl GpuState {
                 status: "present-called",
                 streaming,
             });
+        }
+
+        #[cfg(feature = "profiling")]
+        if self.pick_profile && iletki::gpu::profiling::active() && self.pending_pick.is_none() {
+            match iletki::gpu::profiling::finish(&self.device, &self.queue) {
+                Ok(capture) => {
+                    for (name, elapsed) in capture.cpu {
+                        println!("profile,cpu,{name},{}", elapsed.as_nanos());
+                    }
+                    for (name, elapsed) in capture.gpu {
+                        println!("profile,gpu,{name},{}", elapsed.as_nanos());
+                    }
+                    for (name, count) in capture.counters {
+                        println!("profile,count,{name},{count}");
+                    }
+                }
+                Err(error) => eprintln!("pick profile failed: {error}"),
+            }
         }
 
         let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -1083,7 +1458,7 @@ impl ApplicationHandler for DemoApp {
             let mut deadline = state
                 .pending_pick
                 .as_ref()
-                .map(|_| now + Duration::from_millis(2));
+                .map(|_| Instant::now() + Duration::from_millis(1));
             if let Some(trace) = &state.latency {
                 if trace.pending_gpu() {
                     let _ = state.device.poll(wgpu::PollType::Poll);
@@ -1117,8 +1492,20 @@ impl ApplicationHandler for DemoApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                if [size.width, size.height] != [s.surface_config.width, s.surface_config.height] {
+                    s.cancel_selection();
+                }
                 s.resize(size);
                 s.window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                s.cancel_selection();
+                s.resize_viewports();
+            }
+            WindowEvent::Focused(false) => {
+                s.press_pos = None;
+                s.cancel_selection();
+                s.dispatch_input(&ViewportInput::FocusLost);
             }
             WindowEvent::ModifiersChanged(m) => {
                 let st = m.state();
@@ -1132,21 +1519,37 @@ impl ApplicationHandler for DemoApp {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
+                        KeyCode::Escape
+                            if s.marquee_origin.is_some()
+                                || s.preview_view.is_some()
+                                || s.queued_pick
+                                    .as_ref()
+                                    .is_some_and(|request| request.kind == PickKind::Commit)
+                                || s.pending_pick.as_ref().is_some_and(|(_, request)| {
+                                    request.kind == PickKind::Commit
+                                }) =>
+                        {
+                            s.cancel_selection()
+                        }
                         KeyCode::Escape => event_loop.exit(),
                         KeyCode::Digit1 => {
+                            s.cancel_selection();
                             s.active_scene = DemoScene::Arch3D;
                             s.reset_cameras();
                         }
                         KeyCode::Digit2 => {
+                            s.cancel_selection();
                             s.active_scene = DemoScene::Cad2D;
                             s.reset_cameras();
                         }
                         KeyCode::Digit3 => {
+                            s.cancel_selection();
                             s.active_scene = DemoScene::Instanced100k;
                             s.reset_cameras();
                         }
                         KeyCode::KeyQ => {
                             if s.active_scene == DemoScene::Arch3D {
+                                s.cancel_selection();
                                 s.quad_view = !s.quad_view;
                                 s.resize_viewports();
                             }
@@ -1186,6 +1589,24 @@ impl ApplicationHandler for DemoApp {
                         s.transition.cancel();
                     }
                     if btn == PointerButton::Primary {
+                        if state == ElementState::Pressed
+                            && s.modifiers.shift
+                            && s.active_scene == DemoScene::Arch3D
+                            && !s.quad_view
+                            && !s.bench_dual
+                        {
+                            s.cancel_selection();
+                            s.transition.cancel();
+                            s.press_pos = None;
+                            s.marquee_origin = Some(s.last_cursor);
+                            return;
+                        }
+                        if state == ElementState::Released
+                            && let Some(origin) = s.marquee_origin.take()
+                        {
+                            s.update_marquee(origin, PickKind::Commit, Instant::now());
+                            return;
+                        }
                         match state {
                             ElementState::Pressed => s.press_pos = Some(s.last_cursor),
                             ElementState::Released => {
@@ -1219,6 +1640,10 @@ impl ApplicationHandler for DemoApp {
                 let pos = Vec2::new(position.x / dpi, position.y / dpi);
                 let delta = pos - s.last_cursor;
                 s.last_cursor = pos;
+                if let Some(origin) = s.marquee_origin {
+                    s.update_marquee(origin, PickKind::Preview, started);
+                    return;
+                }
                 let ev = ViewportInput::PointerMove {
                     pos,
                     delta,

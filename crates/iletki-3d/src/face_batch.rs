@@ -12,6 +12,7 @@ pub(crate) const OBJECT_BYTES: u64 = (OBJECTS * size_of::<ObjectUniforms>()) as 
 pub(crate) struct GeometryPage {
     vertices: wgpu::Buffer,
     slots: wgpu::Buffer,
+    picks: Option<wgpu::Buffer>,
 }
 
 pub(crate) enum VertexRange {
@@ -34,12 +35,25 @@ impl VertexRange {
             }
         }
     }
+
+    pub(crate) fn pick_slice(&self) -> Option<wgpu::BufferSlice<'_>> {
+        let Self::Packed { page, vertices, .. } = self else {
+            return None;
+        };
+        let stride = size_of::<[u32; 2]>() as u64;
+        Some(
+            page.picks
+                .as_ref()?
+                .slice((u64::from(vertices.start) * stride)..(u64::from(vertices.end) * stride)),
+        )
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct PageBuilder {
     vertices: Vec<Vertex3D>,
     slots: Vec<u32>,
+    picks: Vec<[u32; 2]>,
     objects: Vec<(usize, Range<u32>)>,
 }
 
@@ -60,6 +74,7 @@ impl PageBuilder {
         &mut self,
         chunk: usize,
         vertices: &[Vertex3D],
+        picks: Option<&[[u32; 2]]>,
         device: &wgpu::Device,
         uploaded: &mut Vec<(usize, VertexRange)>,
     ) {
@@ -67,6 +82,13 @@ impl PageBuilder {
             self.flush(device, uploaded);
         }
         let start = self.vertices.len() as u32;
+        if let Some(picks) = picks {
+            self.picks.resize(self.vertices.len(), [0, 0]);
+            self.picks.extend_from_slice(picks);
+        } else if !self.picks.is_empty() {
+            self.picks
+                .resize(self.vertices.len() + vertices.len(), [0, 0]);
+        }
         self.vertices.extend_from_slice(vertices);
         self.slots
             .resize(self.vertices.len(), self.objects.len() as u32);
@@ -98,6 +120,12 @@ impl PageBuilder {
                 "iletki-3d geometry slots",
                 bytemuck::cast_slice(&self.slots),
             ),
+            picks: (!self.picks.is_empty()).then(|| {
+                make_buffer(
+                    "iletki-3d geometry pick IDs",
+                    bytemuck::cast_slice(&self.picks),
+                )
+            }),
         });
         for (slot, (chunk, vertices)) in self.objects.drain(..).enumerate() {
             uploaded.push((
@@ -111,6 +139,7 @@ impl PageBuilder {
         }
         self.vertices.clear();
         self.slots.clear();
+        self.picks.clear();
     }
 }
 
@@ -260,6 +289,7 @@ impl PackedDraws {
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         pipeline: &wgpu::RenderPipeline,
+        picking: bool,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
         let mut bound = None;
@@ -282,6 +312,12 @@ impl PackedDraws {
                         pass.set_bind_group(1, &page.binding, &[]);
                         pass.set_vertex_buffer(0, geometry.vertices.slice(..));
                         pass.set_vertex_buffer(1, geometry.slots.slice(..));
+                        if picking {
+                            let Some(picks) = &geometry.picks else {
+                                continue;
+                            };
+                            pass.set_vertex_buffer(2, picks.slice(..));
+                        }
                         bound = Some(*uniforms);
                     }
                     pass.draw(vertices.clone(), 0..1);

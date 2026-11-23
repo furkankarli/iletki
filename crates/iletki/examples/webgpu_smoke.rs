@@ -167,7 +167,7 @@ mod web {
                 Vec3::new(0.5, 0.0, 0.5),
                 Vec3::new(-0.5, 0.0, 0.5),
                 [255, 0, 0, 255],
-                PickId::NONE,
+                PickId::new(ID.layer, i, 0),
             );
             scene.insert(mesh);
         }

@@ -88,14 +88,18 @@ fn vs_mask(v: VertIn) -> MaskOut {
     return out;
 }
 
-@vertex
-fn vs_mesh_pick(v: VertIn, p: PickIn) -> PickOut {
-    let pos_rel = v.position * object.scale + object.offset_rel;
+fn pick_vertex(v: VertIn, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {
+    let pos_rel = v.position * placement.scale + placement.offset_rel;
     var out: PickOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
-    out.pick_id = p.pick_id;
+    out.pick_id = id;
     return out;
+}
+
+@vertex
+fn vs_mesh_pick(v: VertIn, p: PickIn) -> PickOut {
+    return pick_vertex(v, object, p.pick_id);
 }
 
 fn shade_mesh(pos_rel: vec3<f32>, normal: vec3<f32>, color: vec4<f32>, is_front: bool) -> vec4<f32> {

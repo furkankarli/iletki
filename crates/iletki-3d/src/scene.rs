@@ -71,6 +71,7 @@ struct PackedPipelines {
     layout: wgpu::BindGroupLayout,
     base: ColorPipelines,
     section: Option<ColorPipelines>,
+    pick: Option<wgpu::RenderPipeline>,
 }
 
 struct SectionPipelines {
@@ -97,6 +98,8 @@ pub struct Scene3DLayer {
     profile_batch_uniforms: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_geometry: bool,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_batch_picking: bool,
 }
 
 impl std::fmt::Debug for Scene3DLayer {
@@ -123,6 +126,8 @@ impl Scene3DLayer {
             profile_batch_uniforms: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_geometry: true,
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_batch_picking: true,
         }
     }
 
@@ -143,6 +148,12 @@ impl Scene3DLayer {
             self.profile_batch_geometry = enabled;
             self.revision.mark_static();
         }
+    }
+
+    /// Switches the picking pass between grouped and per-chunk draws for A/B profiling.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_batch_picking(&mut self, enabled: bool) {
+        self.profile_batch_picking = enabled;
     }
 
     /// Inserts a 3D mesh chunk anchored at `mesh.origin` and returns its [`Chunk3DId`].
@@ -390,6 +401,53 @@ impl Scene3DLayer {
             &face_layout,
             true,
         );
+        let make_pick = |shader: &wgpu::ShaderModule,
+                         vertex,
+                         layout: &wgpu::PipelineLayout,
+                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d pick mesh"),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some("fs_pick"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: PICK_ID_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let pick = make_pick(
+            &shader,
+            "vs_mesh_pick",
+            &pipeline_layout,
+            &[Some(vert_layout.clone()), Some(pick_layout)],
+        );
         let packed = PageBuilder::supports(ctx.device).then(|| {
             let layout = face_batch::bind_layout(ctx.device);
             let pipeline_layout =
@@ -406,14 +464,12 @@ impl Scene3DLayer {
                     label: Some("iletki-3d packed geometry shader"),
                     source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
                 });
-            let buffers = [
-                Some(vert_layout.clone()),
-                Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<u32>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![3 => Uint32],
-                }),
-            ];
+            let slot_layout = wgpu::VertexBufferLayout {
+                array_stride: size_of::<u32>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![3 => Uint32],
+            };
+            let buffers = [Some(vert_layout.clone()), Some(slot_layout.clone())];
             let pipelines =
                 |shader: &wgpu::ShaderModule, face, face_fragment, edge, edge_fragment| {
                     ColorPipelines {
@@ -471,7 +527,26 @@ impl Scene3DLayer {
                     ),
                 }
             });
+            let limits = ctx.device.limits();
+            let pick =
+                (limits.max_vertex_buffers >= 3 && limits.max_vertex_attributes >= 5).then(|| {
+                    make_pick(
+                        &shader,
+                        "vs_pick_batched",
+                        &pipeline_layout,
+                        &[
+                            Some(vert_layout.clone()),
+                            Some(slot_layout),
+                            Some(wgpu::VertexBufferLayout {
+                                array_stride: size_of::<[u32; 2]>() as u64,
+                                step_mode: wgpu::VertexStepMode::Vertex,
+                                attributes: &wgpu::vertex_attr_array![4 => Uint32x2],
+                            }),
+                        ],
+                    )
+                });
             PackedPipelines {
+                pick,
                 layout,
                 base,
                 section,
@@ -565,44 +640,6 @@ impl Scene3DLayer {
                 },
             }
         });
-
-        let pick = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d pick mesh"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_mesh_pick"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(vert_layout), Some(pick_layout)],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_pick"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: PICK_ID_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
 
         self.views.clear();
         self.pipelines = Some(Pipelines {
@@ -715,8 +752,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 if pack_edges {
                     bytes = bytes.saturating_add(mesh.edges.len().saturating_mul(size_of::<u32>()));
                 }
-                if mesh.pick_ids.len() == mesh.vertices.len() {
-                    bytes = bytes.saturating_add(size_of_val(mesh.pick_ids.as_slice()));
+                if pack || mesh.pick_ids.len() == mesh.vertices.len() {
+                    // A shared face page can contain both pickable and unpickable chunks.
+                    bytes = bytes
+                        .saturating_add(mesh.vertices.len().saturating_mul(size_of::<[u32; 2]>()));
                 }
                 if !ctx.uploads.reserve(bytes) {
                     pending = true;
@@ -733,8 +772,16 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     chunk.has_picks = false;
                 } else {
                     chunk.vertex_count = u32::try_from(mesh.vertices.len()).unwrap_or(0);
+                    let picks = (mesh.pick_ids.len() == mesh.vertices.len())
+                        .then_some(mesh.pick_ids.as_slice());
                     if pack {
-                        builder.push(chunk_index, &mesh.vertices, ctx.device, &mut uploaded_faces);
+                        builder.push(
+                            chunk_index,
+                            &mesh.vertices,
+                            picks,
+                            ctx.device,
+                            &mut uploaded_faces,
+                        );
                     } else {
                         chunk.vertex_buf = Some(VertexRange::Direct(
                             ctx.device
@@ -745,22 +792,20 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 }),
                         ));
                     }
-                    if mesh.pick_ids.len() == mesh.vertices.len() {
-                        chunk.pick_buf = Some(ctx.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
+                    chunk.pick_buf = picks.filter(|_| !pack).map(|ids| {
+                        ctx.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                                 label: Some("iletki-3d pick ids"),
-                                contents: bytemuck::cast_slice(&mesh.pick_ids),
+                                contents: bytemuck::cast_slice(ids),
                                 usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        ));
-                        chunk.has_picks = true;
+                            })
+                    });
+                    chunk.has_picks = picks.is_some();
+                    if chunk.has_picks {
                         chunk.pick_bounds_trusted = crate::objects::pick_bounds_cover_vertices(
                             chunk.local_bounds,
                             &mesh.vertices,
                         );
-                    } else {
-                        chunk.pick_buf = None;
-                        chunk.has_picks = false;
                     }
                 }
                 if mesh.edges.is_empty() {
@@ -772,6 +817,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         edge_builder.push(
                             chunk_index,
                             &mesh.edges,
+                            None,
                             ctx.device,
                             &mut uploaded_edges,
                         );
@@ -868,10 +914,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         // Small visible subsets use direct draws. Each larger pass preserves chunk order
         // and stages aligned uniforms only for direct draws or a selected mask.
+        let use_packed = pack_geometry && view.draws.len() >= 128;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let use_packed = use_packed && (picking.is_none() || self.profile_batch_picking);
         let packed_layout = p
             .packed
             .as_ref()
-            .filter(|_| pack_geometry && picking.is_none() && view.draws.len() >= 128)
+            .filter(|packed| use_packed && (picking.is_none() || packed.pick.is_some()))
             .map(|packed| &packed.layout);
         {
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -880,16 +929,19 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 let Some(Some(chunk)) = self.chunks.get(object.chunk) else {
                     continue;
                 };
-                let mut direct = packed_layout.is_none() || chunk.selected;
+                let mut direct = packed_layout.is_none() || (picking.is_none() && chunk.selected);
                 if let Some(layout) = packed_layout {
-                    for (geometry, draws) in [
-                        (&chunk.vertex_buf, &mut view.faces),
-                        (&chunk.edge_buf, &mut view.edges),
-                    ] {
-                        if let Some(geometry) = geometry {
-                            direct |= matches!(geometry, VertexRange::Direct(_));
-                            draws.push(ctx.device, layout, geometry, object.uniforms, index);
-                        }
+                    if let Some(geometry) = &chunk.vertex_buf {
+                        direct |= matches!(geometry, VertexRange::Direct(_));
+                        view.faces
+                            .push(ctx.device, layout, geometry, object.uniforms, index);
+                    }
+                    if picking.is_none()
+                        && let Some(geometry) = &chunk.edge_buf
+                    {
+                        direct |= matches!(geometry, VertexRange::Direct(_));
+                        view.edges
+                            .push(ctx.device, layout, geometry, object.uniforms, index);
                     }
                 }
                 if direct {
@@ -1107,7 +1159,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     if let Some(pipeline) = packed_pipeline
                         && draws.has_packed()
                     {
-                        draws.paint(pass, pipeline, |pass, index| {
+                        draws.paint(pass, pipeline, false, |pass, index| {
                             pass.set_pipeline(direct_pipeline);
                             draw_direct(pass, index);
                         });
@@ -1121,15 +1173,33 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
             DrawPhase::OutlineMask => self.paint_outline_mask(&p.mask, pass, ctx),
             DrawPhase::Picking => {
-                pass.set_pipeline(&p.pick);
-                for (index, object) in view.draws.iter().enumerate() {
-                    if let Some(Some(chunk)) = self.chunks.get(object.chunk)
-                        && let (Some(vbuf), Some(pbuf)) = (&chunk.vertex_buf, &chunk.pick_buf)
+                let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
+                    if let Some(object) = view.draws.get(index)
+                        && let Some(Some(chunk)) = self.chunks.get(object.chunk)
+                        && let Some(vertices) = &chunk.vertex_buf
+                        && let Some(ids) = chunk
+                            .pick_buf
+                            .as_ref()
+                            .map(|buf| buf.slice(..))
+                            .or_else(|| vertices.pick_slice())
                         && view.bind(pass, index, p.dynamic_uniforms)
                     {
-                        pass.set_vertex_buffer(0, vbuf.slice());
-                        pass.set_vertex_buffer(1, pbuf.slice(..));
+                        pass.set_vertex_buffer(0, vertices.slice());
+                        pass.set_vertex_buffer(1, ids);
                         pass.draw(0..chunk.vertex_count, 0..1);
+                    }
+                };
+                if let Some(pipeline) = p.packed.as_ref().and_then(|packed| packed.pick.as_ref())
+                    && view.faces.has_packed()
+                {
+                    view.faces.paint(pass, pipeline, true, |pass, index| {
+                        pass.set_pipeline(&p.pick);
+                        draw_direct(pass, index);
+                    });
+                } else {
+                    pass.set_pipeline(&p.pick);
+                    for index in 0..view.draws.len() {
+                        draw_direct(pass, index);
                     }
                 }
             }

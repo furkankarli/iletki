@@ -1150,6 +1150,7 @@ impl ViewportHost {
             label: Some("iletki pick encoder"),
         });
         {
+            let _profile = crate::trace::scope("pick.draw_encode");
             let paint_ctx = PaintCtx {
                 viewport_id: self.id,
                 camera: &self.camera,
@@ -1192,17 +1193,20 @@ impl ViewportHost {
                 }
             }
         }
-        let depth_copy = self
-            .depth_copy
-            .get_or_insert_with(|| DepthCopyPipeline::new(device));
-        let depth_r32f = depth_copy.copy_subrect(
-            device,
-            queue,
-            &mut encoder,
-            pick.depth_view(),
-            [x0, y0],
-            [w, h],
-        );
+        let depth_r32f = {
+            let _profile = crate::trace::scope("pick.depth_copy_encode");
+            let depth_copy = self
+                .depth_copy
+                .get_or_insert_with(|| DepthCopyPipeline::new(device));
+            depth_copy.copy_subrect(
+                device,
+                queue,
+                &mut encoder,
+                pick.depth_view(),
+                [x0, y0],
+                [w, h],
+            )
+        };
 
         // Copy both ID and depth sub-rects into staging buffers in the SAME command submission.
         let id_buf = encode_texture_to_staging(
@@ -1324,6 +1328,7 @@ fn extract_mapped_rows(
     staging: &wgpu::Buffer,
     layout: StagingLayout,
 ) -> Result<Vec<u8>, ViewportError> {
+    let _profile = crate::trace::scope("readback.copy_rows");
     let slice = staging.slice(..);
     let mapped = slice
         .get_mapped_range()
@@ -1394,15 +1399,18 @@ impl PendingPick {
             return Poll::Ready(Err(ViewportError::PickAlreadyRead));
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|_| ViewportError::BufferMapFailed)?;
+        {
+            let _profile = crate::trace::scope("pick.poll_maps");
+            #[cfg(not(target_arch = "wasm32"))]
+            self.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|_| ViewportError::BufferMapFailed)?;
 
-        let id_ready = map_is_ready(&self.id_map, wake)?;
-        let depth_ready = map_is_ready(&self.depth_map, wake)?;
-        if !id_ready || !depth_ready {
-            return Poll::Pending;
+            let id_ready = map_is_ready(&self.id_map, wake)?;
+            let depth_ready = map_is_ready(&self.depth_map, wake)?;
+            if !id_ready || !depth_ready {
+                return Poll::Pending;
+            }
         }
 
         let staged = self.staged.take().ok_or(ViewportError::PickAlreadyRead)?;

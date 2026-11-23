@@ -103,23 +103,55 @@ size, output and active refresh rate. The replay runs at approximately 60 input
 events per second. Actions are `orbit`, `pan`, `zoom`, `click`, `marquee` and `edit`.
 The edit action orbits while moving every hundredth part once every six events.
 `--action live` records OS input from dragging, scrolling and releasing a pick button.
+Use Shift + left drag in the single 3D viewport to preview a visible-object selection
+and release to commit it. Escape cancels the gesture and restores the committed selection.
 `--dual` adds an orthographic view for camera and edit replays.
+
+For the wide marquee gate, run the following command three times per adapter with separate
+output directories. Use `--region boundary` and `--region empty` for separate controls.
+The default `mixed` region alternates center and left rectangles for historical comparison.
+Use `--rect-size 512` for large rectangles and `--motion orbit|section|edit` for invalidation
+under camera moves, live section changes or 1% part edits. Section motion requires
+`--style edges-section`. Replay requests run on a 60 Hz schedule and write a separate final
+release event.
+
+```sh
+cargo run --release -p iletki-demo -- --latency-bench out/marquee/radeon/filled/1 \
+  --scene wide --style edges-section --action marquee --region filled
+python3 docs/benchmarks/repro/summarize-latency.py out/marquee
+```
+
+Use 16.67 ms p95, 33.3 ms p99 and at least 57 applied preview frames per scheduled second
+as the fixed-view, filled 256×256 software gate. Check the highlighted object count to
+distinguish dense, boundary and empty requests. Leave `ILETKI_PICK_PROFILE` unset for latency
+gates. Build the demo with `--features profiling` and set `ILETKI_PICK_PROFILE=1` in a separate
+run to log CPU phases, GPU passes and draw counts. Set `ILETKI_DIRECT_PICK=1` in that build
+to A/B the per-chunk pick path while keeping the same preview and contour code.
 
 For a controlled presentation comparison, select `--present fifo` or `--present mailbox`,
 `--depth 1` or `--depth 2`, and optionally `--notify-present` for the Wayland frame
 callback. Baseline runs omit these overrides. Each frame records surface acquisition,
 encode, queue submit and present return timestamps. GPU completion uses callbacks
 observed during nonblocking polling. The event CSV tracks the frame using each input
-or pick result, including superseded and stale picks. Surface failures retain their
-own status. The top-left marker encodes the low 16 Gray-code frame-ID bits in
+or pick result, the rectangle, raw hits and highlighted objects, and timestamps for
+pick encode start, submission and observed completion. It distinguishes requests
+coalesced before submission, results coalesced before a frame and stale results.
+Compare the release digest between packed and direct runs using the same binary and adapter.
+The digest includes the ordered hit IDs, depth bits and reconstructed world positions.
+Surface failures retain their own status. The top-left marker encodes the low 16 Gray-code frame-ID bits in
 left-to-right three-pixel cells. Match external optical captures to the frame ID and
 use a synchronized physical input trigger to measure input-to-display latency.
 The timing CSVs cover software observations and leave physical latency to that capture.
 
-For physical acceptance, use a fixed 60 Hz display and report both camera and selection
-latency against the agreed limits. The rendering limits are 12 ms p95 and 16.67 ms p99
+For physical acceptance, run in live mode on a fixed 60 Hz display. Trigger HID input and
+an LED from a shared clock and capture the LED, frame marker and changed viewport region
+together at 1,000 fps or faster, or use a calibrated equivalent. Vary trigger time across the
+refresh interval. Measure the change at the object contour for selection so scanout at the
+marker position does not substitute for scanout at the selected object. The rendering limits
+are 12 ms p95 and 16.67 ms p99
 for the 20,000-part workload with edges and a live section. The physical targets are
-33.3/50 ms for camera p95/p99 and 50/66.7 ms for click-to-contour p95/p99.
+33.3/50 ms for camera p95/p99 and 50/66.7 ms from either a click or a marquee release to
+the changed contour.
 
 ### Tessellated IFC and STEP models
 
