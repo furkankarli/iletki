@@ -80,14 +80,154 @@ struct ColorPipelines {
     edges: wgpu::RenderPipeline,
 }
 
+fn color_pipeline<W>(
+    ctx: &PrepareCtx<'_, W>,
+    shader: &wgpu::ShaderModule,
+    vertex: &str,
+    fragment: &str,
+    layout: &wgpu::PipelineLayout,
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+    edges: bool,
+) -> wgpu::RenderPipeline {
+    ctx.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(if edges {
+                "iletki-3d shaded edges"
+            } else {
+                "iletki-3d lit mesh"
+            }),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(vertex),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fragment),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: ctx.color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: if edges {
+                    wgpu::PrimitiveTopology::LineList
+                } else {
+                    wgpu::PrimitiveTopology::TriangleList
+                },
+                // Keep back faces visible so section clip planes reveal solid interiors.
+                cull_mode: None,
+                ..wgpu::PrimitiveState::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(!edges),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: ctx.msaa_samples,
+                ..wgpu::MultisampleState::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
 struct PackedPipelines {
     layout: wgpu::BindGroupLayout,
     base: ColorPipelines,
     section: Option<ColorPipelines>,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    section_shader: Option<(SectionAa, wgpu::ShaderModule)>,
+    repeated: Option<RepeatedPipelines>,
     pick: Option<wgpu::RenderPipeline>,
     mask: wgpu::RenderPipeline,
     multisampled_mask: Option<wgpu::RenderPipeline>,
     section_mask: Option<wgpu::RenderPipeline>,
+}
+
+struct RepeatedPipelines {
+    base: ColorPipelines,
+    section: Option<ColorPipelines>,
+    slots: wgpu::Buffer,
+}
+
+impl PackedPipelines {
+    fn color<W>(
+        ctx: &PrepareCtx<'_, W>,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+        section: Option<SectionAa>,
+    ) -> ColorPipelines {
+        let (face, face_fragment, edge, edge_fragment) = match section {
+            None => ("vs_mesh_batched", "fs_lit", "vs_edge_batched", "fs_edge"),
+            Some(SectionAa::Sampled) => (
+                "vs_mesh_batched_sampled",
+                "fs_lit_sampled",
+                "vs_edge_batched_sampled",
+                "fs_edge_sampled",
+            ),
+            Some(SectionAa::Raster) => (
+                "vs_mesh_batched_raster",
+                "fs_lit_raster",
+                "vs_edge_batched_raster",
+                "fs_unlit",
+            ),
+        };
+        ColorPipelines {
+            faces: color_pipeline(ctx, shader, face, face_fragment, layout, buffers, false),
+            edges: color_pipeline(ctx, shader, edge, edge_fragment, layout, buffers, true),
+        }
+    }
+
+    fn ensure_repeated<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
+        if self.repeated.is_some() {
+            return;
+        }
+        let buffers = [
+            Some(mesh_vertex_layout()),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<u32>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![3 => Uint32],
+            }),
+        ];
+        let color =
+            |shader, section| Self::color(ctx, shader, &self.pipeline_layout, &buffers, section);
+        let slots = (0..face_batch::OBJECTS as u32).collect::<Vec<_>>();
+        self.repeated = Some(RepeatedPipelines {
+            base: color(&self.shader, None),
+            section: self
+                .section_shader
+                .as_ref()
+                .map(|(aa, shader)| color(shader, Some(*aa))),
+            slots: ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("iletki-3d repeated geometry slots"),
+                    contents: bytemuck::cast_slice(&slots),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        });
+    }
+}
+
+fn mesh_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4];
+    wgpu::VertexBufferLayout {
+        array_stride: size_of::<Vertex3D>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRIBUTES,
+    }
 }
 
 struct SectionPipelines {
@@ -112,6 +252,7 @@ pub struct Scene3DLayer {
     free_chunks: BinaryHeap<Reverse<usize>>,
     selected_slots: BTreeSet<usize>,
     pending_meshes: usize,
+    has_repeated_pages: bool,
     section_groups: Vec<Option<SectionGroup>>,
     section_relations: Vec<(SectionRelation, bool)>,
     views: Vec<ViewObjects>,
@@ -121,6 +262,8 @@ pub struct Scene3DLayer {
     profile_batch_geometry: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_picking: bool,
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    profile_repeated_pages: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_section_culling: bool,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -151,6 +294,7 @@ impl Scene3DLayer {
             free_chunks: BinaryHeap::new(),
             selected_slots: BTreeSet::new(),
             pending_meshes: 0,
+            has_repeated_pages: false,
             section_groups: Vec::new(),
             section_relations: Vec::new(),
             views: Vec::new(),
@@ -160,6 +304,8 @@ impl Scene3DLayer {
             profile_batch_geometry: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_picking: true,
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            profile_repeated_pages: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_section_culling: true,
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -192,6 +338,12 @@ impl Scene3DLayer {
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     pub fn set_profile_batch_picking(&mut self, enabled: bool) {
         self.profile_batch_picking = enabled;
+    }
+
+    /// Sets whether newly uploaded identical meshes can use instanced color draws.
+    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+    pub fn set_profile_repeated_pages(&mut self, enabled: bool) {
+        self.profile_repeated_pages = enabled;
     }
 
     /// Enables conservative CPU rejection in raster sections for A/B profiling.
@@ -408,15 +560,7 @@ impl Scene3DLayer {
                 bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&object_layout)],
                 immediate_size: 0,
             });
-        let vert_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex3D>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![
-                0 => Float32x3,
-                1 => Float32x3,
-                2 => Unorm8x4
-            ],
-        };
+        let vert_layout = mesh_vertex_layout();
         let pick_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<[u32; 2]>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -428,55 +572,8 @@ impl Scene3DLayer {
                           fragment,
                           layout: &wgpu::PipelineLayout,
                           buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-                          edges: bool| {
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(if edges {
-                        "iletki-3d shaded edges"
-                    } else {
-                        "iletki-3d lit mesh"
-                    }),
-                    layout: Some(layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some(vertex),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some(fragment),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: ctx.color_format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: if edges {
-                            wgpu::PrimitiveTopology::LineList
-                        } else {
-                            wgpu::PrimitiveTopology::TriangleList
-                        },
-                        // Keep back faces visible so section clip planes reveal solid interiors.
-                        cull_mode: None,
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(!edges),
-                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: ctx.msaa_samples,
-                        ..wgpu::MultisampleState::default()
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
+                          edges| {
+            color_pipeline(ctx, shader, vertex, fragment, layout, buffers, edges)
         };
         let face_layout = [Some(vert_layout.clone())];
         let lit = make_color(
@@ -604,34 +701,7 @@ impl Scene3DLayer {
                 attributes: &wgpu::vertex_attr_array![3 => Uint32],
             };
             let buffers = [Some(vert_layout.clone()), Some(slot_layout.clone())];
-            let pipelines =
-                |shader: &wgpu::ShaderModule, face, face_fragment, edge, edge_fragment| {
-                    ColorPipelines {
-                        faces: make_color(
-                            shader,
-                            face,
-                            face_fragment,
-                            &pipeline_layout,
-                            &buffers,
-                            false,
-                        ),
-                        edges: make_color(
-                            shader,
-                            edge,
-                            edge_fragment,
-                            &pipeline_layout,
-                            &buffers,
-                            true,
-                        ),
-                    }
-                };
-            let base = pipelines(
-                &shader,
-                "vs_mesh_batched",
-                "fs_lit",
-                "vs_edge_batched",
-                "fs_edge",
-            );
+            let base = PackedPipelines::color(ctx, &shader, &pipeline_layout, &buffers, None);
             let mask = make_mask(
                 &shader,
                 "vs_mask_batched",
@@ -650,7 +720,7 @@ impl Scene3DLayer {
                     &buffers,
                 )
             });
-            let (section, section_mask) = section_aa.map_or((None, None), |aa| {
+            let section_shader = section_aa.map(|aa| {
                 let sampled = concat!(
                     include_str!("shaders/mesh3d_sampled.wgsl"),
                     "\n",
@@ -661,38 +731,17 @@ impl Scene3DLayer {
                     "\n",
                     include_str!("shaders/mesh3d_batched_raster.wgsl")
                 );
-                let shader = aa.shader(ctx.device, &source, sampled, raster);
-                let color = match aa {
-                    SectionAa::Sampled => pipelines(
-                        &shader,
-                        "vs_mesh_batched_sampled",
-                        "fs_lit_sampled",
-                        "vs_edge_batched_sampled",
-                        "fs_edge_sampled",
-                    ),
-                    SectionAa::Raster => pipelines(
-                        &shader,
-                        "vs_mesh_batched_raster",
-                        "fs_lit_raster",
-                        "vs_edge_batched_raster",
-                        "fs_unlit",
-                    ),
-                };
+                (aa, aa.shader(ctx.device, &source, sampled, raster))
+            });
+            let section = section_shader.as_ref().map(|(aa, shader)| {
+                PackedPipelines::color(ctx, shader, &pipeline_layout, &buffers, Some(*aa))
+            });
+            let section_mask = section_shader.as_ref().map(|(aa, shader)| {
                 let (vertex, fragment) = match aa {
                     SectionAa::Sampled => ("vs_mesh_batched_sampled", "fs_mask_sampled"),
                     SectionAa::Raster => ("vs_mesh_batched_raster", "fs_mask_unclipped"),
                 };
-                (
-                    Some(color),
-                    Some(make_mask(
-                        &shader,
-                        vertex,
-                        fragment,
-                        4,
-                        &pipeline_layout,
-                        &buffers,
-                    )),
-                )
+                make_mask(shader, vertex, fragment, 4, &pipeline_layout, &buffers)
             });
             let limits = ctx.device.limits();
             let pick =
@@ -717,6 +766,10 @@ impl Scene3DLayer {
                 layout,
                 base,
                 section,
+                pipeline_layout,
+                shader,
+                section_shader,
+                repeated: None,
                 mask,
                 multisampled_mask,
                 section_mask,
@@ -880,7 +933,7 @@ impl Scene3DLayer {
         if let Some(packed) = packed
             && view.mask.has_packed()
         {
-            view.mask.paint(pass, packed, false, |pass, index| {
+            view.mask.paint(pass, packed, false, None, |pass, index| {
                 pass.set_pipeline(pipeline);
                 draw_direct(pass, index);
             });
@@ -939,9 +992,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let pack_geometry = p.packed.is_some();
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let pack_geometry = pack_geometry && self.profile_batch_geometry;
-        let mut builder = PageBuilder::default();
+        let repeat_pages = pack_geometry;
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let repeat_pages = repeat_pages && self.profile_repeated_pages;
+        let mut builder = PageBuilder::new(repeat_pages);
         let mut uploaded_faces = Vec::new();
-        let mut edge_builder = PageBuilder::default();
+        let mut edge_builder = PageBuilder::new(repeat_pages);
         let mut uploaded_edges = Vec::new();
 
         let upload_slots = if self.pending_meshes == 0 {
@@ -1058,6 +1114,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         }
         builder.flush(ctx.device, &mut uploaded_faces);
         for (index, faces) in uploaded_faces {
+            self.has_repeated_pages |= faces.repeats();
             if let Some(Some(chunk)) = self.chunks.get_mut(index) {
                 chunk.vertex_buf = Some(faces);
             }
@@ -1065,11 +1122,20 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         edge_builder.flush(ctx.device, &mut uploaded_edges);
         for (index, edges) in uploaded_edges {
+            self.has_repeated_pages |= edges.repeats();
             if let Some(Some(chunk)) = self.chunks.get_mut(index) {
                 chunk.edge_buf = Some(edges);
             }
         }
 
+        if self.has_repeated_pages
+            && let Some(packed) = self.pipelines.as_mut().and_then(|p| p.packed.as_mut())
+        {
+            packed.ensure_repeated(ctx);
+        }
+        let Some(p) = self.pipelines.as_ref() else {
+            return pending;
+        };
         let batch = p.dynamic_uniforms;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let batch = batch && self.profile_batch_uniforms;
@@ -1298,6 +1364,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             index,
                             object.section_culled,
                             object.bridge_section_gap,
+                            picking.is_none(),
                         );
                     }
                     if picking.is_none()
@@ -1311,6 +1378,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             index,
                             object.section_culled,
                             object.bridge_section_gap,
+                            true,
                         );
                     }
                 }
@@ -1440,6 +1508,15 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         .filter(|_| self.use_antialiased_section)
                         .unwrap_or(&pipelines.base)
                 });
+                let repeated = p.packed.as_ref().and_then(|pipelines| {
+                    let repeated = pipelines.repeated.as_ref()?;
+                    let color = repeated
+                        .section
+                        .as_ref()
+                        .filter(|_| self.use_antialiased_section)
+                        .unwrap_or(&repeated.base);
+                    Some((color, &repeated.slots))
+                });
                 let passes = [
                     (lit, packed.map(|p| &p.faces), &view.faces, false),
                     (edge, packed.map(|p| &p.edges), &view.edges, true),
@@ -1473,7 +1550,17 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     if let Some(pipeline) = packed_pipeline
                         && draws.has_packed()
                     {
-                        draws.paint(pass, pipeline, false, |pass, index| {
+                        let repeated = repeated.map(|(pipelines, slots)| {
+                            (
+                                if edges {
+                                    &pipelines.edges
+                                } else {
+                                    &pipelines.faces
+                                },
+                                slots,
+                            )
+                        });
+                        draws.paint(pass, pipeline, false, repeated, |pass, index| {
                             pass.set_pipeline(direct_pipeline);
                             draw_direct(pass, index);
                         });
@@ -1513,7 +1600,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 if let Some(pipeline) = p.packed.as_ref().and_then(|packed| packed.pick.as_ref())
                     && view.faces.has_packed()
                 {
-                    view.faces.paint(pass, pipeline, true, |pass, index| {
+                    view.faces.paint(pass, pipeline, true, None, |pass, index| {
                         pass.set_pipeline(&p.pick);
                         draw_direct(pass, index);
                     });

@@ -5,7 +5,7 @@ use iletki_wgpu::wgpu::{self, util::DeviceExt};
 use std::{num::NonZeroU64, ops::Range, sync::Arc};
 
 // The matching WGSL uniform array is 4 KiB, within the WebGPU uniform binding limit.
-const OBJECTS: usize = 256;
+pub(crate) const OBJECTS: usize = 256;
 const MAX_VERTICES: usize = 65_536;
 // Bound the extra vertex work in exchange for one fewer draw.
 const MAX_SECTION_GAP_VERTICES: u32 = 256;
@@ -16,6 +16,7 @@ pub(crate) struct GeometryPage {
     vertices: wgpu::Buffer,
     slots: wgpu::Buffer,
     picks: Option<wgpu::Buffer>,
+    repeated_vertices: u32,
 }
 
 pub(crate) enum VertexRange {
@@ -28,6 +29,10 @@ pub(crate) enum VertexRange {
 }
 
 impl VertexRange {
+    pub(crate) fn repeats(&self) -> bool {
+        matches!(self, Self::Packed { page, .. } if page.repeated_vertices != 0)
+    }
+
     pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
         match self {
             Self::Direct(buffer) => buffer.slice(..),
@@ -58,9 +63,17 @@ pub(crate) struct PageBuilder {
     slots: Vec<u32>,
     picks: Vec<[u32; 2]>,
     objects: Vec<(usize, Range<u32>)>,
+    repeatable: bool,
 }
 
 impl PageBuilder {
+    pub(crate) fn new(repeatable: bool) -> Self {
+        Self {
+            repeatable,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
         limits.max_uniform_buffer_binding_size >= OBJECT_BYTES
@@ -71,6 +84,25 @@ impl PageBuilder {
         !vertices.is_empty()
             && vertices.len() <= MAX_VERTICES
             && vertices.len().is_multiple_of(primitive_vertices)
+    }
+
+    fn repeated_vertices(&self) -> u32 {
+        let Some((_, first)) = self.objects.first() else {
+            return 0;
+        };
+        if !self.repeatable || !(1..=64).contains(&first.end) || self.objects.len() < 8 {
+            return 0;
+        }
+        let prototype = self.vertices.get(..first.end as usize).unwrap_or_default();
+        let identical = self.objects.iter().all(|(_, vertices)| {
+            self.vertices
+                .get(vertices.start as usize..vertices.end as usize)
+                .is_some_and(|vertices| {
+                    bytemuck::cast_slice::<_, u8>(vertices)
+                        == bytemuck::cast_slice::<_, u8>(prototype)
+                })
+        });
+        if identical { first.end } else { 0 }
     }
 
     pub(crate) fn push(
@@ -129,6 +161,7 @@ impl PageBuilder {
                     bytemuck::cast_slice(&self.picks),
                 )
             }),
+            repeated_vertices: self.repeated_vertices(),
         });
         for (slot, (chunk, vertices)) in self.objects.drain(..).enumerate() {
             uploaded.push((
@@ -194,6 +227,7 @@ enum Draw {
         geometry: Arc<GeometryPage>,
         uniforms: usize,
         vertices: Range<u32>,
+        instances: u32,
     },
 }
 
@@ -224,6 +258,7 @@ impl PackedDraws {
             geometry: previous_page,
             uniforms,
             vertices: previous,
+            instances: 0,
         }) = self.commands.last()
         else {
             return;
@@ -247,9 +282,10 @@ impl PackedDraws {
         draw_index: usize,
         clipped: bool,
         bridge_sections: bool,
+        repeat: bool,
     ) {
         if !clipped {
-            self.push(geometry, offset, draw_index);
+            self.push_inner(geometry, offset, draw_index, repeat);
         } else if bridge_sections {
             self.stage_section_gap(geometry, offset);
         }
@@ -261,6 +297,16 @@ impl PackedDraws {
         offset: ObjectUniforms,
         draw_index: usize,
     ) {
+        self.push_inner(geometry, offset, draw_index, false);
+    }
+
+    fn push_inner(
+        &mut self,
+        geometry: &VertexRange,
+        offset: ObjectUniforms,
+        draw_index: usize,
+        repeat: bool,
+    ) {
         let gap_end = self.section_gap_end.take();
         let VertexRange::Packed {
             page,
@@ -271,10 +317,14 @@ impl PackedDraws {
             self.commands.push(Draw::Direct(draw_index));
             return;
         };
-        if !self
-            .last_page
-            .as_ref()
-            .is_some_and(|prev| Arc::ptr_eq(prev, page))
+        let repeat = repeat && page.repeated_vertices != 0;
+        let continuation = !repeat
+            || matches!(self.commands.last(), Some(Draw::Packed { instances, .. }) if *instances != 0);
+        if !continuation
+            || !self
+                .last_page
+                .as_ref()
+                .is_some_and(|prev| Arc::ptr_eq(prev, page))
         {
             if self.used_pages == self.pages.len() {
                 self.pages.push(
@@ -288,6 +338,34 @@ impl PackedDraws {
             self.last_page = Some(page.clone());
         }
         let uniforms = self.used_pages.saturating_sub(1);
+        if repeat {
+            if let Some(Draw::Packed {
+                uniforms: previous,
+                instances,
+                ..
+            }) = self.commands.last_mut()
+                && *previous == uniforms
+                && *instances != 0
+                && let Some(transform) = self
+                    .pages
+                    .get_mut(uniforms)
+                    .and_then(|p| p.get_mut(*instances as usize))
+            {
+                *transform = offset;
+                *instances += 1;
+                return;
+            }
+            if let Some(transform) = self.pages.get_mut(uniforms).and_then(|p| p.first_mut()) {
+                *transform = offset;
+                self.commands.push(Draw::Packed {
+                    geometry: page.clone(),
+                    uniforms,
+                    vertices: 0..page.repeated_vertices,
+                    instances: 1,
+                });
+            }
+            return;
+        }
         if let Some(uniforms) = self.pages.get_mut(uniforms)
             && let Some(transform) = uniforms.get_mut(*slot)
         {
@@ -298,6 +376,7 @@ impl PackedDraws {
         if let Some(Draw::Packed {
             uniforms: prev,
             vertices: range,
+            instances: 0,
             ..
         }) = self.commands.last_mut()
             && *prev == uniforms
@@ -314,6 +393,7 @@ impl PackedDraws {
             geometry: page.clone(),
             uniforms,
             vertices: vertices.clone(),
+            instances: 0,
         });
     }
 
@@ -417,6 +497,7 @@ impl PackedDraws {
         pass: &mut wgpu::RenderPass<'_>,
         pipeline: &wgpu::RenderPipeline,
         picking: bool,
+        repeated: Option<(&wgpu::RenderPipeline, &wgpu::Buffer)>,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
         let mut bound = None;
@@ -430,13 +511,23 @@ impl PackedDraws {
                     geometry,
                     uniforms,
                     vertices,
+                    instances,
                 } => {
                     if bound != Some(*uniforms) {
                         let pages_per_buffer = self.pages_per_buffer.max(1);
                         let Some(block) = self.buffers.get(*uniforms / pages_per_buffer) else {
                             continue;
                         };
-                        pass.set_pipeline(pipeline);
+                        if *instances != 0 {
+                            let Some((pipeline, slots)) = repeated else {
+                                continue;
+                            };
+                            pass.set_pipeline(pipeline);
+                            pass.set_vertex_buffer(1, slots.slice(..));
+                        } else {
+                            pass.set_pipeline(pipeline);
+                            pass.set_vertex_buffer(1, geometry.slots.slice(..));
+                        }
                         let offset = [((*uniforms % pages_per_buffer) * self.stride) as u32];
                         let offsets = if self.dynamic_offsets {
                             offset.as_slice()
@@ -445,7 +536,6 @@ impl PackedDraws {
                         };
                         pass.set_bind_group(1, &block.binding, offsets);
                         pass.set_vertex_buffer(0, geometry.vertices.slice(..));
-                        pass.set_vertex_buffer(1, geometry.slots.slice(..));
                         if picking {
                             let Some(picks) = &geometry.picks else {
                                 continue;
@@ -454,7 +544,7 @@ impl PackedDraws {
                         }
                         bound = Some(*uniforms);
                     }
-                    pass.draw(vertices.clone(), 0..1);
+                    pass.draw(vertices.clone(), 0..(*instances).max(1));
                 }
             }
         }

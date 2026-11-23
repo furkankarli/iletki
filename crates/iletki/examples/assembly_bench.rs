@@ -294,6 +294,9 @@ mod native {
             if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_BRIDGING").is_some() {
                 scene.set_profile_section_bridging(false);
             }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_REPEATED_PAGES").is_some() {
+                scene.set_profile_repeated_pages(false);
+            }
             self.record_memory(case, "before-targets")?;
             let host = |initial_px| {
                 ViewportHost::new_with_adapter(
@@ -419,6 +422,7 @@ mod native {
             let signatures = std::env::var_os("ILETKI_ASSEMBLY_SIGNATURES").is_some();
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
+            let overlap = std::env::var_os("ILETKI_ASSEMBLY_OVERLAP").is_some();
             let trace_end = WARMUP + samples + traces;
             for frame in 0..trace_end + if signatures { ORBIT_PERIOD } else { 0 } {
                 let start = Instant::now();
@@ -446,6 +450,10 @@ mod native {
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
                 main.render_to_texture(&gpu.device, &gpu.queue, &mut encoder, &(), &mut [scene]);
                 if let Some(second) = second.as_mut() {
+                    if overlap {
+                        gpu.queue.submit([encoder.finish()]);
+                        encoder = gpu.device.create_command_encoder(&Default::default());
+                    }
                     second.render_to_texture(
                         &gpu.device,
                         &gpu.queue,

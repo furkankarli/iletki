@@ -210,6 +210,15 @@ fn packed_faces_match_direct_across_views_and_chunk_edits() {
     };
     let middle = scene.insert(cube(center, 1));
     for i in 0..289 {
+        if i == 32 {
+            // A large direct draw interrupts the first packed page. Its transforms
+            // must stay independent of the repeated draws on either side.
+            let mut large = cube(center + Vec3::new(0.1, 0.15, -0.25), 800);
+            large
+                .vertices
+                .resize(65_538, iletki_3d::Vertex3D::default());
+            scene.insert(large);
+        }
         let x = f64::from(i % 17) - 8.0;
         let y = f64::from(i / 17) - 8.0;
         if i != 144 {

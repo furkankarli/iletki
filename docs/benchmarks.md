@@ -108,6 +108,12 @@ number modulo 30, multiplied by 12.
 With either edit control, `edit-frame` repeats the changing frames from the orbit
 series for separate percentile analysis.
 
+`ILETKI_ASSEMBLY_NO_REPEATED_PAGES=1` keeps color draws on the regular packed path
+when a page contains byte-identical small meshes. Selection and picking use the
+same geometry in both variants. Set `ILETKI_ASSEMBLY_OVERLAP=1` in a two-view run to
+submit the first viewport before encoding the second. The wall timer still ends
+at completion of both views.
+
 The offscreen workloads exclude window acquisition, compositing and presentation. The
 asynchronous pick workload polls continuously to measure request readiness independently
 of the application's event loop or display refresh rate.
