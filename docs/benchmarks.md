@@ -157,7 +157,11 @@ to A/B the per-chunk pick path while keeping the same preview and contour code.
 
 For a controlled presentation comparison, select `--present fifo` or `--present mailbox`,
 `--depth 1` or `--depth 2`, and optionally `--notify-present` for the Wayland frame
-callback. Baseline runs omit these overrides. Each frame records surface acquisition,
+callback. Scripted baseline runs omit these overrides. The interactive demo and `--action live`
+request the frame callback before presenting. The window title shows smoothed CPU encoding
+time after surface acquisition and whole frame time through presentation return.
+The first frame is labeled separately. The averages start fresh after a gap of at least 350 ms.
+Each trace records surface acquisition,
 encode, queue submit and present return timestamps. GPU completion uses callbacks
 observed during nonblocking polling. The event CSV tracks the frame using each input
 or pick result, the rectangle, raw hits and highlighted objects, and timestamps for

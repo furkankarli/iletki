@@ -48,6 +48,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
+const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
 
 const MARQUEE_SHADER: &str = r#"
 @vertex
@@ -212,9 +213,10 @@ struct GpuState {
     bench_edits: Vec<(Chunk3DId, Vec3)>,
     bench_dual: bool,
     last_pick_text: String,
-    frame_count: u32,
-    fps_timer: Instant,
-    smoothed_ms: f64,
+    timing_samples: u8,
+    title_updated_at: Instant,
+    smoothed_frame_ms: f64,
+    smoothed_encode_ms: f64,
 }
 
 impl GpuState {
@@ -434,9 +436,10 @@ impl GpuState {
             bench_edits,
             bench_dual,
             last_pick_text: String::from("Click any 3D object to pick"),
-            frame_count: 0,
-            fps_timer: Instant::now(),
-            smoothed_ms: 0.0,
+            timing_samples: 0,
+            title_updated_at: Instant::now(),
+            smoothed_frame_ms: 0.0,
+            smoothed_encode_ms: 0.0,
         };
         #[cfg(feature = "profiling")]
         if std::env::var_os("ILETKI_DIRECT_PICK").is_some() {
@@ -1018,9 +1021,14 @@ impl GpuState {
             ViewportMode::Continuous => "Continuous",
         };
         let clip = if self.clip_enabled { " | CLIP" } else { "" };
+        let frame_label = if self.timing_samples == 1 {
+            "Startup frame"
+        } else {
+            "Frame"
+        };
         self.window.set_title(&format!(
-            "iletki-demo | {scene_name} | {mode}{clip} | {:.2} ms | {} | [1/2/3 Q C M R]",
-            self.smoothed_ms, self.last_pick_text
+            "iletki-demo | {scene_name} | {mode}{clip} | CPU encode {:.2} ms | {frame_label} {:.2} ms | {} | [1/2/3 Q C M R]",
+            self.smoothed_encode_ms, self.smoothed_frame_ms, self.last_pick_text
         ));
     }
 
@@ -1238,7 +1246,8 @@ impl GpuState {
         {
             iletki::gpu::profiling::begin(&self.device);
         }
-        let dt = self.last_frame_time.elapsed().as_secs_f64().min(0.1);
+        let frame_gap = frame_start.saturating_duration_since(self.last_frame_time);
+        let dt = frame_gap.as_secs_f64().min(0.1);
         self.last_frame_time = frame_start;
         if self.transition.is_active() {
             let changed = self.transition.tick(dt, self.vp_main.camera_mut());
@@ -1267,7 +1276,7 @@ impl GpuState {
                 return Ok(());
             }
         };
-        let acquired = self.latency.as_ref().map(|_| Instant::now());
+        let acquired = Instant::now();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1418,29 +1427,22 @@ impl GpuState {
             pass.draw(0..3, id..id.saturating_add(1));
         }
         let commands = enc.finish();
-        let encoded = self.latency.as_ref().map(|_| Instant::now());
+        let encoded = Instant::now();
         self.queue.submit([commands]);
         let submitted = self.latency.as_ref().map(|_| Instant::now());
         if let Some(trace) = &self.latency {
             trace.track_gpu(&self.queue, trace.frame_id());
-            if trace.options.notify {
-                self.window.pre_present_notify();
-            }
+        }
+        if self.latency.as_ref().is_none_or(|trace| {
+            trace.options.notify || trace.options.action == latency::Action::Live
+        }) {
+            self.window.pre_present_notify();
         }
         self.queue.present(output);
-        if let (
-            Some(trace),
-            Some(acquired),
-            Some(viewport_encoded),
-            Some(encoded),
-            Some(submitted),
-        ) = (
-            &mut self.latency,
-            acquired,
-            viewport_encoded,
-            encoded,
-            submitted,
-        ) {
+        let presented = Instant::now();
+        if let (Some(trace), Some(viewport_encoded), Some(submitted)) =
+            (&mut self.latency, viewport_encoded, submitted)
+        {
             trace.frame(latency::Frame {
                 id: trace.frame_id(),
                 started: trace.ns(frame_start),
@@ -1448,7 +1450,7 @@ impl GpuState {
                 encoded: trace.ns(encoded),
                 viewport_encoded: trace.ns(viewport_encoded),
                 submitted: trace.ns(submitted),
-                presented: trace.ns(Instant::now()),
+                presented: trace.ns(presented),
                 status: "present-called",
                 streaming,
                 dynamic_drawn,
@@ -1473,17 +1475,26 @@ impl GpuState {
             }
         }
 
-        let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        self.smoothed_ms = if self.smoothed_ms == 0.0 {
-            ms
-        } else {
-            self.smoothed_ms * 0.9 + ms * 0.1
+        // Keep the startup frame and any previous burst of on-demand redraws out of the
+        // timing shown for a fresh interaction.
+        let reset_timing = self.timing_samples < 2 || frame_gap >= TITLE_UPDATE_INTERVAL;
+        let smooth = |previous: f64, elapsed: Duration| {
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            if reset_timing {
+                ms
+            } else {
+                previous * 0.9 + ms * 0.1
+            }
         };
-        self.frame_count += 1;
-        if self.fps_timer.elapsed().as_secs_f64() >= 0.35 {
+        self.smoothed_frame_ms = smooth(
+            self.smoothed_frame_ms,
+            presented.duration_since(frame_start),
+        );
+        self.smoothed_encode_ms = smooth(self.smoothed_encode_ms, encoded.duration_since(acquired));
+        self.timing_samples = self.timing_samples.saturating_add(1).min(2);
+        if reset_timing || self.title_updated_at.elapsed() >= TITLE_UPDATE_INTERVAL {
             self.update_title();
-            self.frame_count = 0;
-            self.fps_timer = Instant::now();
+            self.title_updated_at = Instant::now();
         }
         if streaming
             || self.vp_main.mode() == ViewportMode::Continuous
