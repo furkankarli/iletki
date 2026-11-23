@@ -130,6 +130,7 @@ impl GpuState {
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("iletki-demo device"),
+            required_features: adapter.features() & wgpu::Features::CLIP_DISTANCES,
             ..wgpu::DeviceDescriptor::default()
         }))
         .map_err(|e| format!("request_device failed: {e}"))?;
@@ -156,8 +157,9 @@ impl GpuState {
         surface.configure(&device, &surface_config);
 
         let make_vp = |px: [u32; 2]| {
-            ViewportHost::new(
+            ViewportHost::new_with_adapter(
                 &device,
+                &adapter,
                 ViewportConfig {
                     color_format: format,
                     msaa_samples: 4,

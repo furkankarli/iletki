@@ -127,6 +127,7 @@ pub struct ViewportHost {
     id: ViewportId,
     lifetime: Arc<()>,
     config: ViewportConfig,
+    section_antialiasing: bool,
     camera: Camera,
     dpi_scale: f32,
     dirty: DirtyFlags,
@@ -164,6 +165,42 @@ impl ViewportHost {
     /// Creates a new viewport host on an existing `wgpu::Device`.
     /// Returns an error for unsupported color, depth or multisample attachments.
     pub fn new(device: &wgpu::Device, config: ViewportConfig) -> Result<Self, ViewportError> {
+        Self::create(device, config, false)
+    }
+
+    /// Creates a viewport host and checks the adapter for antialiased section clipping support.
+    ///
+    /// Pass the adapter that created `device`. Built-in 3D layers use the capability for
+    /// 4× MSAA section cuts. Enable [`wgpu::Features::CLIP_DISTANCES`] at device creation for
+    /// hardware clipping when supported. Other non-OpenGL devices need multisampled shading.
+    /// OpenGL uses pixel-rate clipping. Returns an error for unsupported color, depth or
+    /// multisample attachments.
+    pub fn new_with_adapter(
+        device: &wgpu::Device,
+        adapter: &wgpu::Adapter,
+        config: ViewportConfig,
+    ) -> Result<Self, ViewportError> {
+        let info = adapter.get_info();
+        // OpenGL's sample interpolation qualifier can require a higher GLSL version than
+        // the one needed for the adapter's MULTISAMPLED_SHADING flag.
+        // The OpenGL sample qualifier can require a higher GLSL version than the
+        // adapter's MULTISAMPLED_SHADING flag guarantees.
+        let section_antialiasing = config.msaa_samples == 4
+            && info.backend != wgpu::Backend::Gl
+            && info == device.adapter_info()
+            && (device.features().contains(wgpu::Features::CLIP_DISTANCES)
+                || adapter
+                    .get_downlevel_capabilities()
+                    .flags
+                    .contains(wgpu::DownlevelFlags::MULTISAMPLED_SHADING));
+        Self::create(device, config, section_antialiasing)
+    }
+
+    fn create(
+        device: &wgpu::Device,
+        config: ViewportConfig,
+        section_antialiasing: bool,
+    ) -> Result<Self, ViewportError> {
         config.validate(device)?;
         let id = ViewportId(NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed));
         let msaa = config.msaa_samples;
@@ -181,6 +218,7 @@ impl ViewportHost {
             id,
             lifetime: Arc::new(()),
             config,
+            section_antialiasing,
             camera: Camera::default(),
             dpi_scale,
             dirty: DirtyFlags::ALL,
@@ -575,6 +613,7 @@ impl ViewportHost {
         let logical = self.logical_size();
         let mut prep_ctx = PrepareCtx {
             viewport_lifetime: &self.lifetime,
+            section_antialiasing: self.section_antialiasing,
             viewport_id: self.id,
             device,
             queue,

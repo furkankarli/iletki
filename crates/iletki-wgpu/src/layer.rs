@@ -123,6 +123,7 @@ impl UploadTracker {
 /// Context handed to [`ViewportLayer::prepare`] before drawing a frame or pick pass.
 pub struct PrepareCtx<'a, W = ()> {
     pub(crate) viewport_lifetime: &'a Arc<()>,
+    pub(crate) section_antialiasing: bool,
     /// Unique identifier of the viewport being prepared (use as key for per-viewport GPU buffers
     /// when one scene is shared across multiple split viewports).
     pub viewport_id: ViewportId,
@@ -155,6 +156,12 @@ pub struct PrepareCtx<'a, W = ()> {
 }
 
 impl<W> PrepareCtx<'_, W> {
+    /// Returns whether this viewport can use antialiased 3D section clipping at 4× MSAA.
+    #[must_use]
+    pub const fn supports_section_antialiasing(&self) -> bool {
+        self.section_antialiasing
+    }
+
     /// Returns a weak reference that lets a layer retire viewport-local GPU state after close.
     #[must_use]
     pub fn viewport_lifetime(&self) -> ViewportLifetime {

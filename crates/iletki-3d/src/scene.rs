@@ -2,6 +2,7 @@
 //! planes, *Shaded with Edges* depth-offset wireframe overlays, Jump-Flood selection outline masks,
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
+use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
@@ -57,6 +58,7 @@ struct Pipelines {
     msaa: u32,
     object_layout: wgpu::BindGroupLayout,
     lit: wgpu::RenderPipeline,
+    section: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     edge: wgpu::RenderPipeline,
     mask: wgpu::RenderPipeline,
     pick: wgpu::RenderPipeline,
@@ -72,6 +74,7 @@ pub struct Scene3DLayer {
     layer_id: u16,
     revision: LayerRevision,
     pipelines: Option<Pipelines>,
+    use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
 }
 
@@ -92,6 +95,7 @@ impl Scene3DLayer {
             layer_id,
             revision: LayerRevision::new(),
             pipelines: None,
+            use_antialiased_section: false,
             chunks: Vec::new(),
         }
     }
@@ -213,11 +217,12 @@ impl Scene3DLayer {
     }
 
     fn ensure_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        if self
-            .pipelines
-            .as_ref()
-            .is_some_and(|p| p.format == ctx.color_format && p.msaa == ctx.msaa_samples)
-        {
+        let section_aa = SectionAa::for_viewport(ctx);
+        if self.pipelines.as_ref().is_some_and(|p| {
+            p.format == ctx.color_format
+                && p.msaa == ctx.msaa_samples
+                && (section_aa.is_none() || p.section.is_some())
+        }) {
             return;
         }
         let wgsl = format!("{CAMERA_WGSL}\n{}", include_str!("shaders/mesh3d.wgsl"));
@@ -225,7 +230,7 @@ impl Scene3DLayer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("iletki-3d mesh shader"),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                source: wgpu::ShaderSource::Wgsl(wgsl.as_str().into()),
             });
         let object_layout = ctx
             .device
@@ -264,88 +269,111 @@ impl Scene3DLayer {
             attributes: &wgpu::vertex_attr_array![3 => Uint32x2],
         };
 
-        let lit = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d lit mesh"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_mesh"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(vert_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_lit"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: ctx.color_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    // Keep back faces visible so section clip planes reveal solid interiors.
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: ctx.msaa_samples,
-                    ..wgpu::MultisampleState::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            });
+        let make_lit = |shader: &wgpu::ShaderModule, vertex, fragment| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d lit mesh"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(vert_layout.clone())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(fragment),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        // Keep back faces visible so section clip planes reveal solid interiors.
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..wgpu::MultisampleState::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let lit = make_lit(&shader, "vs_mesh", "fs_lit");
 
-        let edge = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d shaded edges"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_edge"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(vert_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_edge"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: ctx.color_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: ctx.msaa_samples,
-                    ..wgpu::MultisampleState::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            });
+        let make_edge = |shader: &wgpu::ShaderModule, vertex, fragment| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d shaded edges"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(vert_layout.clone())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(fragment),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..wgpu::MultisampleState::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let edge = make_edge(&shader, "vs_edge", "fs_edge");
+
+        let section = section_aa.map(|aa| {
+            let shader = aa.shader(
+                ctx.device,
+                &wgsl,
+                include_str!("shaders/mesh3d_sampled.wgsl"),
+                include_str!("shaders/mesh3d_raster.wgsl"),
+            );
+            match aa {
+                SectionAa::Sampled => (
+                    make_lit(&shader, "vs_mesh_sampled", "fs_lit_sampled"),
+                    make_edge(&shader, "vs_edge_sampled", "fs_edge_sampled"),
+                ),
+                SectionAa::Raster => (
+                    make_lit(&shader, "vs_mesh_raster", "fs_lit_raster"),
+                    make_edge(&shader, "vs_edge_raster", "fs_unlit"),
+                ),
+            }
+        });
 
         let mask = ctx
             .device
@@ -425,6 +453,7 @@ impl Scene3DLayer {
             msaa: ctx.msaa_samples,
             object_layout,
             lit,
+            section,
             edge,
             mask,
             pick,
@@ -467,6 +496,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
         self.prune_closed_viewports();
         self.ensure_pipelines(ctx);
+        self.use_antialiased_section =
+            ctx.supports_section_antialiasing() && !ctx.camera.clip_planes().is_empty();
         let Some(p) = &self.pipelines else {
             return false;
         };
@@ -580,10 +611,16 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let cam_pos = ctx.camera.position_3d();
         let vp_id = ctx.viewport_id;
 
+        let (lit, edge) = p
+            .section
+            .as_ref()
+            .filter(|_| self.use_antialiased_section)
+            .map_or((&p.lit, &p.edge), |(lit, edge)| (lit, edge));
+
         match phase {
             DrawPhase::Opaque => {
                 // 1. Solid shaded triangles
-                pass.set_pipeline(&p.lit);
+                pass.set_pipeline(lit);
                 for chunk in self.chunks.iter().flatten() {
                     if !chunk.visible || chunk.vertex_count == 0 {
                         continue;
@@ -611,7 +648,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     .flatten()
                     .any(|c| c.visible && c.edge_count > 0);
                 if any_edges {
-                    pass.set_pipeline(&p.edge);
+                    pass.set_pipeline(edge);
                     for chunk in self.chunks.iter().flatten() {
                         if !chunk.visible || chunk.edge_count == 0 {
                             continue;

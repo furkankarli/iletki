@@ -36,8 +36,7 @@ struct PickOut {
     @location(1) @interpolate(flat) pick_id: vec2<u32>,
 };
 
-@vertex
-fn vs_inst_color(v: VertIn, inst: InstIn) -> ColorOut {
+fn instanced_vertex(v: VertIn, inst: InstIn) -> ColorOut {
     let pos_rel = v.position * inst.inst_scale + inst.inst_offset + batch.offset_rel;
     var out: ColorOut;
     out.clip_pos = iletki_project_3d(pos_rel);
@@ -45,6 +44,11 @@ fn vs_inst_color(v: VertIn, inst: InstIn) -> ColorOut {
     out.normal = v.normal;
     out.color = inst.inst_color;
     return out;
+}
+
+@vertex
+fn vs_inst_color(v: VertIn, inst: InstIn) -> ColorOut {
+    return instanced_vertex(v, inst);
 }
 
 @vertex
@@ -57,14 +61,10 @@ fn vs_inst_pick(v: VertIn, inst: InstIn) -> PickOut {
     return out;
 }
 
-@fragment
-fn fs_inst_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
-    if (iletki_is_clipped(in.pos_rel)) {
-        discard;
-    }
-    let n_raw = normalize(in.normal);
+fn shade_instanced(pos_rel: vec3<f32>, normal: vec3<f32>, color: vec4<f32>, is_front: bool) -> vec4<f32> {
+    let n_raw = normalize(normal);
     let n = select(-n_raw, n_raw, is_front);
-    let view_dir = normalize(-in.pos_rel);
+    let view_dir = normalize(-pos_rel);
     let key_dir = normalize(vec3<f32>(0.45, 0.35, 0.82));
     let hemi = mix(0.22, 0.36, n.z * 0.5 + 0.5);
     let key = max(dot(n, key_dir), 0.0) * 0.48;
@@ -72,8 +72,16 @@ fn fs_inst_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location
     let head = max(dot(n, view_dir), 0.0) * 0.20;
     let back_tint = select(0.72, 1.0, is_front);
     let shade = min(hemi + key + fill + head, 1.05) * back_tint;
-    let base_rgb = iletki_color_to_target(in.color.rgb);
-    return vec4<f32>(base_rgb * shade, in.color.a);
+    let base_rgb = iletki_color_to_target(color.rgb);
+    return vec4<f32>(base_rgb * shade, color.a);
+}
+
+@fragment
+fn fs_inst_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    if (iletki_is_clipped(in.pos_rel)) {
+        discard;
+    }
+    return shade_instanced(in.pos_rel, in.normal, in.color, is_front);
 }
 
 @fragment

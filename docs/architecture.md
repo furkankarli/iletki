@@ -34,6 +34,13 @@ offscreen color and its UV bounds. `BorrowedPass` prepares the same offscreen re
 composites color into the application's pass using its viewport and scissor. The application's depth
 attachment affects pipeline compatibility. Viewport scene depth is stored in the offscreen target.
 
+For antialiased live 3D sections, construct the host with `ViewportHost::new_with_adapter`
+and use 4× MSAA. Request `wgpu::Features::CLIP_DISTANCES` at device creation when the adapter
+advertises it. Built-in 3D layers then cut primitives during rasterization. The alternative
+evaluates clipping at each sample and can cost substantially more on dense scenes. OpenGL,
+adapters without the capability and the device-only constructor use pixel-rate clipping.
+An egui host can pass the adapter and device from its `egui_wgpu::RenderState`.
+
 `OnDemand` refreshes its cached passes when shared layers report new revisions or their membership
 changes. Hosts can schedule another frame while `FrameStats::streaming_pending` is set. Native
 hosts using `begin_pick_rect` keep checking `PendingPick::try_read` while the request is pending.

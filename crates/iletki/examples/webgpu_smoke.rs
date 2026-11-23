@@ -12,8 +12,8 @@ fn main() -> Result<(), iletki::gpu::wgpu::web_sys::wasm_bindgen::JsValue> {
 mod web {
     use iletki::gpu::wgpu;
     use iletki::{
-        DrawStyle2D, Mesh2D, PassTargetDesc, PickId, Scene2DLayer, Vec2, ViewportConfig,
-        ViewportHost, ViewportLayer,
+        Camera, DrawStyle2D, Mesh2D, Mesh3D, PassTargetDesc, PickId, Plane, Scene2DLayer,
+        Scene3DLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer,
     };
     use wgpu::web_sys::{
         js_sys::{self, Promise, Reflect, futures::future_to_promise},
@@ -75,6 +75,85 @@ mod web {
         let mut layer = Scene2DLayer::new(ID.layer);
         layer.set_static_mesh(&mesh);
         let layers: &mut [&mut dyn ViewportLayer<()>] = &mut [&mut layer];
+        let pixel = render_pixels(&device, &queue, &mut host, layers, SIZE / 2, 1).await?;
+        if pixel != COLOR {
+            return Err(format!("unexpected WebGPU center pixel: {pixel:?}"));
+        }
+        let hits = host
+            .pick_rect_async(&device, &queue, &(), layers, [SIZE / 2, SIZE / 2, 1, 1])
+            .await
+            .map_err(|e| e.to_string())?;
+        if !matches!(hits.as_slice(), [hit] if hit.id == ID && (hit.depth - 0.5).abs() < 1e-5) {
+            return Err(format!("unexpected WebGPU pick: {hits:?}"));
+        }
+        check_section(&adapter, &device, &queue).await?;
+        Ok(format!(
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section coverage",
+            info.backend, info.name
+        ))
+    }
+
+    async fn check_section(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        let mut host = ViewportHost::new_with_adapter(
+            device,
+            adapter,
+            ViewportConfig {
+                color_format: FORMAT,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+                initial_px: [SIZE; 2],
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let mut camera = Camera::ortho_3d(
+            Vec3::new(0.0, -8.0, 0.0),
+            Vec3::ZERO,
+            Vec3::Z,
+            8.0,
+            0.05,
+            100.0,
+        );
+        let section = Plane::from_normal_point(Vec3::X, Vec3::new(0.0625, 0.0, 0.0))
+            .ok_or("invalid test section plane")?;
+        camera.set_clip_planes(&[section]);
+        *host.camera_mut() = camera;
+
+        let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+        mesh.push_quad(
+            Vec3::new(-3.0, 0.0, -3.0),
+            Vec3::new(3.0, 0.0, -3.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(-3.0, 0.0, 3.0),
+            COLOR,
+            ID,
+        );
+        let mut scene = Scene3DLayer::new(ID.layer);
+        scene.insert(mesh);
+        let pixels =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        let (Some(&clipped), Some(&cut), Some(&solid)) =
+            (pixels.get(1), pixels.get(5), pixels.get(9))
+        else {
+            return Err("missing WebGPU section pixels".to_owned());
+        };
+        if clipped != 0 || cut < 8 || cut.saturating_add(8) >= solid {
+            return Err(format!("unexpected WebGPU section pixels: {pixels:?}"));
+        }
+        Ok(())
+    }
+
+    async fn render_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        host: &mut ViewportHost,
+        layers: &mut [&mut dyn ViewportLayer<()>],
+        x: u32,
+        width: u32,
+    ) -> Result<Vec<u8>, String> {
         let target = PassTargetDesc {
             format: FORMAT,
             sample_count: 1,
@@ -83,7 +162,7 @@ mod web {
         };
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        host.prepare_for_pass(&device, &queue, &mut encoder, &(), layers, target)
+        host.prepare_for_pass(device, queue, &mut encoder, &(), layers, target)
             .map_err(|e| e.to_string())?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("WebGPU smoke output"),
@@ -116,15 +195,15 @@ mod web {
             host.paint_into_pass(&mut pass, target);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("center pixel"),
-            size: 4,
+            label: Some("WebGPU smoke pixels"),
+            size: u64::from(width) * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 origin: wgpu::Origin3d {
-                    x: SIZE / 2,
+                    x,
                     y: SIZE / 2,
                     z: 0,
                 },
@@ -135,7 +214,7 @@ mod web {
                 layout: Default::default(),
             },
             wgpu::Extent3d {
-                width: 1,
+                width,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -155,23 +234,11 @@ mod web {
         .await
         .map_err(|e| format!("pixel mapping failed: {e:?}"))?;
 
-        let pixel = readback.get_mapped_range(..).map_err(|e| e.to_string())?;
-        if *pixel != COLOR {
-            return Err(format!("unexpected WebGPU center pixel: {:?}", &*pixel));
-        }
-        drop(pixel);
+        let pixels = readback
+            .get_mapped_range(..)
+            .map_err(|e| e.to_string())?
+            .to_vec();
         readback.unmap();
-
-        let hits = host
-            .pick_rect_async(&device, &queue, &(), layers, [SIZE / 2, SIZE / 2, 1, 1])
-            .await
-            .map_err(|e| e.to_string())?;
-        if !matches!(hits.as_slice(), [hit] if hit.id == ID && (hit.depth - 0.5).abs() < 1e-5) {
-            return Err(format!("unexpected WebGPU pick: {hits:?}"));
-        }
-        Ok(format!(
-            "{:?} ({}) rendered {COLOR:?} and picked {ID:?}",
-            info.backend, info.name
-        ))
+        Ok(pixels)
     }
 }

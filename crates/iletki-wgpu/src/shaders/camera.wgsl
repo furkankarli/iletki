@@ -34,11 +34,13 @@ fn iletki_project_3d(pos_rel: vec3<f32>) -> vec4<f32> {
 // Returns true if a camera-relative 3D point is clipped away by any active section clip plane.
 // Uses a small negative tolerance (-1e-4) so faces lying exactly coplanar with a clip plane
 // (common at CAD grid axes like x=0, y=0) never suffer floating-point stipple/striping artifacts.
+const ILETKI_CLIP_TOLERANCE: f32 = 1e-4;
+
 fn iletki_is_clipped(pos_rel: vec3<f32>) -> bool {
     let count = min(iletki_camera.clip_plane_count, 6u);
     for (var i: u32 = 0u; i < count; i = i + 1u) {
         let plane = iletki_camera.clip_planes[i];
-        if (dot(plane.xyz, pos_rel) + plane.w < -1e-4) {
+        if (dot(plane.xyz, pos_rel) + plane.w < -ILETKI_CLIP_TOLERANCE) {
             return true;
         }
     }

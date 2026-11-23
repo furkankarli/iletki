@@ -15,6 +15,7 @@ pub mod gizmo;
 pub mod grid;
 pub mod instanced;
 pub mod scene;
+mod section;
 pub mod vertex;
 
 pub use gizmo::{GizmoAxis, TransformGizmoLayer};
