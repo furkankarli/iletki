@@ -16,6 +16,7 @@ use iletki_wgpu::{
     PrepareCtx, ViewportLayer,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -97,6 +98,7 @@ pub struct Scene3DLayer {
     pipelines: Option<Pipelines>,
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
+    free_chunks: BinaryHeap<Reverse<usize>>,
     views: Vec<ViewObjects>,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     profile_batch_uniforms: bool,
@@ -125,6 +127,7 @@ impl Scene3DLayer {
             pipelines: None,
             use_antialiased_section: false,
             chunks: Vec::new(),
+            free_chunks: BinaryHeap::new(),
             views: Vec::new(),
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             profile_batch_uniforms: true,
@@ -179,11 +182,9 @@ impl Scene3DLayer {
             has_picks: false,
             pick_bounds_trusted: false,
         };
-        if let Some((index, slot)) = self
-            .chunks
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
+        // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
+        if let Some(Reverse(index)) = self.free_chunks.pop()
+            && let Some(slot @ None) = self.chunks.get_mut(index)
         {
             *slot = Some(entry);
             return Chunk3DId { index, generation };
@@ -248,6 +249,7 @@ impl Scene3DLayer {
                 .is_some_and(|entry| entry.generation == id.generation)
         {
             *slot = None;
+            self.free_chunks.push(Reverse(id.index));
             for view in &mut self.views {
                 view.faces.clear();
                 view.edges.clear();
@@ -752,10 +754,9 @@ impl Scene3DLayer {
         }
         view.mask.clear();
         for (index, uniforms, geometry) in selected {
-            view.mask
-                .push(ctx.device, layout, geometry, uniforms, index);
+            view.mask.push(geometry, uniforms, index);
         }
-        view.mask.upload(ctx.queue);
+        view.mask.upload(ctx.device, layout, ctx.queue);
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         iletki_wgpu::profiling::count("scene.outline_mask_draws", view.mask.counts().0);
         true
@@ -1087,18 +1088,16 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 };
                 let mut direct = packed_layout.is_none()
                     || (picking.is_none() && chunk.selected && !packed_mask);
-                if let Some(layout) = packed_layout {
+                if packed_layout.is_some() {
                     if let Some(geometry) = &chunk.vertex_buf {
                         direct |= matches!(geometry, VertexRange::Direct(_));
-                        view.faces
-                            .push(ctx.device, layout, geometry, object.uniforms, index);
+                        view.faces.push(geometry, object.uniforms, index);
                     }
                     if picking.is_none()
                         && let Some(geometry) = &chunk.edge_buf
                     {
                         direct |= matches!(geometry, VertexRange::Direct(_));
-                        view.edges
-                            .push(ctx.device, layout, geometry, object.uniforms, index);
+                        view.edges.push(geometry, object.uniforms, index);
                     }
                 }
                 if direct {
@@ -1106,8 +1105,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     view.direct_uniforms.push(object.uniforms);
                 }
             }
-            view.faces.upload(ctx.queue);
-            view.edges.upload(ctx.queue);
+            if let Some(layout) = packed_layout {
+                view.faces.upload(ctx.device, layout, ctx.queue);
+                view.edges.upload(ctx.device, layout, ctx.queue);
+            }
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         if iletki_wgpu::profiling::active() {
@@ -1288,5 +1289,31 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insertion_reuses_the_lowest_vacant_slot_and_rejects_stale_handles() {
+        let mut scene = Scene3DLayer::new(1);
+        let insert = |scene: &mut Scene3DLayer| scene.insert(Mesh3D::at_origin(Vec3::ZERO));
+        let first = insert(&mut scene);
+        let second = insert(&mut scene);
+        let third = insert(&mut scene);
+        scene.remove(third);
+        scene.remove(first);
+        scene.remove(first);
+
+        let replacement_first = insert(&mut scene);
+        scene.remove(first);
+        assert_eq!(replacement_first.index, first.index);
+        assert!(scene.chunk_mut(replacement_first).is_some());
+        assert!(scene.chunk_mut(first).is_none());
+        assert_eq!(insert(&mut scene).index, third.index);
+        assert_eq!(insert(&mut scene).index, 3);
+        assert!(scene.chunk_mut(second).is_some());
     }
 }

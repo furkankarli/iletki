@@ -121,9 +121,12 @@ def main():
     args = parser.parse_args()
     started = perf_counter()
     if args.format == "ifc":
-        if len(args.input) != 1:
-            parser.error("IFC mode expects one source file")
-        parts = sorted(ifc_parts(args.input[0]), key=lambda part: part[0])
+        parts = []
+        for path in args.input:
+            parts.extend(sorted(ifc_parts(path), key=lambda part: part[0]))
+        if len(args.input) > 1:
+            # STEP entity IDs are local to their IFC file. Use unique pick IDs in a federation.
+            parts = [(i, origin, data) for i, (_, origin, data) in enumerate(parts, 1)]
     else:
         parts = [part for i, path in enumerate(args.input) for part in step_parts(path, i * 100_000 + 1)]
     triangles = sum(len(data) // 3 for _, _, data in parts)

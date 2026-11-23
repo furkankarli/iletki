@@ -7,6 +7,7 @@ use std::{num::NonZeroU64, ops::Range, sync::Arc};
 // The matching WGSL uniform array is 4 KiB, within the WebGPU uniform binding limit.
 const OBJECTS: usize = 256;
 const MAX_VERTICES: usize = 65_536;
+const UNIFORM_BLOCK_BYTES: usize = 1024 * 1024;
 pub(crate) const OBJECT_BYTES: u64 = (OBJECTS * size_of::<ObjectUniforms>()) as u64;
 
 pub(crate) struct GeometryPage {
@@ -143,6 +144,10 @@ impl PageBuilder {
     }
 }
 
+fn dynamic_offsets(limits: &wgpu::Limits) -> bool {
+    limits.max_dynamic_uniform_buffers_per_pipeline_layout != 0
+}
+
 pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("iletki-3d geometry page transforms"),
@@ -151,7 +156,7 @@ pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             visibility: wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
+                has_dynamic_offset: dynamic_offsets(&device.limits()),
                 min_binding_size: NonZeroU64::new(OBJECT_BYTES),
             },
             count: None,
@@ -162,12 +167,17 @@ pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 struct ViewUniforms {
     buffer: wgpu::Buffer,
     binding: wgpu::BindGroup,
-    transforms: Box<[ObjectUniforms; OBJECTS]>,
+    capacity: usize,
 }
 
 #[derive(Default)]
 pub(crate) struct PackedDraws {
-    pages: Vec<ViewUniforms>,
+    pages: Vec<[ObjectUniforms; OBJECTS]>,
+    buffers: Vec<ViewUniforms>,
+    staging: Vec<u8>,
+    pages_per_buffer: usize,
+    stride: usize,
+    dynamic_offsets: bool,
     commands: Vec<Draw>,
     last_page: Option<Arc<GeometryPage>>,
     used_pages: usize,
@@ -191,8 +201,6 @@ impl PackedDraws {
 
     pub(crate) fn push(
         &mut self,
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
         geometry: &VertexRange,
         offset: ObjectUniforms,
         draw_index: usize,
@@ -212,37 +220,19 @@ impl PackedDraws {
             .is_some_and(|prev| Arc::ptr_eq(prev, page))
         {
             if self.used_pages == self.pages.len() {
-                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("iletki-3d geometry transform page"),
-                    size: OBJECT_BYTES,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("iletki-3d geometry transform binding"),
-                    layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                });
-                self.pages.push(ViewUniforms {
-                    buffer,
-                    binding,
-                    transforms: Box::new(
-                        [ObjectUniforms {
-                            offset_rel: [0.0; 3],
-                            scale: 1.0,
-                        }; OBJECTS],
-                    ),
-                });
+                self.pages.push(
+                    [ObjectUniforms {
+                        offset_rel: [0.0; 3],
+                        scale: 1.0,
+                    }; OBJECTS],
+                );
             }
             self.used_pages += 1;
             self.last_page = Some(page.clone());
         }
         let uniforms = self.used_pages.saturating_sub(1);
         if let Some(uniforms) = self.pages.get_mut(uniforms)
-            && let Some(transform) = uniforms.transforms.get_mut(*slot)
+            && let Some(transform) = uniforms.get_mut(*slot)
         {
             *transform = offset;
         }
@@ -266,13 +256,81 @@ impl PackedDraws {
         });
     }
 
-    pub(crate) fn upload(&self, queue: &wgpu::Queue) {
-        for page in self.pages.iter().take(self.used_pages) {
-            queue.write_buffer(
-                &page.buffer,
-                0,
-                bytemuck::cast_slice(page.transforms.as_slice()),
-            );
+    pub(crate) fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        queue: &wgpu::Queue,
+    ) {
+        let limits = device.limits();
+        let alignment = (limits.min_uniform_buffer_offset_alignment as usize).max(1);
+        let page_bytes = OBJECT_BYTES as usize;
+        self.stride = page_bytes.div_ceil(alignment) * alignment;
+        self.dynamic_offsets = dynamic_offsets(&limits);
+        self.pages_per_buffer = if self.dynamic_offsets {
+            (UNIFORM_BLOCK_BYTES / self.stride).max(1)
+        } else {
+            1
+        };
+
+        for (index, pages) in self
+            .pages
+            .get(..self.used_pages)
+            .unwrap_or_default()
+            .chunks(self.pages_per_buffer)
+            .enumerate()
+        {
+            if self
+                .buffers
+                .get(index)
+                .is_none_or(|block| block.capacity < pages.len())
+            {
+                let capacity = pages.len().next_power_of_two().min(self.pages_per_buffer);
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iletki-3d geometry transforms"),
+                    size: ((capacity - 1) * self.stride + page_bytes) as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iletki-3d geometry transform binding"),
+                    layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &buffer,
+                            offset: 0,
+                            size: NonZeroU64::new(OBJECT_BYTES),
+                        }),
+                    }],
+                });
+                let block = ViewUniforms {
+                    buffer,
+                    binding,
+                    capacity,
+                };
+                if let Some(existing) = self.buffers.get_mut(index) {
+                    *existing = block;
+                } else {
+                    self.buffers.push(block);
+                }
+            }
+            let Some(block) = self.buffers.get(index) else {
+                continue;
+            };
+            let bytes = if self.stride == page_bytes || pages.len() == 1 {
+                bytemuck::cast_slice(pages)
+            } else {
+                self.staging
+                    .resize((pages.len() - 1) * self.stride + page_bytes, 0);
+                for (dst, src) in self.staging.chunks_mut(self.stride).zip(pages) {
+                    if let Some(page) = dst.get_mut(..page_bytes) {
+                        page.copy_from_slice(bytemuck::cast_slice(src));
+                    }
+                }
+                self.staging.as_slice()
+            };
+            queue.write_buffer(&block.buffer, 0, bytes);
         }
     }
 
@@ -282,7 +340,10 @@ impl PackedDraws {
 
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.commands.len(), self.used_pages)
+        (
+            self.commands.len(),
+            self.used_pages.div_ceil(self.pages_per_buffer.max(1)),
+        )
     }
 
     pub(crate) fn paint(
@@ -305,11 +366,18 @@ impl PackedDraws {
                     vertices,
                 } => {
                     if bound != Some(*uniforms) {
-                        let Some(page) = self.pages.get(*uniforms) else {
+                        let pages_per_buffer = self.pages_per_buffer.max(1);
+                        let Some(block) = self.buffers.get(*uniforms / pages_per_buffer) else {
                             continue;
                         };
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(1, &page.binding, &[]);
+                        let offset = [((*uniforms % pages_per_buffer) * self.stride) as u32];
+                        let offsets = if self.dynamic_offsets {
+                            offset.as_slice()
+                        } else {
+                            &[]
+                        };
+                        pass.set_bind_group(1, &block.binding, offsets);
                         pass.set_vertex_buffer(0, geometry.vertices.slice(..));
                         pass.set_vertex_buffer(1, geometry.slots.slice(..));
                         if picking {

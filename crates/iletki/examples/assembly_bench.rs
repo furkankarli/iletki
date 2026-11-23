@@ -79,7 +79,7 @@ mod native {
         }
 
         fn acceptance_wide(self) -> bool {
-            self.chunks == 20_000 && self.view == "wide"
+            matches!(self.chunks, 20_000 | 100_000) && self.view == "wide"
         }
 
         fn camera(self, frame: u32, secondary: bool) -> Camera {
@@ -249,6 +249,7 @@ mod native {
         gpu: &'a Gpu,
         samples: BufWriter<File>,
         profile: BufWriter<File>,
+        memory: Option<BufWriter<File>>,
         run: u32,
         variant: String,
         size: [u32; 2],
@@ -261,6 +262,7 @@ mod native {
             mut scene: Scene3DLayer,
             edits: &[(Chunk3DId, Vec3)],
         ) -> Result<(), Error> {
+            self.record_memory(case, "before-targets")?;
             let host = || {
                 ViewportHost::new_with_adapter(
                     &self.gpu.device,
@@ -278,12 +280,46 @@ mod native {
                 *second.camera_mut() = case.camera(0, true);
             }
             self.orbit(case, &mut scene, &mut main, &mut second, edits)?;
-            if (case.primary() || case.model.is_some()) && self.variant != "visibility-only" {
+            self.record_memory(case, "after-orbit")?;
+            if (case.primary() || case.model.is_some() || case.chunks == 100_000)
+                && self.variant != "visibility-only"
+            {
                 self.picking(case, &mut scene, &mut main)?;
+            }
+            self.record_memory(case, "after-pick")?;
+            drop(second);
+            drop(main);
+            drop(scene);
+            if self.memory.is_some() {
+                self.gpu.wait(self.gpu.queue.submit([]))?;
+                self.record_memory(case, "closed")?;
             }
             self.samples.flush()?;
             self.profile.flush()?;
+            if let Some(memory) = &mut self.memory {
+                memory.flush()?;
+            }
             Ok(())
+        }
+
+        fn record_memory(&mut self, case: Case, stage: &str) -> std::io::Result<()> {
+            let Some(output) = &mut self.memory else {
+                return Ok(());
+            };
+            let (allocated, reserved) = self.gpu.device.generate_allocator_report().map_or_else(
+                || (String::new(), String::new()),
+                |report| {
+                    (
+                        report.total_allocated_bytes.to_string(),
+                        report.total_reserved_bytes.to_string(),
+                    )
+                },
+            );
+            writeln!(
+                output,
+                "{},{},{stage},{allocated},{reserved}",
+                case.chunks, case.view
+            )
         }
 
         fn orbit(
@@ -312,6 +348,7 @@ mod native {
                 gpu.wait(gpu.queue.submit([encoder.finish()]))?;
                 if frame == 0 {
                     self.record(case, "first-frame", frame, 0.0, elapsed_ms(start), "")?;
+                    self.record_memory(case, "first-frame")?;
                 }
                 if !streaming {
                     self.record(
@@ -322,6 +359,7 @@ mod native {
                         elapsed_ms(stream_start),
                         "",
                     )?;
+                    self.record_memory(case, "streaming-complete")?;
                     break;
                 }
                 if frame == case.chunks {
@@ -332,12 +370,20 @@ mod native {
             let samples = if long { 360 } else { 60 };
             let profile = std::env::var_os("ILETKI_PROFILE").is_some() && long;
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
+            let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
             for frame in 0..12 + samples + if profile { 8 } else { 0 } {
                 let start = Instant::now();
-                if edit_scene && frame % 6 == 0 {
-                    let delta = if frame % 12 == 0 { 0.2 } else { 0.0 };
+                let edited = (edit_scene || edit_visibility) && frame % 6 == 0;
+                if edited {
+                    let toggled = frame % 12 == 0;
+                    let delta = if toggled { 0.2 } else { 0.0 };
                     for &(id, origin) in edits {
-                        scene.set_origin(id, origin + Vec3::X * delta);
+                        if edit_scene {
+                            scene.set_origin(id, origin + Vec3::X * delta);
+                        }
+                        if edit_visibility {
+                            scene.set_visible(id, !toggled);
+                        }
                     }
                 }
                 *main.camera_mut() = case.camera(frame, false);
@@ -396,6 +442,9 @@ mod native {
                         String::new()
                     };
                     self.record(case, "orbit", frame - 12, encode, wall, &signature)?;
+                    if edited {
+                        self.record(case, "edit-frame", frame - 12, encode, wall, "")?;
+                    }
                 }
             }
             Ok(())
@@ -519,10 +568,21 @@ mod native {
             .parse()?;
         fs::create_dir_all(output)?;
         let gpu = Gpu::new()?;
+        let memory = if std::env::var_os("ILETKI_ASSEMBLY_MEMORY").is_some() {
+            let mut output = BufWriter::new(File::create(output.join("memory.csv"))?);
+            writeln!(
+                output,
+                "chunks,view,stage,gpu_allocated_bytes,gpu_reserved_bytes"
+            )?;
+            Some(output)
+        } else {
+            None
+        };
         let mut bench = Benchmark {
             gpu: &gpu,
             samples: BufWriter::new(File::create(output.join("frames.csv"))?),
             profile: BufWriter::new(File::create(output.join("profile.csv"))?),
+            memory,
             run,
             variant,
             size: viewport_size()?,
@@ -540,6 +600,7 @@ mod native {
         if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
             let started = Instant::now();
             let fixture = crate::assembly_fixture::load(Path::new(&path))?;
+            let decoded_ms = elapsed_ms(started);
             let chunks = u32::try_from(fixture.meshes.len())?;
             let focus = fixture.bounds.center().ok_or("model has no bounds")?;
             let radius = fixture.bounds.radius() * 2.6;
@@ -556,6 +617,7 @@ mod native {
                 model: Some((focus, radius)),
                 style,
             };
+            let insert_started = Instant::now();
             let mut scene = Scene3DLayer::new(1);
             scene.set_profile_batch_geometry(pack);
             let mut edits = Vec::new();
@@ -566,17 +628,20 @@ mod native {
                     edits.push((id, origin));
                 }
             }
+            let insert_ms = elapsed_ms(insert_started);
             eprintln!(
                 "model: {chunks} chunks, {} triangles, {:?} pixels",
                 fixture.triangles, bench.size
             );
-            bench.record(case, "scene-load", 0, 0.0, elapsed_ms(started), "")?;
+            bench.record(case, "scene-load", 0, 0.0, decoded_ms + insert_ms, "")?;
+            bench.record(case, "fixture-decode", 0, 0.0, decoded_ms, "")?;
+            bench.record(case, "scene-insert", 0, 0.0, insert_ms, "")?;
             return bench.run_case(case, scene, &edits);
         }
         let primary_only = std::env::var_os("ILETKI_PRIMARY_ONLY").is_some();
         let filter = std::env::var("ILETKI_ASSEMBLY_CASE").ok();
         let mut ran_case = false;
-        for chunks in [1000, 4000, 20000] {
+        for chunks in [1000, 4000, 20000, 100_000] {
             for view in ["near", "wide", "dual"] {
                 let case = Case {
                     chunks,
@@ -584,7 +649,8 @@ mod native {
                     model: None,
                     style,
                 };
-                if (primary_only && !case.primary())
+                if (chunks == 100_000 && filter.as_deref() != Some("100000/wide"))
+                    || (primary_only && !case.primary())
                     || filter
                         .as_ref()
                         .is_some_and(|filter| filter != &format!("{chunks}/{view}"))
@@ -592,7 +658,9 @@ mod native {
                     continue;
                 }
                 ran_case = true;
+                let started = Instant::now();
                 let (scene, edits) = case.make_scene(bench.variant != "visibility-only", pack);
+                bench.record(case, "scene-build", 0, 0.0, elapsed_ms(started), "")?;
                 bench.run_case(case, scene, &edits)?;
             }
         }

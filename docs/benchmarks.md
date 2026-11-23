@@ -81,6 +81,9 @@ The adapter chooses raster clipping when clip distances are available. Set
 `ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
 Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
 adds an orthographic view to a model run and records both reference image hashes.
+`ILETKI_ASSEMBLY_VISIBILITY_EDITS=1` toggles visibility for the same subset.
+With either edit control, `edit-frame` repeats the changing frames from the orbit
+series for separate percentile analysis.
 
 The offscreen workloads exclude window acquisition, compositing and presentation. The
 asynchronous pick workload polls continuously to measure request readiness independently
@@ -205,6 +208,43 @@ python3 docs/benchmarks/repro/convert-model.py step-gltf out/nist.iltmesh out/ct
 ILETKI_ASSEMBLY_MESH=out/schependomlaan.iltmesh ILETKI_ASSEMBLY_SIZE=1920x1080 ILETKI_PROFILE=1 \
   target/release/examples/assembly_bench out/ifc/1 packed 1
 ```
+
+### Production-scale loading and edits
+
+The West Riverside Hospital architecture and structural models form a coordinated
+IFC4 federation. Attribution goes to Wawan Solihin and the University of Auckland
+OpenIFC Model Repository. The files are distributed under CC BY 3.0. The converter
+tessellates each file, preserves its placements, and assigns distinct pick IDs
+across source files. Keep the downloaded and converted assets in a local directory.
+[Model card and attribution](https://huggingface.co/datasets/sylvainHellin/ifc-bench/blob/ebacaf2de71cedd7226897497fcdf8b143c5b66f/projects/west_riverside_hospital/model_card.md)
+
+```sh
+mkdir -p out/hospital
+hospital_url=https://huggingface.co/datasets/sylvainHellin/ifc-bench/resolve/ebacaf2de71cedd7226897497fcdf8b143c5b66f/projects/west_riverside_hospital
+for file in arc_ifc4.ifc str_ifc4.ifc license.txt; do
+  curl --fail --location "$hospital_url/$file" --output "out/hospital/$file"
+done
+python3 docs/benchmarks/repro/convert-model.py ifc out/hospital/hospital.iltmesh \
+  out/hospital/arc_ifc4.ifc out/hospital/str_ifc4.ifc
+cargo build --release --locked -p iletki --features profiling --example assembly_bench
+ILETKI_ASSEMBLY_MESH=out/hospital/hospital.iltmesh ILETKI_ASSEMBLY_SIZE=1920x1080 \
+  ILETKI_ASSEMBLY_STYLE=edges-section ILETKI_ASSEMBLY_EDITS=1 \
+  ILETKI_ASSEMBLY_VISIBILITY_EDITS=1 ILETKI_PROFILE=1 ILETKI_ASSEMBLY_MEMORY=1 \
+  /usr/bin/time -v -o out/hospital/process-memory.txt \
+  target/release/examples/assembly_bench out/hospital/run current 1
+```
+
+`fixture-decode` and `scene-insert` separate binary fixture reading from insertion into
+the viewport layer. `first-frame` and `streaming-complete` use GPU-completed frames.
+On Linux, GNU time records peak process RSS. The optional `memory.csv` records live
+allocations and reserved blocks reported by wgpu at open, first frame, completed
+upload, steady state, picking and close. These are allocator snapshots. An unavailable
+allocator report leaves the fields empty.
+
+Set `ILETKI_ASSEMBLY_CASE=100000/wide` and unset `ILETKI_ASSEMBLY_MESH` to run the
+100,000-chunk synthetic control. Its `scene-build` timing includes generating each
+mesh and inserting it. Match flags, fixture checksums, resolution, adapter and
+sample counts when comparing revisions.
 
 Keep the CSVs in frame order and run several repetitions. When comparing renderers, fix the GPU,
 driver, visible geometry, camera, lighting, MSAA and output format. Measure initial setup,

@@ -74,9 +74,16 @@ fn render(
 #[test]
 fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
     let Some(adapter) = adapter() else { return };
-    for features in device_features(&adapter) {
+    let dynamic_limit = wgpu::Limits::default().max_dynamic_uniform_buffers_per_pipeline_layout;
+    for (features, limit) in
+        device_features(&adapter).flat_map(|features| [(features, dynamic_limit), (features, 0)])
+    {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: features,
+            required_limits: wgpu::Limits {
+                max_dynamic_uniform_buffers_per_pipeline_layout: limit,
+                ..Default::default()
+            },
             ..Default::default()
         }))
         .unwrap();
@@ -91,9 +98,9 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         )
         .unwrap()]);
         let mut selection_updates = Vec::new();
-        for i in 0..169 {
-            let x = (f64::from(i % 13) - 6.0) * 0.45;
-            let z = (f64::from(i / 13) - 6.0) * 0.45;
+        for i in 0..289 {
+            let x = (f64::from(i % 17) - 8.0) * 0.45;
+            let z = (f64::from(i / 17) - 8.0) * 0.45;
             let mut mesh = Mesh3D::at_origin(Vec3::new(x, 0.0, z));
             mesh.push_box_with_edges(
                 Vec3::new(-0.19, -0.15, -0.19),
@@ -130,7 +137,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         let direct = render(&device, &queue, &mut host, &mut scene, camera).unwrap();
         assert!(
             image.pixels == direct.pixels,
-            "packed section differs with {features:?}"
+            "packed section differs with {features:?} and dynamic uniform limit {limit}"
         );
         let picks = host
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
