@@ -23,3 +23,11 @@ fn fs_edge_sampled(in: SampledColorOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(iletki_color_to_target(in.color.rgb), in.color.a);
 }
+
+@fragment
+fn fs_mask_sampled(in: SampledColorOut) -> @location(0) f32 {
+    if (iletki_is_clipped(in.sample_pos_rel)) {
+        discard;
+    }
+    return 1.0;
+}

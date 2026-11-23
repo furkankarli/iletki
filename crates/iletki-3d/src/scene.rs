@@ -5,7 +5,7 @@
 use crate::section::SectionAa;
 use crate::vertex::{Mesh3D, Vertex3D};
 use bytemuck::{Pod, Zeroable};
-use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
+use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, Vec4, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
@@ -58,10 +58,17 @@ struct Pipelines {
     msaa: u32,
     object_layout: wgpu::BindGroupLayout,
     lit: wgpu::RenderPipeline,
-    section: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    section: Option<SectionPipelines>,
     edge: wgpu::RenderPipeline,
     mask: wgpu::RenderPipeline,
+    multisampled_mask: Option<wgpu::RenderPipeline>,
     pick: wgpu::RenderPipeline,
+}
+
+struct SectionPipelines {
+    lit: wgpu::RenderPipeline,
+    edge: wgpu::RenderPipeline,
+    multisampled_mask: wgpu::RenderPipeline,
 }
 
 /// Camera-relative Reversed-Z 3D scene layer implementing [`ViewportLayer`].
@@ -356,6 +363,45 @@ impl Scene3DLayer {
         };
         let edge = make_edge(&shader, "vs_edge", "fs_edge");
 
+        let make_mask = |shader: &wgpu::ShaderModule, vertex, fragment, count| {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d outline mask"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some(vertex),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(vert_layout.clone())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(fragment),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: OUTLINE_MASK_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None,
+                        ..wgpu::PrimitiveState::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count,
+                        ..Default::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        let mask = make_mask(&shader, "vs_mask", "fs_mask", 1);
+        let multisampled_mask =
+            (ctx.msaa_samples == 4).then(|| make_mask(&shader, "vs_mask", "fs_mask", 4));
+
         let section = section_aa.map(|aa| {
             let shader = aa.shader(
                 ctx.device,
@@ -364,48 +410,18 @@ impl Scene3DLayer {
                 include_str!("shaders/mesh3d_raster.wgsl"),
             );
             match aa {
-                SectionAa::Sampled => (
-                    make_lit(&shader, "vs_mesh_sampled", "fs_lit_sampled"),
-                    make_edge(&shader, "vs_edge_sampled", "fs_edge_sampled"),
-                ),
-                SectionAa::Raster => (
-                    make_lit(&shader, "vs_mesh_raster", "fs_lit_raster"),
-                    make_edge(&shader, "vs_edge_raster", "fs_unlit"),
-                ),
+                SectionAa::Sampled => SectionPipelines {
+                    lit: make_lit(&shader, "vs_mesh_sampled", "fs_lit_sampled"),
+                    edge: make_edge(&shader, "vs_edge_sampled", "fs_edge_sampled"),
+                    multisampled_mask: make_mask(&shader, "vs_mesh_sampled", "fs_mask_sampled", 4),
+                },
+                SectionAa::Raster => SectionPipelines {
+                    lit: make_lit(&shader, "vs_mesh_raster", "fs_lit_raster"),
+                    edge: make_edge(&shader, "vs_edge_raster", "fs_unlit"),
+                    multisampled_mask: make_mask(&shader, "vs_mesh_raster", "fs_mask_unclipped", 4),
+                },
             }
         });
-
-        let mask = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d outline mask"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_mask"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(vert_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_mask"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: OUTLINE_MASK_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..wgpu::PrimitiveState::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
 
         let pick = ctx
             .device
@@ -456,8 +472,41 @@ impl Scene3DLayer {
             section,
             edge,
             mask,
+            multisampled_mask,
             pick,
         });
+    }
+
+    fn paint_outline_mask<W>(
+        &self,
+        pipeline: &wgpu::RenderPipeline,
+        pass: &mut wgpu::RenderPass<'_>,
+        ctx: &PaintCtx<'_, W>,
+    ) {
+        let frustum = ctx.camera.frustum(ctx.logical_size);
+        let cam_pos = ctx.camera.position_3d();
+        let vp_id = ctx.viewport_id;
+        pass.set_pipeline(pipeline);
+        for chunk in self.chunks.iter().flatten() {
+            if !chunk.visible || !chunk.selected || chunk.vertex_count == 0 {
+                continue;
+            }
+            let wb = Bounds3::from_corners(
+                chunk.origin + chunk.local_bounds.min,
+                chunk.origin + chunk.local_bounds.max,
+            );
+            if !wb.is_empty() && !frustum.intersects_bounds_world(wb, cam_pos) {
+                continue;
+            }
+            let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) else {
+                continue;
+            };
+            if let Some(vbuf) = &chunk.vertex_buf {
+                pass.set_bind_group(1, &binding.bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.draw(0..chunk.vertex_count, 0..1);
+            }
+        }
     }
 }
 
@@ -603,6 +652,129 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         pending
     }
 
+    fn supports_multisampled_outline_mask(&self) -> bool {
+        self.pipelines
+            .as_ref()
+            .is_some_and(|p| p.multisampled_mask.is_some())
+    }
+
+    fn paint_multisampled_outline_mask(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        ctx: &PaintCtx<'_, W>,
+    ) {
+        let Some(p) = &self.pipelines else {
+            return;
+        };
+        let mask = p
+            .section
+            .as_ref()
+            .filter(|_| self.use_antialiased_section)
+            .map(|section| &section.multisampled_mask)
+            .or(p.multisampled_mask.as_ref());
+        if let Some(mask) = mask {
+            self.paint_outline_mask(mask, pass, ctx);
+        }
+    }
+
+    fn outline_mask_rect(&self, ctx: &PaintCtx<'_, W>) -> Option<[u32; 4]> {
+        let projection = ctx.camera.view_proj_relative(ctx.logical_size);
+        let camera_pos = ctx.camera.position_3d();
+        let [width, height] = ctx.active_px.map(f64::from);
+        let mut min = [width, height];
+        let mut max = [0.0_f64; 2];
+        let error_rows = [
+            [
+                projection.c0.x,
+                projection.c1.x,
+                projection.c2.x,
+                projection.c3.x,
+            ],
+            [
+                projection.c0.y,
+                projection.c1.y,
+                projection.c2.y,
+                projection.c3.y,
+            ],
+            [
+                projection.c0.w,
+                projection.c1.w,
+                projection.c2.w,
+                projection.c3.w,
+            ],
+        ];
+        for chunk in self
+            .chunks
+            .iter()
+            .flatten()
+            .filter(|chunk| chunk.selected && chunk.visible && chunk.vertex_count != 0)
+        {
+            let bounds = chunk.local_bounds;
+            if bounds.is_empty() {
+                return None;
+            }
+            let [ox, oy, oz] = (chunk.origin - camera_pos).to_f32();
+            for x in [bounds.min.x, bounds.max.x] {
+                for y in [bounds.min.y, bounds.max.y] {
+                    for z in [bounds.min.z, bounds.max.z] {
+                        // Use the same rounded local coordinates and origin as the vertex shader.
+                        let point = Vec4::new(
+                            f64::from(x as f32 + ox),
+                            f64::from(y as f32 + oy),
+                            f64::from(z as f32 + oz),
+                            1.0,
+                        );
+                        let clip = projection.mul_vec4(point);
+                        // Bound f32 uniform and dot-product rounding before the perspective divide.
+                        let [x_error, y_error, w_error] = error_rows.map(|[a, b, c, d]| {
+                            let magnitude = (a * point.x).abs()
+                                + (b * point.y).abs()
+                                + (c * point.z).abs()
+                                + d.abs();
+                            magnitude * (16.0 * f64::from(f32::EPSILON))
+                                + f64::from(f32::MIN_POSITIVE)
+                        });
+                        if ![clip.x, clip.y, clip.z, clip.w]
+                            .into_iter()
+                            .all(f64::is_finite)
+                            || clip.w <= w_error
+                            || clip.w >= f64::from(f32::MAX) * 0.5
+                            || x_error.max(y_error) > 1.0
+                        {
+                            return None;
+                        }
+                        let nx = clip.x / clip.w;
+                        let ny = clip.y / clip.w;
+                        let dx = (x_error + nx.abs() * w_error) / (clip.w - w_error);
+                        let dy = (y_error + ny.abs() * w_error) / (clip.w - w_error);
+                        let [left, top] = [
+                            (nx - dx + 1.0) * width * 0.5,
+                            (1.0 - ny - dy) * height * 0.5,
+                        ];
+                        let [right, bottom] = [
+                            (nx + dx + 1.0) * width * 0.5,
+                            (1.0 - ny + dy) * height * 0.5,
+                        ];
+                        let [l, t] = min;
+                        let [r, b] = max;
+                        min = [l.min(left), t.min(top)];
+                        max = [r.max(right), b.max(bottom)];
+                    }
+                }
+            }
+        }
+        let [left, top] = min.map(f64::floor);
+        let [right, bottom] = max.map(f64::ceil);
+        let x = left.clamp(0.0, width) as u32;
+        let y = top.clamp(0.0, height) as u32;
+        Some([
+            x,
+            y,
+            (right.clamp(0.0, width) as u32).saturating_sub(x),
+            (bottom.clamp(0.0, height) as u32).saturating_sub(y),
+        ])
+    }
+
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {
         let Some(p) = &self.pipelines else {
             return;
@@ -615,7 +787,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             .section
             .as_ref()
             .filter(|_| self.use_antialiased_section)
-            .map_or((&p.lit, &p.edge), |(lit, edge)| (lit, edge));
+            .map_or((&p.lit, &p.edge), |section| (&section.lit, &section.edge));
 
         match phase {
             DrawPhase::Opaque => {
@@ -672,29 +844,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     }
                 }
             }
-            DrawPhase::OutlineMask => {
-                pass.set_pipeline(&p.mask);
-                for chunk in self.chunks.iter().flatten() {
-                    if !chunk.visible || !chunk.selected || chunk.vertex_count == 0 {
-                        continue;
-                    }
-                    let wb = Bounds3::from_corners(
-                        chunk.origin + chunk.local_bounds.min,
-                        chunk.origin + chunk.local_bounds.max,
-                    );
-                    if !wb.is_empty() && !frustum.intersects_bounds_world(wb, cam_pos) {
-                        continue;
-                    }
-                    let Some(binding) = chunk.per_viewport.iter().find(|b| b.id == vp_id) else {
-                        continue;
-                    };
-                    if let Some(vbuf) = &chunk.vertex_buf {
-                        pass.set_bind_group(1, &binding.bg, &[]);
-                        pass.set_vertex_buffer(0, vbuf.slice(..));
-                        pass.draw(0..chunk.vertex_count, 0..1);
-                    }
-                }
-            }
+            DrawPhase::OutlineMask => self.paint_outline_mask(&p.mask, pass, ctx),
             DrawPhase::Picking => {
                 pass.set_pipeline(&p.pick);
                 for chunk in self.chunks.iter().flatten() {

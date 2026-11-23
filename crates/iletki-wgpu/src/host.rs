@@ -504,26 +504,6 @@ impl ViewportHost {
             }
         }
 
-        let has_outline_layers = layers
-            .iter()
-            .any(|l| l.phases().contains(DrawPhase::OutlineMask));
-        let has_dynamic_layers = has_outline_layers
-            || layers.iter().any(|l| {
-                let m = l.phases();
-                m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
-            });
-
-        if has_outline_layers {
-            OutlineEngine::ensure(
-                &mut self.outline,
-                device,
-                size.allocated_px,
-                self.targets.format(),
-                self.targets.msaa_samples(),
-                DEPTH_FORMAT,
-            );
-        }
-
         let paint_ctx = PaintCtx {
             viewport_id: self.id,
             camera: &self.camera,
@@ -534,23 +514,42 @@ impl ViewportHost {
             dpi_scale: self.dpi_scale,
         };
 
+        let outline_rect = Self::outline_rect(layers, &paint_ctx);
+        let has_dynamic_layers = outline_rect.is_some()
+            || layers.iter().any(|l| {
+                let m = l.phases();
+                m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
+            });
+
+        if outline_rect.is_some() {
+            let multisampled_mask = self.targets.msaa_samples() == 4
+                && layers
+                    .iter()
+                    .filter(|layer| layer.phases().contains(DrawPhase::OutlineMask))
+                    .all(|layer| layer.supports_multisampled_outline_mask());
+            OutlineEngine::ensure(
+                &mut self.outline,
+                device,
+                size.allocated_px,
+                self.targets.format(),
+                self.targets.msaa_samples(),
+                DEPTH_FORMAT,
+                multisampled_mask,
+            );
+        }
+
         match self.config.mode {
             ViewportMode::Continuous => {
-                if has_outline_layers {
+                if let Some(rect) = outline_rect {
                     self.run_outline_mask_and_jfa(
-                        queue,
-                        encoder,
-                        [aw, ah],
-                        layers,
-                        &paint_ctx,
-                        &mut stats,
+                        queue, encoder, rect, layers, &paint_ctx, &mut stats,
                     );
                 }
                 self.render_continuous(
                     encoder,
                     aw,
                     ah,
-                    has_outline_layers,
+                    outline_rect,
                     layers,
                     &paint_ctx,
                     &mut stats,
@@ -571,21 +570,16 @@ impl ViewportHost {
                 }
 
                 if need_dynamic {
-                    if has_outline_layers {
+                    if let Some(rect) = outline_rect {
                         self.run_outline_mask_and_jfa(
-                            queue,
-                            encoder,
-                            [aw, ah],
-                            layers,
-                            &paint_ctx,
-                            &mut stats,
+                            queue, encoder, rect, layers, &paint_ctx, &mut stats,
                         );
                     }
                     self.render_dynamic_over_cache(
                         encoder,
                         aw,
                         ah,
-                        has_outline_layers,
+                        outline_rect,
                         layers,
                         &paint_ctx,
                         &mut stats,
@@ -684,12 +678,49 @@ impl ViewportHost {
         std::mem::swap(&mut self.cached_layers, &mut self.prepared_layers);
     }
 
+    fn outline_rect<W>(
+        layers: &[&mut dyn ViewportLayer<W>],
+        ctx: &PaintCtx<'_, W>,
+    ) -> Option<[u32; 4]> {
+        let [aw, ah] = ctx.active_px;
+        let mut min_x = aw;
+        let mut min_y = ah;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        for layer in layers
+            .iter()
+            .filter(|layer| layer.phases().contains(DrawPhase::OutlineMask))
+        {
+            let Some([x, y, width, height]) = layer.outline_mask_rect(ctx) else {
+                return Some([0, 0, aw, ah]);
+            };
+            let right = x.saturating_add(width).min(aw);
+            let bottom = y.saturating_add(height).min(ah);
+            if right > x && bottom > y {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(right);
+                max_y = max_y.max(bottom);
+            }
+        }
+        if min_x >= max_x || min_y >= max_y {
+            return None;
+        }
+        // Cover the largest supported outline, its feather, and the seed filter's neighbors.
+        const PADDING: u32 = 17;
+        let x = min_x.saturating_sub(PADDING);
+        let y = min_y.saturating_sub(PADDING);
+        let right = max_x.saturating_add(PADDING).min(aw);
+        let bottom = max_y.saturating_add(PADDING).min(ah);
+        Some([x, y, right - x, bottom - y])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_outline_mask_and_jfa<W>(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        active_px: [u32; 2],
+        rect: [u32; 4],
         layers: &mut [&mut dyn ViewportLayer<W>],
         paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
@@ -697,17 +728,23 @@ impl ViewportHost {
         let Some(engine) = &self.outline else {
             return;
         };
-        let [aw, ah] = active_px;
+        let [aw, ah] = paint_ctx.active_px;
+        let [x, y, w, h] = rect;
         {
+            let (view, resolve_target) = engine.mask_color_views();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki outline mask"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: engine.mask_view(),
+                    view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store: if resolve_target.is_some() {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -716,16 +753,26 @@ impl ViewportHost {
                 multiview_mask: None,
             });
             pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
-            pass.set_scissor_rect(0, 0, aw, ah);
+            pass.set_scissor_rect(x, y, w, h);
             pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
             for layer in layers.iter() {
                 if layer.phases().contains(DrawPhase::OutlineMask) {
-                    layer.paint(DrawPhase::OutlineMask, &mut pass, paint_ctx);
+                    if resolve_target.is_some() {
+                        layer.paint_multisampled_outline_mask(&mut pass, paint_ctx);
+                    } else {
+                        layer.paint(DrawPhase::OutlineMask, &mut pass, paint_ctx);
+                    }
                     stats.layer_draws = stats.layer_draws.saturating_add(1);
                 }
             }
         }
-        engine.run_jump_flood(queue, encoder, active_px, self.config.outline);
+        engine.run_jump_flood(
+            queue,
+            encoder,
+            paint_ctx.active_px,
+            rect,
+            self.config.outline,
+        );
     }
 
     fn render_static_cache<W>(
@@ -782,7 +829,7 @@ impl ViewportHost {
         encoder: &mut wgpu::CommandEncoder,
         aw: u32,
         ah: u32,
-        composite_outline: bool,
+        outline_rect: Option<[u32; 4]>,
         layers: &mut [&mut dyn ViewportLayer<W>],
         paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
@@ -827,8 +874,8 @@ impl ViewportHost {
             pass.draw(0..3, 0..1);
         }
 
-        if composite_outline && let Some(outline) = &self.outline {
-            outline.composite_into_pass(&mut pass, [aw, ah]);
+        if let (Some(rect), Some(outline)) = (outline_rect, &self.outline) {
+            outline.composite_into_pass(&mut pass, rect);
         }
 
         // Now switch viewport to active rect for gizmo and screen-space overlay layers.
@@ -851,13 +898,13 @@ impl ViewportHost {
         encoder: &mut wgpu::CommandEncoder,
         aw: u32,
         ah: u32,
-        composite_outline: bool,
+        outline_rect: Option<[u32; 4]>,
         layers: &mut [&mut dyn ViewportLayer<W>],
         paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.output_color_views();
-        let has_second_pass = composite_outline
+        let has_second_pass = outline_rect.is_some()
             || layers.iter().any(|l| {
                 let m = l.phases();
                 m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
@@ -928,8 +975,8 @@ impl ViewportHost {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if composite_outline && let Some(outline) = &self.outline {
-                outline.composite_into_pass(&mut pass, [aw, ah]);
+            if let (Some(rect), Some(outline)) = (outline_rect, &self.outline) {
+                outline.composite_into_pass(&mut pass, rect);
             }
             pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, aw, ah);

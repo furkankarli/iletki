@@ -232,6 +232,32 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
     /// Return `true` if more streaming uploads remain for subsequent frames.
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool;
 
+    /// Returns whether this layer prepared a 4× MSAA pipeline for its outline mask.
+    ///
+    /// The host uses a single-sample mask when any participating layer uses the default.
+    fn supports_multisampled_outline_mask(&self) -> bool {
+        false
+    }
+
+    /// Records the outline mask with a 4× MSAA `R8Unorm` color attachment and no depth attachment.
+    ///
+    /// Layers that report support must implement this method. The camera bind group is bound.
+    fn paint_multisampled_outline_mask(
+        &self,
+        _pass: &mut wgpu::RenderPass<'_>,
+        _ctx: &PaintCtx<'_, W>,
+    ) {
+    }
+
+    /// Returns a conservative physical pixel rectangle `[x, y, width, height]` for mask geometry.
+    ///
+    /// Return `None` to use the full viewport, or an empty rectangle for an invisible mask.
+    /// The host adds space for the outline and its filter. Mask drawing must stay within this
+    /// rectangle before filtering. Update the layer revision when its outline geometry changes.
+    fn outline_mask_rect(&self, _ctx: &PaintCtx<'_, W>) -> Option<[u32; 4]> {
+        None
+    }
+
     /// Records draw commands for `phase` into `pass`.
     ///
     /// `@group(0)` is already bound to `ctx.camera_bind_group` and the viewport/scissor is already

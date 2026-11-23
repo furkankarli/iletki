@@ -540,3 +540,127 @@ fn coplanar_clip_plane_has_zero_striping_and_srgb_target_has_no_double_gamma() {
         "coplanar face on clip plane y=0.0 had {holes} stipple/discard holes"
     );
 }
+
+#[test]
+fn multisampled_outline_preserves_edge_coverage_at_large_screen_coordinates() {
+    // Omitting the rectangle hint keeps the same mask pipeline and forces full-screen processing.
+    struct FullScreenMask<'a>(&'a mut Scene3DLayer);
+    impl ViewportLayer<()> for FullScreenMask<'_> {
+        fn id(&self) -> u16 {
+            ViewportLayer::<()>::id(self.0)
+        }
+
+        fn phases(&self) -> iletki_core::DrawPhaseMask {
+            ViewportLayer::<()>::phases(self.0)
+        }
+
+        fn revision(&self) -> iletki_wgpu::LayerRevision {
+            ViewportLayer::<()>::revision(self.0)
+        }
+
+        fn prepare(&mut self, ctx: &mut iletki_wgpu::PrepareCtx<'_>) -> bool {
+            self.0.prepare(ctx)
+        }
+
+        fn supports_multisampled_outline_mask(&self) -> bool {
+            ViewportLayer::<()>::supports_multisampled_outline_mask(self.0)
+        }
+
+        fn paint_multisampled_outline_mask(
+            &self,
+            pass: &mut wgpu::RenderPass<'_>,
+            ctx: &iletki_wgpu::PaintCtx<'_>,
+        ) {
+            self.0.paint_multisampled_outline_mask(pass, ctx);
+        }
+
+        fn paint(
+            &self,
+            phase: iletki_core::DrawPhase,
+            pass: &mut wgpu::RenderPass<'_>,
+            ctx: &iletki_wgpu::PaintCtx<'_>,
+        ) {
+            self.0.paint(phase, pass, ctx);
+        }
+    }
+
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    for mode in [ViewportMode::OnDemand, ViewportMode::Continuous] {
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                color_format: wgpu::TextureFormat::Rgba8Unorm,
+                initial_px: [4096, 64],
+                msaa_samples: 4,
+                mode,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+                outline: OutlineConfig {
+                    color: [1.0, 0.0, 0.0, 1.0],
+                    width_px: 3.0,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        *host.camera_mut() = Camera::ortho_3d(
+            Vec3::new(0.0, -8.0, 0.0),
+            Vec3::ZERO,
+            Vec3::Z,
+            8.0,
+            0.05,
+            100.0,
+        );
+        let mut scene = Scene3DLayer::new(1);
+        // With eight pixels per world unit, the right edges both bisect a physical pixel.
+        for x in [-192.0, 192.0] {
+            let mut mesh = Mesh3D::at_origin(Vec3::new(x, 0.0, 0.0));
+            mesh.push_quad(
+                Vec3::new(-4.0, 0.0, -3.0),
+                Vec3::new(0.0625, 0.0, -3.0),
+                Vec3::new(0.0625, 0.0, 3.0),
+                Vec3::new(-4.0, 0.0, 3.0),
+                [0, 255, 0, 255],
+                PickId::NONE,
+            );
+            let chunk = scene.insert(mesh);
+            scene.set_selected(chunk, true);
+        }
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut encoder, &(), &mut [&mut scene]);
+        queue.submit([encoder.finish()]);
+        let image = host.readback_rgba_blocking(&device, &queue).unwrap();
+        let [left, edge, outside, far] = [511, 512, 513, 519].map(|x| image.pixel(x, 32).unwrap());
+        assert!(left[0] < 8 && left[1] > 40, "{left:?}");
+        assert!((95..=160).contains(&edge[0]) && edge[1] > 20, "{edge:?}");
+        assert!(outside[0] > 235 && outside[1] < 8, "{outside:?}");
+        assert!(far[0] < 8, "{far:?}");
+
+        for x in 511..=519 {
+            let [red, _, _, _] = image.pixel(x, 32).unwrap();
+            let [far_red, _, _, _] = image.pixel(x + 3072, 32).unwrap();
+            assert!(
+                red.abs_diff(far_red) <= 2,
+                "{mode:?}, {x}: {red} versus {far_red}"
+            );
+        }
+
+        host.mark_dirty(DirtyFlags::SELECTION);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        host.render_to_texture(
+            &device,
+            &queue,
+            &mut encoder,
+            &(),
+            &mut [&mut FullScreenMask(&mut scene)],
+        );
+        queue.submit([encoder.finish()]);
+        let full_screen = host.readback_rgba_blocking(&device, &queue).unwrap();
+        assert!(
+            image.pixels == full_screen.pixels,
+            "{mode:?}: scissor changed rendered pixels"
+        );
+    }
+}

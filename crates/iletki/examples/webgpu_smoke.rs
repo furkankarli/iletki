@@ -88,7 +88,7 @@ mod web {
         }
         check_section(&adapter, &device, &queue).await?;
         Ok(format!(
-            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section coverage",
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section and outline coverage",
             info.backend, info.name
         ))
     }
@@ -132,7 +132,7 @@ mod web {
             ID,
         );
         let mut scene = Scene3DLayer::new(ID.layer);
-        scene.insert(mesh);
+        let chunk = scene.insert(mesh);
         let pixels =
             render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
         let (Some(&clipped), Some(&cut), Some(&solid)) =
@@ -142,6 +142,17 @@ mod web {
         };
         if clipped != 0 || cut < 8 || cut.saturating_add(8) >= solid {
             return Err(format!("unexpected WebGPU section pixels: {pixels:?}"));
+        }
+        scene.set_selected(chunk, true);
+        let pixels =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2 - 1, 3).await?;
+        let (Some(&outside), Some(&edge), Some(&inside)) =
+            (pixels.first(), pixels.get(4), pixels.get(8))
+        else {
+            return Err("missing WebGPU outline pixels".to_owned());
+        };
+        if outside < 220 || !(95..=160).contains(&edge) || inside > 16 {
+            return Err(format!("unexpected WebGPU outline pixels: {pixels:?}"));
         }
         Ok(())
     }

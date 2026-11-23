@@ -123,7 +123,7 @@ jobs:
           wasm-bindgen --target web --out-name smoke --out-dir target/webgpu-smoke \
             target/wasm32-unknown-unknown/debug/examples/webgpu_smoke.wasm
 
-      - name: Verify render, 4× section coverage and asynchronous 64-bit picking
+      - name: Verify render, 4× section and outline coverage, and asynchronous 64-bit picking
         run: |
           google-chrome --version
           node .github/scripts/webgpu-smoke.mjs
