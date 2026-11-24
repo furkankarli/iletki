@@ -1,10 +1,9 @@
 //! Conservative Reversed-Z min-depth Hi-Z pyramid for two-phase GPU occlusion culling.
 //!
-//! Uses power-of-two mip 0 dimensions (`ceil(active_px / 2).next_power_of_two()`) padded with
-//! `1.0` (neutral identity for `min()` in Reversed-Z `[0.0, 1.0]`). Every mip `m` has exact
-//! hardware dimensions `max(1, w0 >> m) x max(1, h0 >> m)`, so screen pixel `px` always maps
-//! cleanly to texel `px >> (m + 1)` with zero odd-dimension misses and only 3 compute passes
-//! for 1080p.
+//! Uses quarter-resolution power-of-two mip 0 dimensions (`ceil(w/4) x ceil(h/4)`, padded with
+//! `1.0` neutral identity for `min()` in Reversed-Z `[0.0, 1.0]`). Pass 0 uses a coalesced
+//! `16x16` workgroup (one screen pixel per thread, unrolled 4x MSAA loads) reducing three pyramid
+//! levels (`4x4`, `2x2`, `1x1`) in LDS in one pass.
 
 use crate::target::DEPTH_FORMAT;
 use bytemuck::{Pod, Zeroable};
@@ -14,91 +13,115 @@ use wgpu::util::DeviceExt;
 
 static NEXT_HIZ_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-const DEPTH_1X_SUFFIX: &str = r#"
-@group(0) @binding(1)
-var src_depth: texture_depth_2d;
+// Shared 16x16 -> 8x8 -> 4x4 (dst0) -> 2x2 (dst1) -> 1x1 (dst2) LDS reduction for Pass 0.
+const REDUCE_16X16_QUARTER: &str = r#"
+var<workgroup> tile16: array<f32, 256>;
 
-@compute @workgroup_size(8, 8, 1)
-fn hiz_main(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wgid: vec3<u32>,
-) {
-    let src = params.src_and_dst0.xy;
-    if (wgid.x * 16u >= src.x || wgid.y * 16u >= src.y) {
-        if (lid.x == 0u && lid.y == 0u && params.dst3_and_meta.z >= 4u) {
-            let dst3 = params.dst3_and_meta.xy;
-            if (wgid.x < dst3.x && wgid.y < dst3.y) {
-                textureStore(dst3_tex, vec2<i32>(wgid.xy), vec4<f32>(1.0, 0.0, 0.0, 0.0));
-            }
-        }
-        return;
+fn reduce_depth_16x16(lid: vec2<u32>, wgid: vec2<u32>, pixel_d: f32) {
+    tile16[lid.y * 16u + lid.x] = pixel_d;
+    workgroupBarrier();
+
+    if (lid.x < 8u && lid.y < 8u) {
+        let sx = lid.x * 2u;
+        let sy = lid.y * 2u;
+        tile8[lid.y * 8u + lid.x] = min(
+            min(tile16[sy * 16u + sx], tile16[sy * 16u + sx + 1u]),
+            min(tile16[(sy + 1u) * 16u + sx], tile16[(sy + 1u) * 16u + sx + 1u]),
+        );
     }
-    let dst0 = params.src_and_dst0.zw;
-    var d = 1.0;
-    if (gid.x < dst0.x && gid.y < dst0.y) {
-        let px0 = gid.x * 2u;
-        let py0 = gid.y * 2u;
-        if (px0 < src.x && py0 < src.y) {
-            let px1 = min(px0 + 1u, src.x - 1u);
-            let py1 = min(py0 + 1u, src.y - 1u);
-            let d00 = textureLoad(src_depth, vec2<i32>(i32(px0), i32(py0)), 0);
-            let d10 = textureLoad(src_depth, vec2<i32>(i32(px1), i32(py0)), 0);
-            let d01 = textureLoad(src_depth, vec2<i32>(i32(px0), i32(py1)), 0);
-            let d11 = textureLoad(src_depth, vec2<i32>(i32(px1), i32(py1)), 0);
-            d = min(min(d00, d10), min(d01, d11));
+    workgroupBarrier();
+
+    let write_count = params.dst3_and_meta.z;
+    if (lid.x < 4u && lid.y < 4u) {
+        let sx = lid.x * 2u;
+        let sy = lid.y * 2u;
+        let v0 = min(
+            min(tile8[sy * 8u + sx], tile8[sy * 8u + sx + 1u]),
+            min(tile8[(sy + 1u) * 8u + sx], tile8[(sy + 1u) * 8u + sx + 1u]),
+        );
+        let out0 = wgid * 4u + lid;
+        let dst0 = params.src_and_dst0.zw;
+        let in0 = out0.x < dst0.x && out0.y < dst0.y;
+        if (in0) {
+            textureStore(dst0_tex, vec2<i32>(out0), vec4<f32>(v0, 0.0, 0.0, 0.0));
+        }
+        tile4[lid.y * 4u + lid.x] = select(1.0, v0, in0);
+    }
+    workgroupBarrier();
+
+    if (lid.x < 2u && lid.y < 2u) {
+        let sx = lid.x * 2u;
+        let sy = lid.y * 2u;
+        let v1 = min(
+            min(tile4[sy * 4u + sx], tile4[sy * 4u + sx + 1u]),
+            min(tile4[(sy + 1u) * 4u + sx], tile4[(sy + 1u) * 4u + sx + 1u]),
+        );
+        let out1 = wgid * 2u + lid;
+        let dst1 = params.dst1_and_dst2.xy;
+        let in1 = out1.x < dst1.x && out1.y < dst1.y;
+        if (write_count >= 2u && in1) {
+            textureStore(dst1_tex, vec2<i32>(out1), vec4<f32>(v1, 0.0, 0.0, 0.0));
+        }
+        tile2[lid.y * 2u + lid.x] = select(1.0, v1, in1);
+    }
+    workgroupBarrier();
+
+    if (lid.x == 0u && lid.y == 0u && write_count >= 3u) {
+        let v2 = min(min(tile2[0], tile2[1]), min(tile2[2], tile2[3]));
+        let dst2 = params.dst1_and_dst2.zw;
+        if (wgid.x < dst2.x && wgid.y < dst2.y) {
+            textureStore(dst2_tex, vec2<i32>(wgid), vec4<f32>(v2, 0.0, 0.0, 0.0));
         }
     }
-    reduce_and_store(gid.xy, lid.xy, wgid.xy, d);
 }
 "#;
 
-const DEPTH_MS_SUFFIX: &str = r#"
-@group(0) @binding(1)
-var src_depth: texture_depth_multisampled_2d;
-
-fn min_ms_pixel(coord: vec2<i32>, samples: i32) -> f32 {
-    var m = textureLoad(src_depth, coord, 0);
-    for (var s: i32 = 1; s < samples; s = s + 1) {
-        m = min(m, textureLoad(src_depth, coord, s));
-    }
-    return m;
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn hiz_main(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wgid: vec3<u32>,
-) {
+const EARLY_OUT_QUARTER: &str = r#"
     let src = params.src_and_dst0.xy;
     if (wgid.x * 16u >= src.x || wgid.y * 16u >= src.y) {
-        if (lid.x == 0u && lid.y == 0u && params.dst3_and_meta.z >= 4u) {
-            let dst3 = params.dst3_and_meta.xy;
-            if (wgid.x < dst3.x && wgid.y < dst3.y) {
-                textureStore(dst3_tex, vec2<i32>(wgid.xy), vec4<f32>(1.0, 0.0, 0.0, 0.0));
+        if (lid.x == 0u && lid.y == 0u && params.dst3_and_meta.z >= 3u) {
+            let dst2 = params.dst1_and_dst2.zw;
+            if (wgid.x < dst2.x && wgid.y < dst2.y) {
+                textureStore(dst2_tex, vec2<i32>(wgid.xy), vec4<f32>(1.0, 0.0, 0.0, 0.0));
             }
         }
         return;
     }
-    let dst0 = params.src_and_dst0.zw;
+"#;
+
+const DEPTH_1X_BODY: &str = r#"
+    var d = 1.0;
+    if (gid.x < src.x && gid.y < src.y) {
+        d = textureLoad(src_depth, vec2<i32>(gid.xy), 0);
+    }
+    reduce_depth_16x16(lid.xy, wgid.xy, d);
+"#;
+
+const DEPTH_4X_BODY: &str = r#"
+    var d = 1.0;
+    if (gid.x < src.x && gid.y < src.y) {
+        let c = vec2<i32>(gid.xy);
+        let d0 = textureLoad(src_depth, c, 0);
+        let d1 = textureLoad(src_depth, c, 1);
+        let d2 = textureLoad(src_depth, c, 2);
+        let d3 = textureLoad(src_depth, c, 3);
+        d = min(min(d0, d1), min(d2, d3));
+    }
+    reduce_depth_16x16(lid.xy, wgid.xy, d);
+"#;
+
+const DEPTH_MS_BODY: &str = r#"
     let samples = i32(params.dst3_and_meta.w);
     var d = 1.0;
-    if (gid.x < dst0.x && gid.y < dst0.y) {
-        let px0 = gid.x * 2u;
-        let py0 = gid.y * 2u;
-        if (px0 < src.x && py0 < src.y) {
-            let px1 = min(px0 + 1u, src.x - 1u);
-            let py1 = min(py0 + 1u, src.y - 1u);
-            let d00 = min_ms_pixel(vec2<i32>(i32(px0), i32(py0)), samples);
-            let d10 = min_ms_pixel(vec2<i32>(i32(px1), i32(py0)), samples);
-            let d01 = min_ms_pixel(vec2<i32>(i32(px0), i32(py1)), samples);
-            let d11 = min_ms_pixel(vec2<i32>(i32(px1), i32(py1)), samples);
-            d = min(min(d00, d10), min(d01, d11));
+    if (gid.x < src.x && gid.y < src.y) {
+        let c = vec2<i32>(gid.xy);
+        var m = textureLoad(src_depth, c, 0);
+        for (var s: i32 = 1; s < samples; s = s + 1) {
+            m = min(m, textureLoad(src_depth, c, s));
         }
+        d = m;
     }
-    reduce_and_store(gid.xy, lid.xy, wgid.xy, d);
-}
+    reduce_depth_16x16(lid.xy, wgid.xy, d);
 "#;
 
 const DOWNSAMPLE_SUFFIX: &str = r#"
@@ -125,7 +148,7 @@ fn hiz_main(
         let d11 = textureLoad(src_mip, vec2<i32>(i32(sx1), i32(sy1)), 0).r;
         d = min(min(d00, d10), min(d01, d11));
     }
-    reduce_and_store(gid.xy, lid.xy, wgid.xy, d);
+    reduce_and_store_8x8(gid.xy, lid.xy, wgid.xy, d);
 }
 "#;
 
@@ -145,7 +168,9 @@ pub(crate) fn supports_hiz(device: &wgpu::Device, msaa_samples: u32) -> bool {
     }
     let limits = device.limits();
     if limits.max_compute_workgroups_per_dimension < 256
-        || limits.max_compute_invocations_per_workgroup < 64
+        || limits.max_compute_invocations_per_workgroup < 256
+        || limits.max_compute_workgroup_size_x < 16
+        || limits.max_compute_workgroup_size_y < 16
         || limits.max_storage_textures_per_shader_stage < 4
     {
         return false;
@@ -225,8 +250,8 @@ impl HiZPyramid {
         let max_dim = device.limits().max_texture_dimension_2d.max(1);
         let aw = active_px[0].max(1).min(max_dim);
         let ah = active_px[1].max(1).min(max_dim);
-        let w0 = aw.div_ceil(2).max(1).next_power_of_two().min(max_dim);
-        let h0 = ah.div_ceil(2).max(1).next_power_of_two().min(max_dim);
+        let w0 = aw.div_ceil(4).max(1).next_power_of_two().min(max_dim);
+        let h0 = ah.div_ceil(4).max(1).next_power_of_two().min(max_dim);
         let mip_count = w0.max(h0).trailing_zeros().saturating_add(1);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -261,7 +286,7 @@ impl HiZPyramid {
             .collect();
 
         // Three tiny 1x1 dummy storage targets so unused slots in the final pass never alias.
-        let dummy_views: [wgpu::TextureView; 3] = std::array::from_fn(|_| {
+        let [dummy0, dummy1, dummy2]: [wgpu::TextureView; 3] = std::array::from_fn(|_| {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("iletki hiz dummy mip"),
                 size: wgpu::Extent3d {
@@ -292,15 +317,12 @@ impl HiZPyramid {
             wgpu::TextureSampleType::Float { filterable: false },
             false,
         );
+        let depth_suffix = build_depth_suffix(msaa_samples);
         let depth_pipeline = create_pipeline(
             device,
             "iletki hiz depth pipeline",
             &depth_layout,
-            if multisampled {
-                DEPTH_MS_SUFFIX
-            } else {
-                DEPTH_1X_SUFFIX
-            },
+            &depth_suffix,
         );
         let downsample_pipeline = create_pipeline(
             device,
@@ -314,8 +336,9 @@ impl HiZPyramid {
         let mut passes = Vec::new();
         let mut base_mip = 0u32;
         while base_mip < mip_count {
-            let write_count = (mip_count - base_mip).min(4);
             let is_depth = base_mip == 0;
+            let step_mips = if is_depth { 3 } else { 4 };
+            let write_count = (mip_count - base_mip).min(step_mips);
             let src_size = if is_depth {
                 [aw, ah]
             } else {
@@ -357,15 +380,13 @@ impl HiZPyramid {
             let Some(v0) = mip_views.get(base_mip as usize) else {
                 break;
             };
-            let v1 = mip_views
-                .get((base_mip + 1) as usize)
-                .unwrap_or(&dummy_views[0]);
-            let v2 = mip_views
-                .get((base_mip + 2) as usize)
-                .unwrap_or(&dummy_views[1]);
-            let v3 = mip_views
-                .get((base_mip + 3) as usize)
-                .unwrap_or(&dummy_views[2]);
+            let v1 = mip_views.get((base_mip + 1) as usize).unwrap_or(&dummy0);
+            let v2 = mip_views.get((base_mip + 2) as usize).unwrap_or(&dummy1);
+            let v3 = if write_count >= 4 {
+                mip_views.get((base_mip + 3) as usize).unwrap_or(&dummy2)
+            } else {
+                &dummy2
+            };
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("iletki hiz pass bind group"),
                 layout: if is_depth {
@@ -400,12 +421,13 @@ impl HiZPyramid {
                     },
                 ],
             });
+            let tile_per_wg = if is_depth { 4 } else { 8 };
             passes.push(HizDispatch {
                 is_depth,
                 bind_group,
-                workgroups: [dst0[0].div_ceil(8), dst0[1].div_ceil(8)],
+                workgroups: [dst0[0].div_ceil(tile_per_wg), dst0[1].div_ceil(tile_per_wg)],
             });
-            base_mip = base_mip.saturating_add(4);
+            base_mip = base_mip.saturating_add(step_mips);
         }
 
         Self {
@@ -462,6 +484,22 @@ impl HiZPyramid {
             pass.dispatch_workgroups(dispatch.workgroups[0], dispatch.workgroups[1], 1);
         }
     }
+}
+
+fn build_depth_suffix(msaa_samples: u32) -> String {
+    let tex_decl = if msaa_samples > 1 {
+        "@group(0) @binding(1)\nvar src_depth: texture_depth_multisampled_2d;"
+    } else {
+        "@group(0) @binding(1)\nvar src_depth: texture_depth_2d;"
+    };
+    let body = match msaa_samples {
+        0 | 1 => DEPTH_1X_BODY,
+        4 => DEPTH_4X_BODY,
+        _ => DEPTH_MS_BODY,
+    };
+    format!(
+        "{tex_decl}\n{REDUCE_16X16_QUARTER}\n@compute @workgroup_size(16, 16, 1)\nfn hiz_main(\n    @builtin(global_invocation_id) gid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(workgroup_id) wgid: vec3<u32>,\n) {{\n{EARLY_OUT_QUARTER}\n{body}\n}}"
+    )
 }
 
 fn create_layout(

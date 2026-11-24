@@ -19,6 +19,8 @@ struct CullViewUniforms {
     view_proj: mat4x4<f32>,
     frustum: array<vec4<f32>, 6>,
     clip_planes: array<vec4<f32>, 6>,
+    cam_forward: vec4<f32>,
+    depth_cuts: vec4<f32>,
     cam_whole: vec3<i32>,
     frustum_count: u32,
     cam_frac: vec3<u32>,
@@ -26,7 +28,7 @@ struct CullViewUniforms {
     item_count: u32,
     active_w: u32,
     active_h: u32,
-    _pad0: u32,
+    bucket_count: u32,
 };
 
 struct ChunkTransformGpu {

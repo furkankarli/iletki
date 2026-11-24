@@ -1228,4 +1228,106 @@ fn gpu_culling_and_hiz_match_cpu_reference_across_views_sections_and_edits() {
     };
     assert!(!preview_slots.is_empty());
     gpu_front.set_color_frame_selection_rect(None);
+
+    // Exercise quarter-res 16x16 Hi-Z across tiny and odd viewport dimensions (1x1, 3x5, 17x13).
+    for dims in [[1, 1], [3, 5], [17, 13], [64, 37]] {
+        gpu_front.resize(&gpu_device, dims, 1.0);
+        let img = render_img(&gpu_device, &gpu_queue, &mut gpu_front, &mut gpu_scene);
+        assert_eq!((img.width, img.height), (dims[0], dims[1]));
+    }
+}
+
+#[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+#[test]
+fn profiling_splits_phase1_and_phase2_pipeline_statistics() {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..wgpu::RequestAdapterOptions::default()
+    })) else {
+        return;
+    };
+    let required =
+        wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | wgpu::Features::PIPELINE_STATISTICS_QUERY;
+    if !adapter.features().contains(required) {
+        return;
+    }
+    let Ok((device, queue)) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d p2 stats test"),
+        required_features: required,
+        ..wgpu::DeviceDescriptor::default()
+    })) else {
+        return;
+    };
+
+    let mut scene = Scene3DLayer::new(1);
+    for i in 0..1030u32 {
+        let mut m = Mesh3D::at_origin(Vec3::new(
+            f64::from(i % 32) * 1.1,
+            f64::from(i / 32) * 1.1,
+            0.0,
+        ));
+        let alpha = if i == 1029 { 120 } else { 255 };
+        m.push_box(
+            Vec3::new(-0.3, -0.3, 0.0),
+            Vec3::new(0.3 + f64::from(i % 4) * 0.05, 0.3, 1.0),
+            [140, 170, 200, alpha],
+            PickId::new(1, i + 1, 0),
+            false,
+        );
+        scene.insert(m);
+    }
+
+    let mut host = ViewportHost::new_with_adapter(
+        &device,
+        &adapter,
+        ViewportConfig {
+            initial_px: [256, 256],
+            mode: ViewportMode::Continuous,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(18.0, -18.0, 20.0),
+        Vec3::new(16.0, 16.0, 0.5),
+        Vec3::Z,
+        55.0_f64.to_radians(),
+        0.1,
+    );
+
+    // Warm one frame so Hi-Z visibility converges, then capture Phase 1 + Phase 2 stats.
+    for frame in 0..2 {
+        if frame == 1 {
+            iletki_wgpu::profiling::begin(&device);
+        }
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+        if frame == 1 {
+            let cap = iletki_wgpu::profiling::finish(&device, &queue).unwrap();
+            let p1_fs = cap
+                .counters
+                .iter()
+                .find(|(k, _)| *k == "gpu.scene.fs_invocations")
+                .map(|(_, v)| *v);
+            let p2_fs = cap
+                .counters
+                .iter()
+                .find(|(k, _)| *k == "gpu.scene_p2.fs_invocations")
+                .map(|(_, v)| *v);
+            assert!(
+                p1_fs.is_some_and(|v| v > 0),
+                "expected non-zero Phase 1 FS invocations, got {p1_fs:?}"
+            );
+            assert!(
+                p2_fs.is_some(),
+                "expected Phase 2 pipeline statistics counter to be emitted"
+            );
+        }
+    }
 }

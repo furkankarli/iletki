@@ -1,4 +1,4 @@
-// Conservative Reversed-Z min-depth Hi-Z pyramid builder (4 mip levels per compute pass).
+// Conservative Reversed-Z min-depth Hi-Z pyramid builder.
 // Reversed-Z stores 1.0 at the near plane and 0.0 at the far plane; taking the minimum across
 // MSAA samples and 2x2 texels guarantees a conservative farthest depth bound.
 
@@ -30,7 +30,7 @@ var<workgroup> tile8: array<f32, 64>;
 var<workgroup> tile4: array<f32, 16>;
 var<workgroup> tile2: array<f32, 4>;
 
-fn reduce_and_store(gid: vec2<u32>, lid: vec2<u32>, wgid: vec2<u32>, val0: f32) {
+fn reduce_and_store_8x8(gid: vec2<u32>, lid: vec2<u32>, wgid: vec2<u32>, val0: f32) {
     let dst0 = params.src_and_dst0.zw;
     let in0 = gid.x < dst0.x && gid.y < dst0.y;
     if (in0) {

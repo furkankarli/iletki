@@ -191,6 +191,12 @@ pub fn finish(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Capture, Vie
                     "gpu.scene.clipper_out",
                     "gpu.scene.fs_invocations",
                 ),
+                "iletki static scene phase2" | "iletki continuous scene phase2" => (
+                    "gpu.scene_p2.vs_invocations",
+                    "gpu.scene_p2.clipper_in",
+                    "gpu.scene_p2.clipper_out",
+                    "gpu.scene_p2.fs_invocations",
+                ),
                 "iletki pick pass" => (
                     "gpu.pick.vs_invocations",
                     "gpu.pick.clipper_in",
@@ -316,7 +322,11 @@ pub fn pass(label: &'static str) -> Option<Pass> {
         };
         let want_stats = matches!(
             label,
-            "iletki static scene" | "iletki continuous scene" | "iletki pick pass"
+            "iletki static scene"
+                | "iletki continuous scene"
+                | "iletki static scene phase2"
+                | "iletki continuous scene phase2"
+                | "iletki pick pass"
         );
         let (stat_queries, stat_index) = match record.stat_queries.as_ref() {
             Some(q) if want_stats && (record.stat_passes.len() as u32) < MAX_STAT_PASSES => {

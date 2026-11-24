@@ -2539,6 +2539,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             }
                             Some(CullChunkInput {
                                 chunk_index,
+                                origin: chunk.origin,
                                 local_bounds: chunk.local_bounds,
                                 trusted: chunk.section_bounds_trusted,
                                 translucent: chunk.has_translucent,
@@ -2666,6 +2667,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         self.transform_table.anchor(),
                         cull_sections,
                         gpu_scene.item_count,
+                        gpu_scene.world_bounds,
+                        gpu_scene.bucket_count,
                     );
                     if GpuCullView::ensure_and_update(
                         &mut view.gpu_cull,
@@ -2675,6 +2678,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         gpu_scene,
                         &self.transform_table,
                         &uniforms,
+                        cam_pos,
                     )
                     .is_some()
                     {
