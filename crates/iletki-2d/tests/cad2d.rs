@@ -155,6 +155,7 @@ fn national_grid_2d_render_incremental_update_overlay_and_pick() {
             clear_color: [0.0, 0.0, 0.0, 1.0],
             mode: ViewportMode::OnDemand,
             initial_px: [128, 128],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
             ..ViewportConfig::default()
         },
     )

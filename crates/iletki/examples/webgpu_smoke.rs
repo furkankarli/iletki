@@ -13,8 +13,9 @@ mod web {
     use iletki::gpu::wgpu;
     use iletki::{
         Camera, DrawStyle2D, Mesh2D, Mesh3D, PassTargetDesc, PickId, Plane, Scene2DLayer,
-        Scene3DLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer,
+        Scene3DLayer, UploadBudget, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer,
     };
+    use std::collections::{BTreeSet, HashMap};
     use wgpu::web_sys::{
         js_sys::{self, Promise, Reflect, futures::future_to_promise},
         wasm_bindgen::JsValue,
@@ -87,8 +88,9 @@ mod web {
             return Err(format!("unexpected WebGPU pick: {hits:?}"));
         }
         check_section(&adapter, &device, &queue).await?;
+        check_modern_3d_paths(&adapter, &device, &queue).await?;
         Ok(format!(
-            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline and packed geometry",
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline, flat indexing, Q32.32 UTM transforms and Rg16Uint MRT selection preview",
             info.backend, info.name
         ))
     }
@@ -211,6 +213,179 @@ mod web {
         if packed_outline != pixels {
             return Err(format!(
                 "unexpected WebGPU packed outline: {packed_outline:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn check_modern_3d_paths(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        let mut host = ViewportHost::new_with_adapter(
+            device,
+            adapter,
+            ViewportConfig {
+                color_format: FORMAT,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+                initial_px: [SIZE; 2],
+                msaa_samples: 4,
+                upload_budget: UploadBudget::UNLIMITED,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if !host.supports_color_frame_selection(device) {
+            return Err(
+                "WebGPU core must support Rg16Uint 4× MSAA color-frame selection preview"
+                    .to_owned(),
+            );
+        }
+
+        // Large national-grid coordinates exercise Q32.32 storage-buffer transforms; flat-shaded
+        // boxes with face sub-IDs exercise provoking-vertex flat indexing.
+        let origin = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+        let mut scene = Scene3DLayer::new(ID.layer);
+        let mut id_by_object = HashMap::new();
+        let mut hidden_id = None;
+        let mut unpickable_id = None;
+        for i in 0..16u32 {
+            let x = f64::from(i % 4) * 1.4 - 2.1;
+            let y = f64::from(i / 4) * 1.4 - 2.1;
+            let mut mesh = Mesh3D::at_origin(origin + Vec3::new(x, y, 0.0));
+            let obj = i + 1;
+            mesh.push_box_with_edges(
+                Vec3::new(-0.45, -0.45, 0.0),
+                Vec3::new(0.45, 0.45, 1.0),
+                [90, 185, 225, 255],
+                [20, 26, 34, 255],
+                PickId::new(ID.layer, obj, 0),
+                true,
+            );
+            if i == 1 {
+                mesh.pick_ids.clear();
+            }
+            let cid = scene.insert(mesh);
+            id_by_object.insert(obj, cid);
+            if i == 0 {
+                scene.set_visible(cid, false);
+                hidden_id = Some(cid);
+            } else if i == 1 {
+                unpickable_id = Some(cid);
+            }
+        }
+        *host.camera_mut() = Camera::perspective_3d(
+            origin + Vec3::new(5.5, -6.5, 6.2),
+            origin + Vec3::new(0.0, 0.0, 0.4),
+            Vec3::Z,
+            50.0_f64.to_radians(),
+            0.1,
+        );
+
+        let target = PassTargetDesc {
+            format: FORMAT,
+            sample_count: 1,
+            depth_format: None,
+            blend_alpha: false,
+        };
+        let run_preview = |host: &mut ViewportHost,
+                           scene: &mut Scene3DLayer,
+                           rect: [u32; 4]|
+         -> Result<(iletki::PendingSlotPreview, bool), String> {
+            host.set_color_frame_selection_rect(Some(rect));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let stats = host
+                .prepare_for_pass(device, queue, &mut encoder, &(), &mut [scene], target)
+                .map_err(|e| e.to_string())?;
+            queue.submit([encoder.finish()]);
+            let pending = host
+                .take_color_frame_selection_preview(device)
+                .ok_or_else(|| "expected color-frame selection preview on WebGPU".to_owned())?;
+            Ok((pending, stats.static_rebuilt))
+        };
+
+        // First drag populates the 4× MSAA Rg16Uint attachment and runs compute bitset reduction.
+        let rect1 = [8, 8, 48, 48];
+        let (pending1, rebuilt1) = run_preview(&mut host, &mut scene, rect1)?;
+        if !rebuilt1 {
+            return Err("first WebGPU MRT preview must populate the static ID target".to_owned());
+        }
+        let slots1 = pending1.await.map_err(|e| e.to_string())?;
+        if slots1.is_empty() {
+            return Err("expected non-empty WebGPU MRT selection preview".to_owned());
+        }
+        let chunks1: BTreeSet<_> = slots1
+            .into_iter()
+            .filter_map(|slot| scene.chunk_id_at_slot(slot as usize))
+            .map(|cid| format!("{cid:?}"))
+            .collect();
+        if let Some(hidden) = hidden_id
+            && chunks1.contains(&format!("{hidden:?}"))
+        {
+            return Err("hidden chunk appeared in WebGPU MRT preview".to_owned());
+        }
+        if let Some(unpickable) = unpickable_id
+            && chunks1.contains(&format!("{unpickable:?}"))
+        {
+            return Err("unpickable chunk appeared in WebGPU MRT preview".to_owned());
+        }
+
+        // Second drag on static camera reuses the cached MRT attachment without rebuilding static.
+        let rect2 = [16, 16, 32, 32];
+        let (pending2, rebuilt2) = run_preview(&mut host, &mut scene, rect2)?;
+        if rebuilt2 {
+            return Err(
+                "subsequent static WebGPU MRT preview must reuse cached IDs without redraw"
+                    .to_owned(),
+            );
+        }
+        let slots2 = pending2.await.map_err(|e| e.to_string())?;
+        let chunks2: BTreeSet<_> = slots2
+            .into_iter()
+            .filter_map(|slot| scene.chunk_id_at_slot(slot as usize))
+            .map(|cid| format!("{cid:?}"))
+            .collect();
+
+        // Verify shaded color output at large UTM coordinates + exact 64-bit pick parity.
+        host.set_color_frame_selection_rect(None);
+        let center =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if !matches!(center.as_slice(), [r, g, b, 255] if *b > 32 && b >= r && *g > 24) {
+            return Err(format!(
+                "unexpected WebGPU UTM flat-indexed center pixel: {center:?}"
+            ));
+        }
+        let exact_hits = host
+            .pick_rect_async(device, queue, &(), &mut [&mut scene], rect2)
+            .await
+            .map_err(|e| e.to_string())?;
+        if exact_hits.is_empty() {
+            return Err("expected non-empty exact pick at UTM coordinates".to_owned());
+        }
+        if !exact_hits
+            .iter()
+            .any(|hit| hit.id.layer == ID.layer && hit.id.sub > 0)
+        {
+            return Err(format!(
+                "expected non-zero flat face sub-ID in UTM exact pick: {exact_hits:?}"
+            ));
+        }
+        let exact_chunks: BTreeSet<_> = exact_hits
+            .iter()
+            .filter(|hit| hit.id.layer == ID.layer)
+            .filter_map(|hit| id_by_object.get(&hit.id.object))
+            .map(|cid| format!("{cid:?}"))
+            .collect();
+        if !exact_chunks.is_subset(&chunks2) {
+            return Err(format!(
+                "WebGPU 4× MSAA MRT preview missed exact pick chunks: exact={exact_chunks:?}, preview={chunks2:?}"
+            ));
+        }
+        let stats = host.selection_preview_stats();
+        if stats.submitted != 2 || stats.ready != 2 {
+            return Err(format!(
+                "unexpected WebGPU selection preview stats: {stats:?}"
             ));
         }
         Ok(())

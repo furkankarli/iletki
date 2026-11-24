@@ -252,8 +252,8 @@ struct DepthCopyParams {
     _pad: [u32; 2],
 }
 
-/// Copies a sub-rectangle of a `Depth32Float` texture into a compact `R32Float` texture for
-/// WebGPU-compliant partial depth readback during picking.
+/// Copies a sub-rectangle of a `Depth32Float` texture into a compact `R32Uint` texture (bitcast
+/// IEEE-754 depth bits) for WebGPU/GL-compliant partial depth readback during picking.
 pub(crate) struct DepthCopyPipeline {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
@@ -278,9 +278,9 @@ fn vs_depth_copy(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32
 }
 
 @fragment
-fn fs_depth_copy(@builtin(position) pos: vec4<f32>) -> @location(0) f32 {
+fn fs_depth_copy(@builtin(position) pos: vec4<f32>) -> @location(0) u32 {
     let coord = vec2<i32>(params.origin) + vec2<i32>(pos.xy);
-    return textureLoad(src_depth, coord, 0).r;
+    return bitcast<u32>(textureLoad(src_depth, coord, 0).r);
 }
 "#;
 
@@ -345,7 +345,7 @@ impl DepthCopyPipeline {
                 entry_point: Some("fs_depth_copy"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
+                    format: wgpu::TextureFormat::R32Uint,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -387,7 +387,7 @@ impl DepthCopyPipeline {
 
         let make_scratch = || {
             let dst = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("iletki pick depth r32f"),
+                label: Some("iletki pick depth r32u"),
                 size: wgpu::Extent3d {
                     width: width.max(1),
                     height: height.max(1),
@@ -396,7 +396,7 @@ impl DepthCopyPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
+                format: wgpu::TextureFormat::R32Uint,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });

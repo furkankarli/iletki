@@ -575,10 +575,33 @@ fn indexed_flat_and_smooth_geometry_match_unindexed_with_exact_picks() {
             !ref_hits.is_empty(),
             "expected pick hits (section={with_section})"
         );
-        assert_eq!(
-            idx_hits, ref_hits,
-            "indexed pick must be bit-exact (section={with_section})"
-        );
+        if device.adapter_info().backend == iletki_wgpu::wgpu::Backend::Gl {
+            // OpenGL uses `Last` provoking corner, so flat indexing rotates each triangle's
+            // vertex order (a,b,c) -> (b,c,a); software rasterizers (llvmpipe) can differ by
+            // 1 ULP in interpolated depth while returning the exact same PickIds.
+            assert_eq!(
+                idx_hits.len(),
+                ref_hits.len(),
+                "indexed pick count must match (section={with_section})"
+            );
+            for (idx, r) in idx_hits.iter().zip(ref_hits.iter()) {
+                assert_eq!(
+                    idx.id, r.id,
+                    "indexed pick ID must match on GL (section={with_section})"
+                );
+                assert!(
+                    (idx.depth - r.depth).abs() <= 1e-5,
+                    "indexed pick depth diverged on GL: {} vs {} (section={with_section})",
+                    idx.depth,
+                    r.depth
+                );
+            }
+        } else {
+            assert_eq!(
+                idx_hits, ref_hits,
+                "indexed pick must be bit-exact (section={with_section})"
+            );
+        }
         let mut max_delta = 0u8;
         let mut diff_gt1 = 0usize;
         for (a, b) in ref_img
@@ -1330,4 +1353,237 @@ fn profiling_splits_phase1_and_phase2_pipeline_statistics() {
             );
         }
     }
+}
+
+#[test]
+fn operational_resilience_optional_features_block_resizes_and_teardown() {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..wgpu::RequestAdapterOptions::default()
+    })) else {
+        return;
+    };
+    let is_gl = adapter.get_info().backend == wgpu::Backend::Gl;
+
+    let build_scene = || {
+        let mut scene = Scene3DLayer::new(1);
+        let mut ids = Vec::with_capacity(1040);
+        for i in 0..1040u32 {
+            let x = f64::from(i % 32) * 1.15 - 17.8;
+            let y = f64::from(i / 32) * 1.15 - 17.8;
+            let mut m = Mesh3D::at_origin(Vec3::new(x, y, 0.0));
+            m.push_box_with_edges(
+                Vec3::new(-0.35, -0.35, 0.0),
+                Vec3::new(0.35 + f64::from(i % 3) * 0.04, 0.35, 0.9),
+                [105, 165, 220, 255],
+                [24, 30, 38, 220],
+                PickId::new(1, i + 1, 0),
+                false,
+            );
+            ids.push(scene.insert(m));
+        }
+        (scene, ids)
+    };
+    let test_camera = || {
+        let mut cam = Camera::perspective_3d(
+            Vec3::new(22.0, -24.0, 22.0),
+            Vec3::new(0.0, 0.0, 0.45),
+            Vec3::Z,
+            52.0_f64.to_radians(),
+            0.1,
+        );
+        let plane = Plane::from_normal_point(Vec3::X, Vec3::new(-2.0, 0.0, 0.0)).unwrap();
+        cam.set_clip_planes(&[plane]);
+        cam
+    };
+
+    // 1. Optional features explicitly disabled (CLIP_DISTANCES and MULTI_DRAW_INDIRECT_COUNT off).
+    {
+        let Ok((device, queue)) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("iletki-3d resilience minimal features"),
+            required_features: wgpu::Features::empty(),
+            ..wgpu::DeviceDescriptor::default()
+        })) else {
+            return;
+        };
+        let (mut scene, ids) = build_scene();
+        scene.set_selected(ids[528], true);
+        let mut host = ViewportHost::new_with_adapter(
+            &device,
+            &adapter,
+            ViewportConfig {
+                initial_px: [256, 256],
+                msaa_samples: 4,
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        *host.camera_mut() = test_camera();
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+        let img = host.readback_rgba_blocking(&device, &queue).unwrap();
+        assert_eq!([img.width, img.height], [256, 256]);
+        assert!(
+            img.pixels.as_chunks::<4>().0.iter().any(|px| px[2] > 60),
+            "minimal-feature device must render shaded geometry without optional features"
+        );
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [64, 64, 128, 128])
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "minimal-feature device must return exact picks"
+        );
+    }
+
+    // 2. Repeated resize across 256 px block boundaries with active Hi-Z, MRT selection & JFA outline,
+    //    plus multi-viewport teardown and `prune_closed_viewports()` memory recovery.
+    let adapter2 = if is_gl {
+        let inst =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(a) = block_on(inst.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            ..wgpu::RequestAdapterOptions::default()
+        })) else {
+            return;
+        };
+        a
+    } else {
+        adapter
+    };
+    let optional = adapter2.features()
+        & (wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | wgpu::Features::CLIP_DISTANCES);
+    let Ok((device, queue)) = block_on(adapter2.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d resilience full features"),
+        required_features: optional,
+        ..wgpu::DeviceDescriptor::default()
+    })) else {
+        return;
+    };
+
+    let (mut scene, ids) = build_scene();
+    scene.set_selected(ids[528], true);
+    scene.set_selected(ids[529], true);
+
+    let make_host = |px: [u32; 2]| {
+        let mut h = ViewportHost::new_with_adapter(
+            &device,
+            &adapter2,
+            ViewportConfig {
+                initial_px: px,
+                msaa_samples: 4,
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        *h.camera_mut() = test_camera();
+        h
+    };
+
+    let mut host = make_host([128, 128]);
+    let supports_mrt = host.supports_color_frame_selection(&device);
+    let sizes: [[u32; 2]; 9] = [
+        [128, 128],
+        [256, 256],
+        [257, 257],
+        [512, 512],
+        [513, 300],
+        [192, 192],
+        [1, 1],
+        [257, 193],
+        [320, 240],
+    ];
+    let mut prev_gen = host.target_generation();
+    let mut saw_gen_bump = false;
+    for [w, h] in sizes {
+        host.resize(&device, [w, h], 1.0);
+        if supports_mrt && w >= 64 && h >= 64 {
+            let rw = (w / 2).min(128);
+            let rh = (h / 2).min(128);
+            host.set_color_frame_selection_rect(Some([(w - rw) / 2, (h - rh) / 2, rw, rh]));
+        } else {
+            host.set_color_frame_selection_rect(None);
+        }
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+        let cur_gen = host.target_generation();
+        assert!(
+            cur_gen >= prev_gen,
+            "target generation must be monotonic across resizes"
+        );
+        if cur_gen > prev_gen {
+            saw_gen_bump = true;
+            prev_gen = cur_gen;
+        }
+        if supports_mrt && w >= 64 && h >= 64 {
+            let mut pending = host
+                .take_color_frame_selection_preview(&device)
+                .expect("expected MRT preview after resize");
+            let slots = loop {
+                match pending.try_read() {
+                    Poll::Ready(res) => break res.unwrap(),
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            };
+            assert!(
+                !slots.is_empty(),
+                "expected non-empty MRT preview at {w}x{h}"
+            );
+        }
+        let img = host.readback_rgba_blocking(&device, &queue).unwrap();
+        assert_eq!([img.width, img.height], [w, h]);
+    }
+    assert!(
+        saw_gen_bump,
+        "crossing 256 px block boundaries must advance target_generation"
+    );
+
+    // 3. Multi-viewport teardown and `prune_closed_viewports()` memory recovery.
+    host.set_color_frame_selection_rect(None);
+    let mut extra = vec![
+        make_host([160, 160]),
+        make_host([160, 160]),
+        make_host([160, 160]),
+    ];
+    {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        for vp in &mut extra {
+            vp.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        }
+        queue.submit([enc.finish()]);
+    }
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    drop(extra);
+    let pruned = scene.prune_closed_viewports();
+    assert!(
+        pruned >= 3,
+        "expected at least 3 closed viewport bindings pruned, got {pruned}"
+    );
+    assert_eq!(scene.prune_closed_viewports(), 0);
+
+    // Surviving viewport continues rendering and picking cleanly after sibling teardown.
+    let mut enc = device.create_command_encoder(&Default::default());
+    host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+    queue.submit([enc.finish()]);
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [80, 60, 160, 120])
+        .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "surviving viewport must continue picking after sibling teardown"
+    );
 }

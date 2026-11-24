@@ -73,11 +73,14 @@ fn render(
 #[cfg(feature = "profiling")]
 #[test]
 fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
-    let Some(adapter) = adapter() else { return };
+    let Some(probe) = adapter() else { return };
     let dynamic_limit = wgpu::Limits::default().max_dynamic_uniform_buffers_per_pipeline_layout;
-    for (features, limit) in
-        device_features(&adapter).flat_map(|features| [(features, dynamic_limit), (features, 0)])
-    {
+    let combos: Vec<_> = device_features(&probe)
+        .flat_map(|features| [(features, dynamic_limit), (features, 0)])
+        .collect();
+    drop(probe);
+    for (features, limit) in combos {
+        let Some(adapter) = adapter() else { return };
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: features,
             required_limits: wgpu::Limits {
@@ -361,9 +364,9 @@ fn head_on_camera() -> Camera {
 
 #[test]
 fn section_coverage_matches_geometry_in_four_views() {
-    let Some(adapter) = adapter() else { return };
-    let info = adapter.get_info();
-    let caps = adapter.get_downlevel_capabilities();
+    let Some(probe) = adapter() else { return };
+    let info = probe.get_info();
+    let caps = probe.get_downlevel_capabilities();
     let sampled = caps
         .flags
         .contains(wgpu::DownlevelFlags::MULTISAMPLED_SHADING);
@@ -390,7 +393,11 @@ fn section_coverage_matches_geometry_in_four_views() {
         ),
     ];
 
-    for features in device_features(&adapter) {
+    let feature_sets: Vec<_> = device_features(&probe).collect();
+    drop(probe);
+
+    for features in feature_sets {
+        let Some(adapter) = adapter() else { return };
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: features,
             ..Default::default()
@@ -443,18 +450,21 @@ fn section_coverage_matches_geometry_in_four_views() {
 
 #[test]
 fn section_clips_cad_lines_and_instances() {
-    let Some(adapter) = adapter() else { return };
-    if adapter.get_info().backend == wgpu::Backend::Gl {
+    let Some(probe) = adapter() else { return };
+    if probe.get_info().backend == wgpu::Backend::Gl {
         return;
     }
-    let sampled = adapter
+    let sampled = probe
         .get_downlevel_capabilities()
         .flags
         .contains(wgpu::DownlevelFlags::MULTISAMPLED_SHADING);
-    for features in device_features(&adapter) {
+    let feature_sets: Vec<_> = device_features(&probe).collect();
+    drop(probe);
+    for features in feature_sets {
         if !sampled && features.is_empty() {
             continue;
         }
+        let Some(adapter) = adapter() else { return };
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: features,
             ..Default::default()
