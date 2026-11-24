@@ -1,4 +1,4 @@
-//! Immutable vertex pages and per-viewport draw ranges.
+//! Immutable vertex/index pages and per-viewport draw ranges.
 
 use crate::{Vertex3D, scene::ObjectUniforms};
 use iletki_wgpu::wgpu::{self, util::DeviceExt};
@@ -6,12 +6,19 @@ use std::{num::NonZeroU64, ops::Range, sync::Arc};
 
 // The matching WGSL uniform array is 4 KiB, within the WebGPU uniform binding limit.
 pub(crate) const OBJECTS: usize = 256;
-const MAX_VERTICES: usize = 65_536;
+pub(crate) const MAX_VERTICES: usize = 65_536;
 // Bound the extra vertex work in exchange for one fewer draw.
 const MAX_SECTION_GAP_VERTICES: u32 = 256;
 const UNIFORM_BLOCK_BYTES: usize = 1024 * 1024;
 pub(crate) const OBJECT_BYTES: u64 = (OBJECTS * size_of::<ObjectUniforms>()) as u64;
 const POSITION: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageKind {
+    Unindexed,
+    IndexedSmooth,
+    IndexedFlat,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum VertexLayout {
@@ -160,91 +167,235 @@ fn bind_vertices(
 
 pub(crate) struct GeometryPage {
     vertices: VertexBuffers,
+    indices: Option<wgpu::Buffer>,
     slots: wgpu::Buffer,
     picks: Option<wgpu::Buffer>,
-    repeated_vertices: u32,
+    kind: PageKind,
+    repeated_elements: u32,
+    repeated_chunk_ids: Option<wgpu::Buffer>,
+}
+
+impl GeometryPage {
+    pub(crate) fn kind(&self) -> PageKind {
+        self.kind
+    }
+
+    pub(crate) fn indices(&self) -> Option<&wgpu::Buffer> {
+        self.indices.as_ref()
+    }
+
+    pub(crate) fn slots(&self) -> &wgpu::Buffer {
+        &self.slots
+    }
+
+    pub(crate) fn picks(&self) -> Option<&wgpu::Buffer> {
+        self.picks.as_ref()
+    }
+
+    pub(crate) fn repeated_elements(&self) -> u32 {
+        self.repeated_elements
+    }
+
+    pub(crate) fn repeated_chunk_ids(&self) -> Option<&wgpu::Buffer> {
+        self.repeated_chunk_ids.as_ref()
+    }
+
+    pub(crate) fn bind_vertices(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        self.vertices.bind(pass, None)
+    }
+
+    pub(crate) fn bind_position(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.vertices.bind_position(pass, None);
+    }
 }
 
 pub(crate) enum VertexRange {
     // Keep buffer handles out of the chunk table that visibility scans every frame.
     Direct(Box<VertexBuffers>),
+    DirectIndexed {
+        vertices: Box<VertexBuffers>,
+        indices: Box<wgpu::Buffer>,
+        index_format: wgpu::IndexFormat,
+        index_count: u32,
+        flat: bool,
+    },
     Packed {
         page: Arc<GeometryPage>,
-        vertices: Range<u32>,
+        /// Vertex range for unindexed pages; index range for indexed pages.
+        elements: Range<u32>,
         slot: usize,
     },
 }
 
 impl VertexRange {
+    pub(crate) fn is_flat(&self) -> bool {
+        match self {
+            Self::Direct(_) => false,
+            Self::DirectIndexed { flat, .. } => *flat,
+            Self::Packed { page, .. } => page.kind == PageKind::IndexedFlat,
+        }
+    }
+
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_) | Self::DirectIndexed { .. })
+    }
+
     pub(crate) fn repeats(&self) -> bool {
-        matches!(self, Self::Packed { page, .. } if page.repeated_vertices != 0)
+        matches!(self, Self::Packed { page, .. } if page.repeated_elements != 0)
     }
 
     pub(crate) fn packed_subrange(&self, range: Range<u32>) -> Option<Self> {
         let Self::Packed {
             page,
-            vertices,
+            elements,
             slot,
         } = self
         else {
             return None;
         };
-        if range.start >= range.end || range.end > vertices.end - vertices.start {
+        if range.start >= range.end || range.end > elements.end - elements.start {
             return None;
         }
         Some(Self::Packed {
             page: page.clone(),
-            vertices: vertices.start + range.start..vertices.start + range.end,
+            elements: elements.start + range.start..elements.start + range.end,
             slot: *slot,
         })
     }
 
-    pub(crate) fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
-        match self {
-            Self::Direct(buffers) => buffers.bind(pass, None),
-            Self::Packed { page, vertices, .. } => page.vertices.bind(pass, Some(vertices)),
-        };
+    pub(crate) fn draw_direct(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        self.draw_direct_instance(pass, count, 0);
     }
 
-    pub(crate) fn bind_position(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub(crate) fn draw_direct_instance(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        count: u32,
+        instance: u32,
+    ) {
+        let instances = instance..instance.saturating_add(1);
         match self {
-            Self::Direct(buffers) => buffers.bind_position(pass, None),
-            Self::Packed { page, vertices, .. } => {
-                page.vertices.bind_position(pass, Some(vertices))
+            Self::Direct(buffers) => {
+                buffers.bind(pass, None);
+                pass.draw(0..count, instances);
+            }
+            Self::DirectIndexed {
+                vertices,
+                indices,
+                index_format,
+                index_count,
+                ..
+            } => {
+                vertices.bind(pass, None);
+                pass.set_index_buffer(indices.slice(..), *index_format);
+                pass.draw_indexed(0..*index_count, 0, instances);
+            }
+            Self::Packed { page, elements, .. } => {
+                if let Some(indices) = &page.indices {
+                    page.vertices.bind(pass, None);
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(elements.clone(), 0, instances);
+                } else {
+                    page.vertices.bind(pass, Some(elements));
+                    pass.draw(0..count, instances);
+                }
             }
         }
     }
 
-    pub(crate) fn pick_slice(&self) -> Option<wgpu::BufferSlice<'_>> {
-        let Self::Packed { page, vertices, .. } = self else {
-            return None;
-        };
-        let stride = size_of::<[u32; 2]>() as u64;
-        Some(
-            page.picks
-                .as_ref()?
-                .slice((u64::from(vertices.start) * stride)..(u64::from(vertices.end) * stride)),
-        )
+    pub(crate) fn draw_direct_pick(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        direct_picks: Option<&wgpu::Buffer>,
+        count: u32,
+    ) {
+        match self {
+            Self::Direct(buffers) => {
+                let Some(picks) = direct_picks else {
+                    return;
+                };
+                buffers.bind_position(pass, None);
+                pass.set_vertex_buffer(1, picks.slice(..));
+                pass.draw(0..count, 0..1);
+            }
+            Self::DirectIndexed {
+                vertices,
+                indices,
+                index_format,
+                index_count,
+                ..
+            } => {
+                let Some(picks) = direct_picks else {
+                    return;
+                };
+                vertices.bind_position(pass, None);
+                pass.set_vertex_buffer(1, picks.slice(..));
+                pass.set_index_buffer(indices.slice(..), *index_format);
+                pass.draw_indexed(0..*index_count, 0, 0..1);
+            }
+            Self::Packed { page, elements, .. } => {
+                let Some(picks) = &page.picks else {
+                    return;
+                };
+                if let Some(indices) = &page.indices {
+                    page.vertices.bind_position(pass, None);
+                    pass.set_vertex_buffer(1, picks.slice(..));
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(elements.clone(), 0, 0..1);
+                } else {
+                    let stride = size_of::<[u32; 2]>() as u64;
+                    page.vertices.bind_position(pass, Some(elements));
+                    pass.set_vertex_buffer(
+                        1,
+                        picks.slice(
+                            (u64::from(elements.start) * stride)
+                                ..(u64::from(elements.end) * stride),
+                        ),
+                    );
+                    pass.draw(0..count, 0..1);
+                }
+            }
+        }
     }
+}
+
+pub(crate) fn upload_index_buffer_u32(device: &wgpu::Device, indices: &[u32]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("iletki-3d direct indices"),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    })
 }
 
 pub(crate) struct PageBuilder {
     vertices: Vec<Vertex3D>,
+    indices: Vec<u16>,
     slots: Vec<u32>,
     picks: Vec<[u32; 2]>,
-    objects: Vec<(usize, Range<u32>)>,
+    // (chunk_index, element_range, vertex_range)
+    objects: Vec<(usize, Range<u32>, Range<u32>)>,
+    kind: PageKind,
     repeatable: bool,
+    global_slots: bool,
     layout: VertexLayout,
 }
 
 impl PageBuilder {
-    pub(crate) fn new(layout: VertexLayout, repeatable: bool) -> Self {
+    pub(crate) fn new(
+        layout: VertexLayout,
+        kind: PageKind,
+        repeatable: bool,
+        global_slots: bool,
+    ) -> Self {
         Self {
             vertices: Vec::new(),
+            indices: Vec::new(),
             slots: Vec::new(),
             picks: Vec::new(),
             objects: Vec::new(),
+            kind,
             repeatable,
+            global_slots,
             layout,
         }
     }
@@ -261,23 +412,52 @@ impl PageBuilder {
             && vertices.len().is_multiple_of(primitive_vertices)
     }
 
-    fn repeated_vertices(&self) -> u32 {
-        let Some((_, first)) = self.objects.first() else {
+    fn repeated_elements(&self) -> u32 {
+        let Some((_, first_elem, first_vert)) = self.objects.first() else {
             return 0;
         };
-        if !self.repeatable || !(1..=64).contains(&first.end) || self.objects.len() < 8 {
+        if !self.repeatable || !(1..=64).contains(&first_elem.end) || self.objects.len() < 8 {
             return 0;
         }
-        let prototype = self.vertices.get(..first.end as usize).unwrap_or_default();
-        let identical = self.objects.iter().all(|(_, vertices)| {
-            self.vertices
-                .get(vertices.start as usize..vertices.end as usize)
-                .is_some_and(|vertices| {
-                    bytemuck::cast_slice::<_, u8>(vertices)
-                        == bytemuck::cast_slice::<_, u8>(prototype)
+        let prototype = self
+            .vertices
+            .get(..first_vert.end as usize)
+            .unwrap_or_default();
+        let proto_bytes = bytemuck::cast_slice::<_, u8>(prototype);
+        if self.kind == PageKind::Unindexed {
+            let identical = self.objects.iter().all(|(_, _, vertices)| {
+                self.vertices
+                    .get(vertices.start as usize..vertices.end as usize)
+                    .is_some_and(|v| bytemuck::cast_slice::<_, u8>(v) == proto_bytes)
+            });
+            return if identical { first_elem.end } else { 0 };
+        }
+        let proto_idx = self
+            .indices
+            .get(..first_elem.end as usize)
+            .unwrap_or_default();
+        let identical = self.objects.iter().all(|(_, elems, verts)| {
+            let verts_match = self
+                .vertices
+                .get(verts.start as usize..verts.end as usize)
+                .is_some_and(|v| bytemuck::cast_slice::<_, u8>(v) == proto_bytes);
+            if !verts_match {
+                return false;
+            }
+            let Some(base) = u16::try_from(verts.start).ok() else {
+                return false;
+            };
+            self.indices
+                .get(elems.start as usize..elems.end as usize)
+                .is_some_and(|idx| {
+                    idx.len() == proto_idx.len()
+                        && idx
+                            .iter()
+                            .zip(proto_idx)
+                            .all(|(&a, &b)| a.checked_sub(base) == Some(b))
                 })
         });
-        if identical { first.end } else { 0 }
+        if identical { first_elem.end } else { 0 }
     }
 
     pub(crate) fn push(
@@ -288,7 +468,13 @@ impl PageBuilder {
         device: &wgpu::Device,
         uploaded: &mut Vec<(usize, VertexRange)>,
     ) {
-        if self.objects.len() == OBJECTS || self.vertices.len() + vertices.len() > MAX_VERTICES {
+        let max_objects = if self.global_slots {
+            usize::MAX
+        } else {
+            OBJECTS
+        };
+        if self.objects.len() == max_objects || self.vertices.len() + vertices.len() > MAX_VERTICES
+        {
             self.flush(device, uploaded);
         }
         let start = self.vertices.len() as u32;
@@ -300,10 +486,60 @@ impl PageBuilder {
                 .resize(self.vertices.len() + vertices.len(), [0, 0]);
         }
         self.vertices.extend_from_slice(vertices);
-        self.slots
-            .resize(self.vertices.len(), self.objects.len() as u32);
-        self.objects
-            .push((chunk, start..self.vertices.len() as u32));
+        let slot_id = if self.global_slots {
+            chunk as u32
+        } else {
+            self.objects.len() as u32
+        };
+        self.slots.resize(self.vertices.len(), slot_id);
+        let range = start..self.vertices.len() as u32;
+        self.objects.push((chunk, range.clone(), range));
+    }
+
+    pub(crate) fn push_indexed(
+        &mut self,
+        chunk: usize,
+        vertices: &[Vertex3D],
+        indices: &[u32],
+        picks: Option<&[[u32; 2]]>,
+        device: &wgpu::Device,
+        uploaded: &mut Vec<(usize, VertexRange)>,
+    ) {
+        let max_objects = if self.global_slots {
+            usize::MAX
+        } else {
+            OBJECTS
+        };
+        if self.objects.len() == max_objects || self.vertices.len() + vertices.len() > MAX_VERTICES
+        {
+            self.flush(device, uploaded);
+        }
+        let vert_start = self.vertices.len() as u32;
+        let idx_start = self.indices.len() as u32;
+        if let Some(picks) = picks {
+            self.picks.resize(self.vertices.len(), [0, 0]);
+            self.picks.extend_from_slice(picks);
+        } else if !self.picks.is_empty() {
+            self.picks
+                .resize(self.vertices.len() + vertices.len(), [0, 0]);
+        }
+        self.vertices.extend_from_slice(vertices);
+        let slot_id = if self.global_slots {
+            chunk as u32
+        } else {
+            self.objects.len() as u32
+        };
+        self.slots.resize(self.vertices.len(), slot_id);
+        self.indices.reserve(indices.len());
+        for &idx in indices {
+            let page_idx = vert_start.saturating_add(idx).min(u32::from(u16::MAX)) as u16;
+            self.indices.push(page_idx);
+        }
+        self.objects.push((
+            chunk,
+            idx_start..self.indices.len() as u32,
+            vert_start..self.vertices.len() as u32,
+        ));
     }
 
     pub(crate) fn flush(
@@ -314,38 +550,69 @@ impl PageBuilder {
         if self.objects.is_empty() {
             return;
         }
-        let make_buffer = |label, contents| {
+        let make_buffer = |label, contents, usage| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents,
+                usage,
+            })
+        };
+        let repeated_elements = self.repeated_elements();
+        let repeated_chunk_ids = (self.global_slots && repeated_elements != 0).then(|| {
+            let ids: Vec<u32> = self
+                .objects
+                .iter()
+                .map(|(chunk, _, _)| *chunk as u32)
+                .collect();
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iletki-3d repeated chunk IDs"),
+                contents: bytemuck::cast_slice(&ids),
                 usage: wgpu::BufferUsages::VERTEX,
             })
+        });
+        let indices = if self.kind == PageKind::Unindexed {
+            None
+        } else {
+            if !self.indices.len().is_multiple_of(2) {
+                self.indices.push(0);
+            }
+            Some(make_buffer(
+                "iletki-3d geometry indices",
+                bytemuck::cast_slice(&self.indices),
+                wgpu::BufferUsages::INDEX,
+            ))
         };
         let page = Arc::new(GeometryPage {
             vertices: VertexBuffers::upload(device, self.layout, &self.vertices),
+            indices,
             slots: make_buffer(
                 "iletki-3d geometry slots",
                 bytemuck::cast_slice(&self.slots),
+                wgpu::BufferUsages::VERTEX,
             ),
             picks: (!self.picks.is_empty()).then(|| {
                 make_buffer(
                     "iletki-3d geometry pick IDs",
                     bytemuck::cast_slice(&self.picks),
+                    wgpu::BufferUsages::VERTEX,
                 )
             }),
-            repeated_vertices: self.repeated_vertices(),
+            kind: self.kind,
+            repeated_elements,
+            repeated_chunk_ids,
         });
-        for (slot, (chunk, vertices)) in self.objects.drain(..).enumerate() {
+        for (slot, (chunk, elements, _)) in self.objects.drain(..).enumerate() {
             uploaded.push((
                 chunk,
                 VertexRange::Packed {
                     page: page.clone(),
-                    vertices,
+                    elements,
                     slot,
                 },
             ));
         }
         self.vertices.clear();
+        self.indices.clear();
         self.slots.clear();
         self.picks.clear();
     }
@@ -369,6 +636,14 @@ pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             count: None,
         }],
     })
+}
+
+pub(crate) struct PaintPipelines<'a> {
+    pub(crate) smooth: &'a wgpu::RenderPipeline,
+    pub(crate) flat: Option<&'a wgpu::RenderPipeline>,
+    pub(crate) repeated_smooth: Option<&'a wgpu::RenderPipeline>,
+    pub(crate) repeated_flat: Option<&'a wgpu::RenderPipeline>,
+    pub(crate) repeated_slots: Option<&'a wgpu::Buffer>,
 }
 
 struct ViewUniforms {
@@ -398,7 +673,7 @@ enum Draw {
     Packed {
         geometry: Arc<GeometryPage>,
         uniforms: usize,
-        vertices: Range<u32>,
+        elements: Range<u32>,
         instances: u32,
     },
 }
@@ -415,12 +690,12 @@ impl PackedDraws {
         }
     }
 
-    /// Stages fully clipped vertices after an active raster draw. A matching retained range
+    /// Stages fully clipped elements after an active raster draw. A matching retained range
     /// commits the gap, so trailing clipped geometry stays out of the draw.
     fn stage_section_gap(&mut self, geometry: &VertexRange, offset: ObjectUniforms) {
         let VertexRange::Packed {
             page,
-            vertices,
+            elements,
             slot,
         } = geometry
         else {
@@ -429,19 +704,19 @@ impl PackedDraws {
         let Some(Draw::Packed {
             geometry: previous_page,
             uniforms,
-            vertices: previous,
+            elements: previous,
             instances: 0,
         }) = self.commands.last()
         else {
             return;
         };
-        if self.section_gap_end.unwrap_or(previous.end) == vertices.start
-            && vertices.end - previous.end <= MAX_SECTION_GAP_VERTICES
+        if self.section_gap_end.unwrap_or(previous.end) == elements.start
+            && elements.end - previous.end <= MAX_SECTION_GAP_VERTICES
             && Arc::ptr_eq(previous_page, page)
             && let Some(transform) = self.pages.get_mut(*uniforms).and_then(|p| p.get_mut(*slot))
         {
             *transform = offset;
-            self.section_gap_end = Some(vertices.end);
+            self.section_gap_end = Some(elements.end);
         }
     }
 
@@ -482,14 +757,14 @@ impl PackedDraws {
         let gap_end = self.section_gap_end.take();
         let VertexRange::Packed {
             page,
-            vertices,
+            elements,
             slot,
         } = geometry
         else {
             self.commands.push(Draw::Direct(draw_index));
             return;
         };
-        let repeat = repeat && page.repeated_vertices != 0;
+        let repeat = repeat && page.repeated_elements != 0;
         let continuation = !repeat
             || matches!(self.commands.last(), Some(Draw::Packed { instances, .. }) if *instances != 0);
         if !continuation
@@ -532,7 +807,7 @@ impl PackedDraws {
                 self.commands.push(Draw::Packed {
                     geometry: page.clone(),
                     uniforms,
-                    vertices: 0..page.repeated_vertices,
+                    elements: 0..page.repeated_elements,
                     instances: 1,
                 });
             }
@@ -543,28 +818,28 @@ impl PackedDraws {
         {
             *transform = offset;
         }
-        // Each merged vertex has staged uniforms for this viewport. The range ends at
+        // Each merged element has staged uniforms for this viewport. The range ends at
         // retained geometry and preserves the existing draw order.
         if let Some(Draw::Packed {
             uniforms: prev,
-            vertices: range,
+            elements: range,
             instances: 0,
             ..
         }) = self.commands.last_mut()
             && *prev == uniforms
-            && gap_end.unwrap_or(range.end) == vertices.start
+            && gap_end.unwrap_or(range.end) == elements.start
         {
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             if let Some(end) = gap_end {
                 self.section_gap_vertices += (end - range.end) as usize;
             }
-            range.end = vertices.end;
+            range.end = elements.end;
             return;
         }
         self.commands.push(Draw::Packed {
             geometry: page.clone(),
             uniforms,
-            vertices: vertices.clone(),
+            elements: elements.clone(),
             instances: 0,
         });
     }
@@ -667,12 +942,11 @@ impl PackedDraws {
     pub(crate) fn paint(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
-        pipeline: &wgpu::RenderPipeline,
+        pipelines: &PaintPipelines<'_>,
         picking: bool,
-        repeated: Option<(&wgpu::RenderPipeline, &wgpu::Buffer)>,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
-        let mut bound = None;
+        let mut bound: Option<(usize, bool)> = None;
         for command in &self.commands {
             match command {
                 Draw::Direct(index) => {
@@ -682,21 +956,35 @@ impl PackedDraws {
                 Draw::Packed {
                     geometry,
                     uniforms,
-                    vertices,
+                    elements,
                     instances,
                 } => {
-                    if bound != Some(*uniforms) {
+                    let is_repeated = *instances != 0;
+                    if bound != Some((*uniforms, is_repeated)) {
                         let pages_per_buffer = self.pages_per_buffer.max(1);
                         let Some(block) = self.buffers.get(*uniforms / pages_per_buffer) else {
                             continue;
                         };
-                        let slots = if *instances != 0 {
-                            let Some((pipeline, slots)) = repeated else {
+                        let is_flat = geometry.kind == PageKind::IndexedFlat;
+                        let slots = if is_repeated {
+                            let pipeline = if is_flat {
+                                pipelines.repeated_flat.or(pipelines.repeated_smooth)
+                            } else {
+                                pipelines.repeated_smooth
+                            };
+                            let (Some(pipeline), Some(slots)) =
+                                (pipeline, pipelines.repeated_slots)
+                            else {
                                 continue;
                             };
                             pass.set_pipeline(pipeline);
                             slots
                         } else {
+                            let pipeline = if is_flat {
+                                pipelines.flat.unwrap_or(pipelines.smooth)
+                            } else {
+                                pipelines.smooth
+                            };
                             pass.set_pipeline(pipeline);
                             &geometry.slots
                         };
@@ -720,9 +1008,16 @@ impl PackedDraws {
                             };
                             pass.set_vertex_buffer(slot_binding + 1, picks.slice(..));
                         }
-                        bound = Some(*uniforms);
+                        if let Some(indices) = &geometry.indices {
+                            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                        }
+                        bound = Some((*uniforms, is_repeated));
                     }
-                    pass.draw(vertices.clone(), 0..(*instances).max(1));
+                    if geometry.indices.is_some() {
+                        pass.draw_indexed(elements.clone(), 0, 0..(*instances).max(1));
+                    } else {
+                        pass.draw(elements.clone(), 0..(*instances).max(1));
+                    }
                 }
             }
         }

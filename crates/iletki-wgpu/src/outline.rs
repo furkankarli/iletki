@@ -445,7 +445,7 @@ impl OutlineEngine {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

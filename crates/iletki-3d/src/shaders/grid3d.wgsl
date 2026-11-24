@@ -29,6 +29,12 @@ struct FsOut {
     @builtin(frag_depth) depth: f32,
 };
 
+struct FsSelectOut {
+    @location(0) color: vec4<f32>,
+    @location(1) slot_id: vec2<u32>,
+    @builtin(frag_depth) depth: f32,
+};
+
 @vertex
 fn vs_grid(@builtin(vertex_index) idx: u32) -> VsOut {
     let x = f32((idx & 1u) * 4u) - 1.0;
@@ -52,8 +58,7 @@ fn grid_alpha(coord: vec2<f32>, spacing: f32) -> f32 {
     return 1.0 - min(line, 1.0);
 }
 
-@fragment
-fn fs_grid(in: VsOut) -> FsOut {
+fn eval_grid(in: VsOut) -> FsOut {
     // Reversed-Z: z = 1.0 is near, z = 0.5 is mid-depth.
     let near_p = unproject_rel(in.ndc.x, in.ndc.y, 1.0);
     let mid_p = unproject_rel(in.ndc.x, in.ndc.y, 0.5);
@@ -134,4 +139,15 @@ fn fs_grid(in: VsOut) -> FsOut {
     out.color = vec4<f32>(iletki_color_to_target(col.rgb), final_a);
     out.depth = depth;
     return out;
+}
+
+@fragment
+fn fs_grid(in: VsOut) -> FsOut {
+    return eval_grid(in);
+}
+
+@fragment
+fn fs_grid_select(in: VsOut) -> FsSelectOut {
+    let base = eval_grid(in);
+    return FsSelectOut(base.color, vec2<u32>(0u, 0u), base.depth);
 }

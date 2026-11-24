@@ -470,3 +470,762 @@ fn shared_scene_releases_bindings_for_closed_viewports() {
     drop(active);
     assert_eq!(scene.prune_closed_viewports(), 1);
 }
+
+#[cfg(feature = "profiling")]
+#[test]
+fn indexed_flat_and_smooth_geometry_match_unindexed_with_exact_picks() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let build_scene = |indexed: bool| {
+        let mut scene = Scene3DLayer::new(1);
+        scene.set_profile_indexed_geometry(indexed);
+        let origin = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+
+        // 1. Flat-eligible packed boxes with edges, transparency, depth ties and sub-face IDs.
+        for i in 0..144u32 {
+            let offset = Vec3::new(
+                f64::from(i % 12) * 2.2 - 12.1,
+                f64::from(i / 12) * 2.2 - 12.1,
+                0.0,
+            );
+            let mut mesh = Mesh3D::at_origin(origin + offset);
+            let alpha = if i % 17 == 0 { 180 } else { 255 };
+            mesh.push_box_with_edges(
+                Vec3::new(-0.7, -0.7, -0.5),
+                Vec3::new(0.7, 0.7, 0.5),
+                [
+                    (80 + (i * 23) % 150) as u8,
+                    (90 + (i * 41) % 140) as u8,
+                    (110 + (i * 59) % 130) as u8,
+                    alpha,
+                ],
+                [20, 24, 30, 220],
+                PickId::new(1, i + 1, 0),
+                i % 3 == 0,
+            );
+            scene.insert(mesh);
+        }
+
+        // 2. Smooth-shaded cylinder (ineligible for flat provoking; uses exact-record indexing).
+        let mut smooth = Mesh3D::at_origin(origin + Vec3::new(0.0, 0.0, 1.5));
+        let segs = 24usize;
+        let pick = PickId::new(1, 900, 0).to_rg32u();
+        for sg in 0..segs {
+            let a0 = std::f32::consts::TAU * (sg as f32) / (segs as f32);
+            let a1 = std::f32::consts::TAU * ((sg + 1) as f32) / (segs as f32);
+            let n0 = [a0.cos(), a0.sin(), 0.0];
+            let n1 = [a1.cos(), a1.sin(), 0.0];
+            let r = 3.0f32;
+            let color = [220, 140, 80, 255];
+            let v00 = iletki_3d::Vertex3D::new([n0[0] * r, n0[1] * r, -1.0], n0, color);
+            let v10 = iletki_3d::Vertex3D::new([n1[0] * r, n1[1] * r, -1.0], n1, color);
+            let v11 = iletki_3d::Vertex3D::new([n1[0] * r, n1[1] * r, 1.0], n1, color);
+            let v01 = iletki_3d::Vertex3D::new([n0[0] * r, n0[1] * r, 1.0], n0, color);
+            smooth
+                .vertices
+                .extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+            smooth.pick_ids.resize(smooth.vertices.len(), pick);
+        }
+        smooth.local_bounds =
+            Bounds3::from_corners(Vec3::new(-3.0, -3.0, -1.0), Vec3::new(3.0, 3.0, 1.0));
+        scene.insert(smooth);
+        (scene, origin)
+    };
+
+    let render_and_pick = |indexed: bool, with_section: bool| {
+        let (mut scene, origin) = build_scene(indexed);
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                initial_px: [256, 256],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        let mut cam = Camera::perspective_3d(
+            origin + Vec3::new(22.0, -24.0, 20.0),
+            origin,
+            Vec3::Z,
+            50.0_f64.to_radians(),
+            0.1,
+        );
+        if with_section {
+            let plane =
+                Plane::from_normal_point(Vec3::X, origin + Vec3::new(0.3, 0.0, 0.0)).unwrap();
+            cam.set_clip_planes(&[plane]);
+        }
+        *host.camera_mut() = cam;
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+        let image = host.readback_rgba_blocking(&device, &queue).unwrap();
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [0, 0, 256, 256])
+            .unwrap();
+        (image, hits)
+    };
+
+    for with_section in [false, true] {
+        let (ref_img, ref_hits) = render_and_pick(false, with_section);
+        let (idx_img, idx_hits) = render_and_pick(true, with_section);
+        assert!(
+            !ref_hits.is_empty(),
+            "expected pick hits (section={with_section})"
+        );
+        assert_eq!(
+            idx_hits, ref_hits,
+            "indexed pick must be bit-exact (section={with_section})"
+        );
+        let mut max_delta = 0u8;
+        let mut diff_gt1 = 0usize;
+        for (a, b) in ref_img
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(idx_img.pixels.as_chunks::<4>().0.iter())
+        {
+            let d = a[0]
+                .abs_diff(b[0])
+                .max(a[1].abs_diff(b[1]))
+                .max(a[2].abs_diff(b[2]))
+                .max(a[3].abs_diff(b[3]));
+            max_delta = max_delta.max(d);
+            if d > 1 {
+                diff_gt1 += 1;
+            }
+        }
+        assert!(
+            max_delta <= 2 && diff_gt1 * 10000 <= (256 * 256),
+            "render parity exceeded tolerance (section={with_section}): max_delta={max_delta}, diff_gt1={diff_gt1}"
+        );
+    }
+}
+
+#[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+#[test]
+fn storage_transforms_match_uniform_fallback_and_handle_edits() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let run = |use_storage: bool| {
+        let mut scene = Scene3DLayer::new(1);
+        scene.set_profile_storage_transforms(use_storage);
+        // Large national-grid coordinates that require split f64 hi/lo precision.
+        let origin = Vec3::new(1_000_000_033.125, -500_000_017.25, 250.5);
+        let mut ids = Vec::new();
+        for i in 0..320u32 {
+            let x = f64::from(i % 20) * 1.4 - 13.3;
+            let y = f64::from(i / 20) * 1.4 - 10.5;
+            let mut mesh = Mesh3D::at_origin(origin + Vec3::new(x, y, 0.0));
+            mesh.push_box_with_edges(
+                Vec3::new(-0.45, -0.45, 0.0),
+                Vec3::new(0.45, 0.45, 1.0),
+                [130, 175, 210, 255],
+                [24, 30, 36, 220],
+                PickId::new(1, i + 1, 0),
+                false,
+            );
+            ids.push(scene.insert(mesh));
+        }
+
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                initial_px: [256, 256],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+
+        let render_frame = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+            queue.submit([enc.finish()]);
+        };
+
+        // Frame 1: initial full-scene wide view (builds retained draw list).
+        *host.camera_mut() = Camera::perspective_3d(
+            origin + Vec3::new(26.0, -28.0, 24.0),
+            origin,
+            Vec3::Z,
+            50.0_f64.to_radians(),
+            0.1,
+        );
+        render_frame(&mut host, &mut scene);
+
+        // Frame 2: camera move (exercises retained O(1) hit) + edits: move, hide, select, remove + reuse.
+        scene.set_origin(ids[10], origin + Vec3::new(0.0, 0.0, 3.0));
+        scene.set_visible(ids[25], false);
+        scene.set_selected(ids[10], true);
+        scene.set_selected(ids[150], true);
+        scene.remove(ids[0]);
+        let mut replacement = Mesh3D::at_origin(origin + Vec3::new(1.0, 1.0, 4.5));
+        replacement.push_box_with_edges(
+            Vec3::new(-0.8, -0.8, 0.0),
+            Vec3::new(0.8, 0.8, 1.4),
+            [235, 90, 60, 255],
+            [20, 20, 20, 255],
+            PickId::new(1, 9999, 0),
+            false,
+        );
+        let _reused = scene.insert(replacement);
+
+        *host.camera_mut() = Camera::perspective_3d(
+            origin + Vec3::new(20.0, -24.0, 22.0),
+            origin + Vec3::new(0.0, 0.0, 1.0),
+            Vec3::Z,
+            50.0_f64.to_radians(),
+            0.1,
+        );
+        render_frame(&mut host, &mut scene);
+        let img = host.readback_rgba_blocking(&device, &queue).unwrap();
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [0, 0, 256, 256])
+            .unwrap();
+        (img, hits)
+    };
+
+    let (ref_img, ref_hits) = run(false);
+    let (sto_img, sto_hits) = run(true);
+
+    assert!(!ref_hits.is_empty());
+    assert!(
+        sto_hits.iter().any(|h| h.id == PickId::new(1, 9999, 0)),
+        "reused slot replacement chunk must be pickable"
+    );
+    assert!(
+        !sto_hits.iter().any(|h| h.id == PickId::new(1, 26, 0)),
+        "hidden chunk must not be pickable"
+    );
+    assert!(
+        !sto_hits.iter().any(|h| h.id == PickId::new(1, 1, 0)),
+        "removed chunk must not be pickable after slot reuse"
+    );
+    assert_eq!(
+        sto_hits, ref_hits,
+        "storage picking must match uniform fallback bit-for-bit"
+    );
+
+    let mut max_delta = 0u8;
+    let mut diff_gt1 = 0usize;
+    for (a, b) in ref_img
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(sto_img.pixels.as_chunks::<4>().0.iter())
+    {
+        let d = a[0]
+            .abs_diff(b[0])
+            .max(a[1].abs_diff(b[1]))
+            .max(a[2].abs_diff(b[2]))
+            .max(a[3].abs_diff(b[3]));
+        max_delta = max_delta.max(d);
+        if d > 1 {
+            diff_gt1 += 1;
+        }
+    }
+    assert!(
+        max_delta <= 2 && diff_gt1 * 10000 <= (256 * 256),
+        "storage vs uniform render parity failed: max_delta={max_delta}, diff_gt1={diff_gt1}"
+    );
+}
+
+#[test]
+fn color_frame_selection_preview_matches_exact_marquee_pick() {
+    use std::collections::{BTreeSet, HashMap};
+    use std::task::Poll;
+
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            initial_px: [256, 256],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    if device.adapter_info().backend == iletki_wgpu::wgpu::Backend::Gl {
+        assert!(!host.supports_color_frame_selection(&device));
+        return;
+    }
+    assert!(
+        host.supports_color_frame_selection(&device),
+        "Vulkan/DX12/Metal must support Rg16Uint 4x MSAA color-frame selection"
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut grid = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
+    let origin = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+    let mut id_by_object = HashMap::new();
+    let mut chunk_ids = Vec::new();
+    for i in 0..160u32 {
+        let x = f64::from(i % 16) * 1.5 - 11.25;
+        let y = f64::from(i / 16) * 1.5 - 6.75;
+        let mut mesh = Mesh3D::at_origin(origin + Vec3::new(x, y, 0.0));
+        let obj = i + 1;
+        mesh.push_box_with_edges(
+            Vec3::new(-0.4, -0.4, 0.0),
+            Vec3::new(0.4, 0.4, 1.0),
+            [110, 165, 210, 255],
+            [20, 26, 34, 220],
+            PickId::new(1, obj, 0),
+            false,
+        );
+        // Leave one chunk unpickable to verify pickable mask parity.
+        if i == 5 {
+            mesh.pick_ids.clear();
+        }
+        let cid = scene.insert(mesh);
+        id_by_object.insert(obj, cid);
+        chunk_ids.push(cid);
+    }
+    scene.set_visible(chunk_ids[12], false);
+
+    let mut cam = Camera::perspective_3d(
+        origin + Vec3::new(16.0, -20.0, 18.0),
+        origin,
+        Vec3::Z,
+        50.0_f64.to_radians(),
+        0.1,
+    );
+    let plane = Plane::from_normal_point(Vec3::X, origin + Vec3::new(-1.0, 0.0, 0.0)).unwrap();
+    cam.set_clip_planes(&[plane]);
+    *host.camera_mut() = cam;
+
+    let read_preview = |host: &mut ViewportHost,
+                        scene: &mut Scene3DLayer,
+                        grid: &mut InfiniteGrid3DLayer,
+                        rect: [u32; 4]| {
+        host.set_color_frame_selection_rect(Some(rect));
+        let mut enc = device.create_command_encoder(&Default::default());
+        let out = host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene, grid]);
+        let static_rebuilt = out.stats.static_rebuilt;
+        queue.submit([enc.finish()]);
+        let mut pending = host
+            .take_color_frame_selection_preview(&device)
+            .expect("expected color-frame selection preview");
+        assert_eq!(pending.snapshot().rect_px, rect);
+        assert_eq!(pending.snapshot().viewport_id, host.viewport_id());
+        let slots = loop {
+            match pending.try_read() {
+                Poll::Ready(res) => break res.unwrap(),
+                Poll::Pending => std::thread::yield_now(),
+            }
+        };
+        let chunks: BTreeSet<_> = slots
+            .into_iter()
+            .filter_map(|s| scene.chunk_id_at_slot(s as usize))
+            .map(|cid| format!("{cid:?}"))
+            .collect();
+        (chunks, static_rebuilt)
+    };
+
+    let rect1 = [64, 64, 128, 128];
+    let (preview1, rebuilt1) = read_preview(&mut host, &mut scene, &mut grid, rect1);
+    assert!(rebuilt1, "first preview frame must populate MRT ID target");
+    assert!(!preview1.is_empty(), "expected non-empty marquee preview");
+
+    // Second drag rect on static camera must reuse the cached MRT ID target without rebuilding static scene.
+    let rect2 = [80, 72, 96, 96];
+    let (preview2, rebuilt2) = read_preview(&mut host, &mut scene, &mut grid, rect2);
+    assert!(
+        !rebuilt2,
+        "subsequent static marquee drag must reuse cached MRT IDs without redrawing geometry"
+    );
+
+    // Clear preview and run exact release pick to verify superset / parity and lifecycle counters.
+    host.set_color_frame_selection_rect(None);
+    let exact_hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene, &mut grid], rect2)
+        .unwrap();
+    let exact_chunks: BTreeSet<_> = exact_hits
+        .iter()
+        .filter(|h| h.id.layer == 1)
+        .filter_map(|h| id_by_object.get(&h.id.object))
+        .map(|cid| format!("{cid:?}"))
+        .collect();
+    assert!(!exact_chunks.is_empty());
+    assert!(
+        exact_chunks.is_subset(&preview2),
+        "4x MSAA preview must cover all exact 1x release picks: missing {:?}",
+        exact_chunks.difference(&preview2).collect::<Vec<_>>()
+    );
+    assert!(
+        !preview2.contains(&format!("{:?}", chunk_ids[5])),
+        "unpickable chunk must not appear in color-frame preview"
+    );
+    assert!(
+        !preview2.contains(&format!("{:?}", chunk_ids[12])),
+        "hidden chunk must not appear in color-frame preview"
+    );
+    let stats = host.selection_preview_stats();
+    assert_eq!(stats.submitted, 2);
+    assert_eq!(stats.ready, 2);
+}
+
+#[test]
+fn gpu_culling_and_hiz_match_cpu_reference_across_views_sections_and_edits() {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..wgpu::RequestAdapterOptions::default()
+    })) else {
+        return;
+    };
+    if !adapter
+        .features()
+        .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
+    {
+        return;
+    }
+    let clip_feat = adapter.features() & wgpu::Features::CLIP_DISTANCES;
+    let Ok((gpu_device, gpu_queue)) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d gpu cull test"),
+        required_features: wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | clip_feat,
+        ..wgpu::DeviceDescriptor::default()
+    })) else {
+        return;
+    };
+    let Ok((ref_device, ref_queue)) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d cpu cull reference"),
+        required_features: clip_feat,
+        ..wgpu::DeviceDescriptor::default()
+    })) else {
+        return;
+    };
+
+    let origin = Vec3::new(100_000.0, 200_000.0, 10.0);
+    let build_scene = || {
+        let mut scene = Scene3DLayer::new(1);
+        let mut ids = Vec::new();
+        // Large opaque occluder wall at y = 0 hiding the 80 distinct boxes behind it from -Y.
+        let mut wall = Mesh3D::at_origin(origin);
+        wall.push_box_with_edges(
+            Vec3::new(-12.0, -0.3, -1.0),
+            Vec3::new(12.0, 0.3, 8.0),
+            [160, 150, 140, 255],
+            [25, 25, 30, 255],
+            PickId::new(1, 1, 0),
+            false,
+        );
+        ids.push(scene.insert(wall));
+
+        // 1040 distinct-sized non-repeated opaque boxes behind the wall (y > 2.0) to cross the
+        // production GPU culling activation threshold (`MIN_GPU_CULL_ITEMS = 1024`).
+        for i in 0..1040u32 {
+            let col = i % 26;
+            let row = (i / 26) % 20;
+            let tier = i / (26 * 20);
+            let x = f64::from(col) * 0.72 - 9.0;
+            let y = 2.5 + f64::from(row) * 0.75;
+            let z = f64::from(tier) * 2.2;
+            let h = 0.8 + f64::from(i % 7) * 0.14;
+            let mut m = Mesh3D::at_origin(origin + Vec3::new(x, y, z));
+            m.push_box_with_edges(
+                Vec3::new(-0.24, -0.24, 0.0),
+                Vec3::new(0.24 + f64::from(i % 5) * 0.02, 0.24, h),
+                [
+                    (80 + (i * 17) % 160) as u8,
+                    (90 + (i * 29) % 150) as u8,
+                    (110 + (i * 43) % 130) as u8,
+                    255,
+                ],
+                [20, 24, 30, 240],
+                PickId::new(1, i + 10, 0),
+                false,
+            );
+            ids.push(scene.insert(m));
+        }
+
+        // Translucent glass pane on the +X side in front of an opaque target box behind it.
+        let mut glass = Mesh3D::at_origin(origin + Vec3::new(16.0, 0.0, 0.0));
+        glass.push_box(
+            Vec3::new(-2.0, -0.1, 0.0),
+            Vec3::new(2.0, 0.1, 4.0),
+            [120, 200, 240, 110],
+            PickId::new(1, 500, 0),
+            false,
+        );
+        ids.push(scene.insert(glass));
+
+        let mut behind_glass = Mesh3D::at_origin(origin + Vec3::new(16.0, 3.0, 0.0));
+        behind_glass.push_box(
+            Vec3::new(-1.0, -1.0, 0.5),
+            Vec3::new(1.0, 1.0, 3.5),
+            [230, 60, 40, 255],
+            PickId::new(1, 501, 0),
+            false,
+        );
+        ids.push(scene.insert(behind_glass));
+
+        (scene, ids)
+    };
+
+    let make_host = |device: &wgpu::Device| {
+        ViewportHost::new_with_adapter(
+            device,
+            &adapter,
+            ViewportConfig {
+                initial_px: [257, 193], // Odd dimensions to exercise power-of-two Hi-Z padding
+                mode: ViewportMode::Continuous,
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let (mut gpu_scene, gpu_ids) = build_scene();
+    let (mut ref_scene, ref_ids) = build_scene();
+    let mut gpu_front = make_host(&gpu_device);
+    let mut gpu_back = make_host(&gpu_device);
+    let mut ref_front = make_host(&ref_device);
+    let mut ref_back = make_host(&ref_device);
+
+    // Camera 1: directly in front of the opaque wall (80 boxes behind wall are occluded).
+    let cam_front = Camera::perspective_3d(
+        origin + Vec3::new(0.0, -6.5, 3.0),
+        origin + Vec3::new(0.0, 4.0, 2.0),
+        Vec3::Z,
+        55.0_f64.to_radians(),
+        0.1,
+    );
+    // Camera 2: looking from behind (+Y) so all 80 boxes are visible (independent viewport!).
+    let cam_back = Camera::perspective_3d(
+        origin + Vec3::new(2.0, 24.0, 12.0),
+        origin + Vec3::new(0.0, 6.0, 1.5),
+        Vec3::Z,
+        55.0_f64.to_radians(),
+        0.1,
+    );
+    // Camera 3: stepped around the wall so previously-occluded boxes suddenly become visible!
+    let cam_reveal = Camera::perspective_3d(
+        origin + Vec3::new(-18.0, -2.0, 7.0),
+        origin + Vec3::new(0.0, 6.0, 1.5),
+        Vec3::Z,
+        55.0_f64.to_radians(),
+        0.1,
+    );
+    // Camera 4: looking directly through the translucent glass pane at the red box behind it.
+    let cam_glass = Camera::perspective_3d(
+        origin + Vec3::new(16.0, -5.0, 2.0),
+        origin + Vec3::new(16.0, 3.0, 2.0),
+        Vec3::Z,
+        45.0_f64.to_radians(),
+        0.1,
+    );
+    // Camera 5: front view with a section clip plane slicing through the wall to expose boxes!
+    let mut cam_section = cam_front.clone();
+    cam_section.set_clip_planes(&[Plane::from_normal_point(
+        Vec3::X,
+        origin + Vec3::new(0.0, 0.0, 0.0),
+    )
+    .unwrap()]);
+
+    let assert_images_match =
+        |label: &str, a: &iletki_wgpu::RgbaImage, b: &iletki_wgpu::RgbaImage| {
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            let mut max_delta = 0u8;
+            let mut diff_gt2 = 0usize;
+            for (pa, pb) in a
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.pixels.as_chunks::<4>().0)
+            {
+                let d = pa
+                    .iter()
+                    .zip(pb)
+                    .map(|(&x, &y)| x.abs_diff(y))
+                    .max()
+                    .unwrap_or(0);
+                max_delta = max_delta.max(d);
+                if d > 2 {
+                    diff_gt2 += 1;
+                }
+            }
+            assert!(
+                diff_gt2 == 0 && max_delta <= 2,
+                "{label}: GPU cull vs CPU ref mismatch: max_delta={max_delta}, diff_gt2={diff_gt2}"
+            );
+        };
+
+    let render_img = |device: &wgpu::Device,
+                      queue: &wgpu::Queue,
+                      host: &mut ViewportHost,
+                      scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(device, queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(device, queue).unwrap()
+    };
+
+    // Frame 0 & Frame 1: dual-viewport shared scene in a single CommandEncoder (converges Hi-Z).
+    *gpu_front.camera_mut() = cam_front.clone();
+    *gpu_back.camera_mut() = cam_back.clone();
+    *ref_front.camera_mut() = cam_front.clone();
+    *ref_back.camera_mut() = cam_back.clone();
+    for step in 0..2 {
+        let mut g_enc = gpu_device.create_command_encoder(&Default::default());
+        gpu_front.render_to_texture(
+            &gpu_device,
+            &gpu_queue,
+            &mut g_enc,
+            &(),
+            &mut [&mut gpu_scene],
+        );
+        gpu_back.render_to_texture(
+            &gpu_device,
+            &gpu_queue,
+            &mut g_enc,
+            &(),
+            &mut [&mut gpu_scene],
+        );
+        gpu_queue.submit([g_enc.finish()]);
+
+        let mut r_enc = ref_device.create_command_encoder(&Default::default());
+        ref_front.render_to_texture(
+            &ref_device,
+            &ref_queue,
+            &mut r_enc,
+            &(),
+            &mut [&mut ref_scene],
+        );
+        ref_back.render_to_texture(
+            &ref_device,
+            &ref_queue,
+            &mut r_enc,
+            &(),
+            &mut [&mut ref_scene],
+        );
+        ref_queue.submit([r_enc.finish()]);
+
+        if step == 1 {
+            assert!(<Scene3DLayer as ViewportLayer<()>>::uses_gpu_culling(
+                &gpu_scene,
+                gpu_front.viewport_id()
+            ));
+            assert!(<Scene3DLayer as ViewportLayer<()>>::uses_gpu_culling(
+                &gpu_scene,
+                gpu_back.viewport_id()
+            ));
+            assert!(!<Scene3DLayer as ViewportLayer<()>>::uses_gpu_culling(
+                &ref_scene,
+                ref_front.viewport_id()
+            ));
+            let g_img = gpu_front
+                .readback_rgba_blocking(&gpu_device, &gpu_queue)
+                .unwrap();
+            let r_img = ref_front
+                .readback_rgba_blocking(&ref_device, &ref_queue)
+                .unwrap();
+            assert_images_match("front-occluded", &g_img, &r_img);
+
+            let gb_img = gpu_back
+                .readback_rgba_blocking(&gpu_device, &gpu_queue)
+                .unwrap();
+            let rb_img = ref_back
+                .readback_rgba_blocking(&ref_device, &ref_queue)
+                .unwrap();
+            assert_images_match("back-visible", &gb_img, &rb_img);
+        }
+    }
+
+    // Immediate reveal frame after boxes were evicted from Phase 1: ZERO pop-in allowed!
+    *gpu_front.camera_mut() = cam_reveal.clone();
+    *ref_front.camera_mut() = cam_reveal.clone();
+    let g_rev = render_img(&gpu_device, &gpu_queue, &mut gpu_front, &mut gpu_scene);
+    let r_rev = render_img(&ref_device, &ref_queue, &mut ref_front, &mut ref_scene);
+    assert_images_match("reveal-zero-popin", &g_rev, &r_rev);
+
+    // Live edits: move, hide, remove + section clip plane!
+    gpu_scene.set_origin(gpu_ids[5], origin + Vec3::new(-4.0, 2.0, 3.0));
+    ref_scene.set_origin(ref_ids[5], origin + Vec3::new(-4.0, 2.0, 3.0));
+    gpu_scene.set_visible(gpu_ids[10], false);
+    ref_scene.set_visible(ref_ids[10], false);
+    gpu_scene.remove(gpu_ids[15]);
+    ref_scene.remove(ref_ids[15]);
+
+    *gpu_front.camera_mut() = cam_section.clone();
+    *ref_front.camera_mut() = cam_section.clone();
+    let g_sec = render_img(&gpu_device, &gpu_queue, &mut gpu_front, &mut gpu_scene);
+    let r_sec = render_img(&ref_device, &ref_queue, &mut ref_front, &mut ref_scene);
+    assert_images_match("section-and-edits", &g_sec, &r_sec);
+
+    // Bit-exact GPU picking parity under section clip + edits!
+    let g_pick = gpu_front
+        .pick_rect_blocking(
+            &gpu_device,
+            &gpu_queue,
+            &(),
+            &mut [&mut gpu_scene],
+            [32, 32, 160, 128],
+        )
+        .unwrap();
+    let r_pick = ref_front
+        .pick_rect_blocking(
+            &ref_device,
+            &ref_queue,
+            &(),
+            &mut [&mut ref_scene],
+            [32, 32, 160, 128],
+        )
+        .unwrap();
+    assert_eq!(
+        g_pick, r_pick,
+        "picking must be 100% bit-exact with GPU culling"
+    );
+
+    // Translucent glass test (run 2 frames so Hi-Z converges): red box behind glass must be visible!
+    *gpu_front.camera_mut() = cam_glass.clone();
+    *ref_front.camera_mut() = cam_glass;
+    for _ in 0..2 {
+        let g_glass = render_img(&gpu_device, &gpu_queue, &mut gpu_front, &mut gpu_scene);
+        let center = g_glass
+            .pixel(g_glass.width / 2, g_glass.height / 2)
+            .unwrap();
+        assert!(
+            center[0] > 90,
+            "red box behind translucent glass was falsely occluded by Hi-Z: center={center:?}"
+        );
+    }
+
+    // Compose Milestone 3 MRT selection preview with Milestone 4 two-phase GPU culling!
+    *gpu_front.camera_mut() = cam_reveal;
+    gpu_front.set_color_frame_selection_rect(Some([40, 40, 160, 120]));
+    let mut enc = gpu_device.create_command_encoder(&Default::default());
+    gpu_front.render_to_texture(
+        &gpu_device,
+        &gpu_queue,
+        &mut enc,
+        &(),
+        &mut [&mut gpu_scene],
+    );
+    gpu_queue.submit([enc.finish()]);
+    let mut pending = gpu_front
+        .take_color_frame_selection_preview(&gpu_device)
+        .expect("MRT selection preview must compose with two-phase GPU culling");
+    let preview_slots = loop {
+        match pending.try_read() {
+            std::task::Poll::Ready(res) => break res.unwrap(),
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    };
+    assert!(!preview_slots.is_empty());
+    gpu_front.set_color_frame_selection_rect(None);
+}

@@ -16,11 +16,13 @@
 
 mod blit;
 pub mod error;
+mod hiz;
 pub mod host;
 pub mod layer;
 mod outline;
 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
 pub mod profiling;
+mod selection_preview;
 pub mod target;
 mod trace;
 pub mod uniforms;
@@ -28,9 +30,10 @@ pub mod uniforms;
 pub use error::ViewportError;
 pub use host::{FrameOutput, FrameStats, PassTargetDesc, PendingPick, RgbaImage, ViewportHost};
 pub use layer::{
-    LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer, ViewportLifetime,
+    GpuCullCtx, LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer, ViewportLifetime,
 };
 pub use outline::OUTLINE_MASK_FORMAT;
-pub use target::{DEPTH_FORMAT, PICK_ID_FORMAT, ViewportConfig};
+pub use selection_preview::{PendingSlotPreview, SelectionPreviewSnapshot, SelectionPreviewStats};
+pub use target::{DEPTH_FORMAT, PICK_ID_FORMAT, SELECTION_ID_FORMAT, ViewportConfig};
 pub use uniforms::{CAMERA_WGSL, CameraUniformsGpu};
 pub use wgpu;

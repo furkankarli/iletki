@@ -13,12 +13,15 @@
 
 mod face_batch;
 pub mod gizmo;
+mod gpu_cull;
 pub mod grid;
 pub mod instanced;
 mod objects;
 mod outline_bounds;
+mod provoking;
 pub mod scene;
 mod section;
+mod storage_batch;
 pub mod vertex;
 
 pub use gizmo::{GizmoAxis, TransformGizmoLayer};

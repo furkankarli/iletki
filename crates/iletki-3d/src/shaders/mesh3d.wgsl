@@ -138,6 +138,11 @@ fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) v
 }
 
 @fragment
+fn fs_lit_unclipped(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    return shade_mesh(in.pos_rel, in.normal, in.color, is_front);
+}
+
+@fragment
 fn fs_edge(in: ColorOut) -> @location(0) vec4<f32> {
     if (iletki_is_clipped(in.pos_rel)) {
         discard;

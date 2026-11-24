@@ -5,7 +5,8 @@ use iletki_core::{DrawPhase, DrawPhaseMask, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PaintCtx, PrepareCtx, ViewportLayer, ViewportLifetime,
+    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PaintCtx, PrepareCtx, SELECTION_ID_FORMAT,
+    ViewportLayer, ViewportLifetime,
 };
 
 /// Ground plane orientation for [`InfiniteGrid3DLayer`].
@@ -80,8 +81,11 @@ struct GridGpu {
     format: wgpu::TextureFormat,
     msaa: u32,
     layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
     per_viewport: Vec<GridViewportBinding>,
     pipeline: wgpu::RenderPipeline,
+    select_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 /// Analytic infinite anti-aliased 3D ground grid layer rendered in [`DrawPhase::Transparent`].
@@ -121,85 +125,135 @@ impl InfiniteGrid3DLayer {
     }
 
     fn ensure_gpu<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        if self
+        let rebuild = !self
             .gpu
             .as_ref()
-            .is_some_and(|g| g.format == ctx.color_format && g.msaa == ctx.msaa_samples)
-        {
-            return;
-        }
-        let wgsl = format!("{CAMERA_WGSL}\n{}", include_str!("shaders/grid3d.wgsl"));
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("iletki-3d grid shader"),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-            });
-        let layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("iletki-3d grid layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+            .is_some_and(|g| g.format == ctx.color_format && g.msaa == ctx.msaa_samples);
+        if rebuild {
+            let wgsl = format!("{CAMERA_WGSL}\n{}", include_str!("shaders/grid3d.wgsl"));
+            let shader = ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("iletki-3d grid shader"),
+                    source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                });
+            let layout = ctx
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("iletki-3d grid layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("iletki-3d grid pipeline layout"),
+                        bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let pipeline = ctx
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d grid pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_grid"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
                     },
-                    count: None,
-                }],
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_grid"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..wgpu::MultisampleState::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                });
+            self.gpu = Some(GridGpu {
+                format: ctx.color_format,
+                msaa: ctx.msaa_samples,
+                layout,
+                pipeline_layout,
+                shader,
+                per_viewport: Vec::new(),
+                pipeline,
+                select_pipeline: None,
             });
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("iletki-3d grid pipeline layout"),
-                bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&layout)],
-                immediate_size: 0,
-            });
-        let pipeline = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("iletki-3d grid pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_grid"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
+        }
+        if ctx.selection_id_attachment()
+            && let Some(gpu) = &mut self.gpu
+            && gpu.select_pipeline.is_none()
+        {
+            gpu.select_pipeline = Some(ctx.device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("iletki-3d grid select pipeline"),
+                    layout: Some(&gpu.pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &gpu.shader,
+                        entry_point: Some("vs_grid"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &gpu.shader,
+                        entry_point: Some("fs_grid_select"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[
+                            Some(wgpu::ColorTargetState {
+                                format: ctx.color_format,
+                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: SELECTION_ID_FORMAT,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::empty(),
+                            }),
+                        ],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..wgpu::MultisampleState::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
                 },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_grid"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: ctx.color_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: ctx.msaa_samples,
-                    ..wgpu::MultisampleState::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            });
-        self.gpu = Some(GridGpu {
-            format: ctx.color_format,
-            msaa: ctx.msaa_samples,
-            layout,
-            per_viewport: Vec::new(),
-            pipeline,
-        });
+            ));
+        }
     }
 }
 
@@ -283,6 +337,10 @@ impl<W> ViewportLayer<W> for InfiniteGrid3DLayer {
         false
     }
 
+    fn supports_color_frame_selection(&self) -> bool {
+        true
+    }
+
     fn paint(&self, phase: DrawPhase, pass: &mut wgpu::RenderPass<'_>, ctx: &PaintCtx<'_, W>) {
         if !self.visible || phase != DrawPhase::Transparent {
             return;
@@ -293,7 +351,15 @@ impl<W> ViewportLayer<W> for InfiniteGrid3DLayer {
         let Some(binding) = gpu.per_viewport.iter().find(|b| b.id == ctx.viewport_id) else {
             return;
         };
-        pass.set_pipeline(&gpu.pipeline);
+        let pipeline = if ctx.selection_id_attachment() {
+            let Some(select_pipeline) = &gpu.select_pipeline else {
+                return;
+            };
+            select_pipeline
+        } else {
+            &gpu.pipeline
+        };
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(1, &binding.bg, &[]);
         pass.draw(0..3, 0..1);
     }

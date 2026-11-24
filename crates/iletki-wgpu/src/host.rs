@@ -3,11 +3,16 @@
 
 use crate::blit::{BlitResources, DepthCopyPipeline};
 use crate::error::ViewportError;
-use crate::layer::{LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer};
+use crate::hiz::{HiZPyramid, supports_hiz};
+use crate::layer::{GpuCullCtx, LayerRevision, PaintCtx, PrepareCtx, UploadTracker, ViewportLayer};
 use crate::outline::OutlineEngine;
+use crate::selection_preview::{
+    PendingSlotPreview, SelectionPreviewReducer, SelectionPreviewSnapshot, SelectionPreviewStats,
+    SlotStagingCache, StagedSlotPreview, supports_compute_preview,
+};
 use crate::target::{
-    DEPTH_FORMAT, PickTargets, TargetSet, ViewportConfig, color_attachment_features,
-    validate_depth_attachment, validate_samples,
+    DEPTH_FORMAT, PickTargets, SelectionPreviewTargets, TargetSet, ViewportConfig,
+    color_attachment_features, validate_depth_attachment, validate_samples,
 };
 use crate::uniforms::CameraGpu;
 use iletki_core::{
@@ -136,10 +141,19 @@ pub struct ViewportHost {
     camera_gpu: CameraGpu,
     blit: BlitResources,
     targets: TargetSet,
+    target_generation: u64,
     outline: Option<OutlineEngine>,
     pick_targets: Option<PickTargets>,
     depth_copy: Option<DepthCopyPipeline>,
     pick_readback: PickBufferCache,
+    selection_preview_rect: Option<[u32; 4]>,
+    selection_targets: Option<SelectionPreviewTargets>,
+    selection_reducer: Option<SelectionPreviewReducer>,
+    selection_staging: SlotStagingCache,
+    selection_id_valid: bool,
+    staged_selection_preview: Option<StagedSlotPreview>,
+    selection_preview_stats: Arc<Mutex<SelectionPreviewStats>>,
+    hiz_pyramid: Option<HiZPyramid>,
     active_output: ActiveOutput,
     static_valid: bool,
     pending_reallocated: bool,
@@ -228,10 +242,19 @@ impl ViewportHost {
             camera_gpu,
             blit,
             targets,
+            target_generation: 1,
             outline: None,
             pick_targets: None,
             depth_copy: None,
             pick_readback: Arc::default(),
+            selection_preview_rect: None,
+            selection_targets: None,
+            selection_reducer: None,
+            selection_staging: Arc::default(),
+            selection_id_valid: false,
+            staged_selection_preview: None,
+            selection_preview_stats: Arc::default(),
+            hiz_pyramid: None,
             active_output: ActiveOutput::StaticCache,
             static_valid: false,
             pending_reallocated: false,
@@ -285,6 +308,82 @@ impl ViewportHost {
             self.config.mode = mode;
             self.dirty.insert(DirtyFlags::ALL);
             self.static_valid = false;
+            self.selection_id_valid = false;
+        }
+    }
+
+    /// Returns whether `device` and this viewport's target configuration support MRT color-frame
+    /// selection previews with compute bitset reduction.
+    #[must_use]
+    pub fn supports_color_frame_selection(&self, device: &wgpu::Device) -> bool {
+        supports_compute_preview(device, self.targets.format(), self.targets.msaa_samples())
+    }
+
+    /// Returns the monotonic generation counter of this viewport's backing render targets.
+    #[must_use]
+    pub const fn target_generation(&self) -> u64 {
+        self.target_generation
+    }
+
+    /// Enables or disables color-frame selection preview capture for the next frame.
+    ///
+    /// Pass `Some([x, y, width, height])` in physical pixels during an active marquee drag so the
+    /// normal color pass writes compact slot IDs to a second attachment and reduces the rectangle
+    /// via compute in the same command encoder. Pass `None` when the gesture ends to release the
+    /// auxiliary target immediately.
+    pub fn set_color_frame_selection_rect(&mut self, rect_px: Option<[u32; 4]>) {
+        self.selection_preview_rect = rect_px;
+        if rect_px.is_none() {
+            self.selection_targets = None;
+            self.selection_id_valid = false;
+            if self.staged_selection_preview.take().is_some()
+                && let Ok(mut stats) = self.selection_preview_stats.lock()
+            {
+                stats.superseded = stats.superseded.saturating_add(1);
+            }
+        }
+    }
+
+    /// Takes the staged color-frame selection preview produced by the most recent
+    /// [`Self::render_to_texture`] or [`Self::prepare_for_pass`] call and starts mapping its
+    /// compact bitset staging buffer.
+    ///
+    /// Call immediately **after** submitting the frame's `CommandEncoder` to `queue`.
+    pub fn take_color_frame_selection_preview(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Option<PendingSlotPreview> {
+        let staged = self.staged_selection_preview.take()?;
+        Some(PendingSlotPreview::from_staged(device, staged))
+    }
+
+    /// Returns cumulative lifecycle counters for color-frame selection previews on this viewport.
+    #[must_use]
+    pub fn selection_preview_stats(&self) -> SelectionPreviewStats {
+        self.selection_preview_stats
+            .lock()
+            .map(|stats| *stats)
+            .unwrap_or_default()
+    }
+
+    /// Records that a completed color-frame selection preview was applied and displayed.
+    pub fn record_selection_preview_displayed(&self) {
+        if let Ok(mut stats) = self.selection_preview_stats.lock() {
+            stats.displayed = stats.displayed.saturating_add(1);
+        }
+    }
+
+    /// Records that a color-frame selection preview was discarded as stale before display.
+    pub fn record_selection_preview_stale(&self) {
+        if let Ok(mut stats) = self.selection_preview_stats.lock() {
+            stats.stale = stats.stale.saturating_add(1);
+        }
+    }
+
+    /// Records that a color-frame selection preview was superseded by a newer request.
+    pub fn record_selection_preview_superseded(&self) {
+        if let Ok(mut stats) = self.selection_preview_stats.lock() {
+            stats.superseded = stats.superseded.saturating_add(1);
         }
     }
 
@@ -355,7 +454,9 @@ impl ViewportHost {
             self.dpi_scale = dpi;
             self.dirty.insert(DirtyFlags::SIZE);
             if reallocated {
+                self.target_generation = self.target_generation.wrapping_add(1);
                 self.static_valid = false;
+                self.selection_id_valid = false;
                 self.pending_reallocated = true;
             }
         }
@@ -499,7 +600,26 @@ impl ViewportHost {
         }
         self.camera_gpu.write(queue, cam_data);
 
-        let (pending, untracked_pending) = self.prepare_layers(device, queue, world, layers, None);
+        // Determine whether this frame can run MRT color-frame selection + compute bitset reduction.
+        let clipped_preview_rect = self.selection_preview_rect.and_then(|[rx, ry, rw, rh]| {
+            let x0 = rx.min(aw);
+            let y0 = ry.min(ah);
+            let x1 = rx.saturating_add(rw).min(aw);
+            let y1 = ry.saturating_add(rh).min(ah);
+            let w = x1.saturating_sub(x0);
+            let h = y1.saturating_sub(y0);
+            (w > 0 && h > 0).then_some([x0, y0, w, h])
+        });
+        let static_phases = DrawPhaseMask::OPAQUE.union(DrawPhaseMask::TRANSPARENT);
+        let layers_support_preview = clipped_preview_rect.is_some()
+            && self.supports_color_frame_selection(device)
+            && layers.iter().all(|l| {
+                l.phases().intersection(static_phases) == DrawPhaseMask::NONE
+                    || l.supports_color_frame_selection()
+            });
+
+        let (pending, untracked_pending) =
+            self.prepare_layers(device, queue, world, layers, None, layers_support_preview);
         stats.streaming_pending = pending;
         let was_streaming = std::mem::replace(&mut self.streaming_pending, untracked_pending);
         if self.config.mode == ViewportMode::OnDemand {
@@ -509,7 +629,54 @@ impl ViewportHost {
             }
         }
 
+        let preview_slot_count = if layers_support_preview {
+            layers
+                .iter()
+                .map(|l| l.selection_slot_count())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let preview_rect = clipped_preview_rect.filter(|_| preview_slot_count > 0);
+        if preview_rect.is_none()
+            && self.staged_selection_preview.take().is_some()
+            && let Ok(mut stats) = self.selection_preview_stats.lock()
+        {
+            stats.superseded = stats.superseded.saturating_add(1);
+        }
+
+        let use_gpu_cull = self.targets.depth_sampleable()
+            && supports_hiz(device, self.targets.msaa_samples())
+            && layers.iter().any(|l| l.uses_gpu_culling(self.id));
+        let want_hiz = use_gpu_cull
+            && (self.config.mode == ViewportMode::Continuous
+                || !self.static_valid
+                || (preview_rect.is_some() && !self.selection_id_valid)
+                || self.dirty.needs_static_rebuild());
+        if want_hiz {
+            HiZPyramid::ensure(
+                &mut self.hiz_pyramid,
+                device,
+                self.targets.depth_view(),
+                size.active_px,
+                self.targets.msaa_samples(),
+                self.target_generation,
+            );
+        }
+
         let paint_ctx = PaintCtx {
+            selection_id_attachment: false,
+            viewport_id: self.id,
+            camera: &self.camera,
+            camera_bind_group: self.camera_gpu.bind_group(),
+            world,
+            active_px: size.active_px,
+            logical_size: logical,
+            dpi_scale: self.dpi_scale,
+        };
+        let mrt_paint_ctx = PaintCtx {
+            selection_id_attachment: true,
             viewport_id: self.id,
             camera: &self.camera,
             camera_bind_group: self.camera_gpu.bind_group(),
@@ -550,27 +717,99 @@ impl ViewportHost {
                         queue, encoder, rect, layers, &paint_ctx, &mut stats,
                     );
                 }
+                let use_mrt = preview_rect.is_some();
+                if use_mrt {
+                    SelectionPreviewTargets::ensure(
+                        &mut self.selection_targets,
+                        device,
+                        size.allocated_px,
+                        self.targets.msaa_samples(),
+                    );
+                }
+                let sel_view = use_mrt
+                    .then(|| {
+                        self.selection_targets
+                            .as_ref()
+                            .map(SelectionPreviewTargets::id_view)
+                    })
+                    .flatten();
+                let scene_ctx = if sel_view.is_some() {
+                    &mrt_paint_ctx
+                } else {
+                    &paint_ctx
+                };
                 self.render_continuous(
+                    device,
+                    queue,
                     encoder,
                     aw,
                     ah,
                     outline_rect,
+                    sel_view,
+                    use_gpu_cull,
                     layers,
+                    scene_ctx,
                     &paint_ctx,
                     &mut stats,
                 );
+                if let Some(rect) = preview_rect {
+                    self.encode_selection_preview_reduction(
+                        device,
+                        queue,
+                        encoder,
+                        rect,
+                        preview_slot_count,
+                        layers,
+                    );
+                }
                 self.active_output = ActiveOutput::DynamicOutput;
                 self.static_valid = false;
+                self.selection_id_valid = false;
                 self.dirty = DirtyFlags::NONE;
             }
             ViewportMode::OnDemand => {
-                let need_static = !self.static_valid || self.dirty.needs_static_rebuild();
+                let use_mrt = preview_rect.is_some();
+                let need_static = !self.static_valid
+                    || (use_mrt && !self.selection_id_valid)
+                    || self.dirty.needs_static_rebuild();
                 let need_dynamic =
                     has_dynamic_layers && (need_static || self.dirty.needs_dynamic_pass());
 
                 if need_static {
-                    self.render_static_cache(encoder, aw, ah, layers, &paint_ctx, &mut stats);
+                    if use_mrt {
+                        SelectionPreviewTargets::ensure(
+                            &mut self.selection_targets,
+                            device,
+                            size.allocated_px,
+                            self.targets.msaa_samples(),
+                        );
+                    }
+                    let sel_view = use_mrt
+                        .then(|| {
+                            self.selection_targets
+                                .as_ref()
+                                .map(SelectionPreviewTargets::id_view)
+                        })
+                        .flatten();
+                    let scene_ctx = if sel_view.is_some() {
+                        &mrt_paint_ctx
+                    } else {
+                        &paint_ctx
+                    };
+                    self.render_static_cache(
+                        device,
+                        queue,
+                        encoder,
+                        aw,
+                        ah,
+                        sel_view,
+                        use_gpu_cull,
+                        layers,
+                        scene_ctx,
+                        &mut stats,
+                    );
                     self.static_valid = true;
+                    self.selection_id_valid = sel_view.is_some();
                     stats.static_rebuilt = true;
                 }
 
@@ -594,11 +833,81 @@ impl ViewportHost {
                 } else if !has_dynamic_layers {
                     self.active_output = ActiveOutput::StaticCache;
                 }
+                if let Some(rect) = preview_rect
+                    && self.selection_id_valid
+                {
+                    self.encode_selection_preview_reduction(
+                        device,
+                        queue,
+                        encoder,
+                        rect,
+                        preview_slot_count,
+                        layers,
+                    );
+                }
                 self.dirty = DirtyFlags::NONE;
             }
         }
 
         stats
+    }
+
+    fn encode_selection_preview_reduction<W>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        rect: [u32; 4],
+        slot_count: u32,
+        layers: &[&mut dyn ViewportLayer<W>],
+    ) {
+        let Some(targets) = &self.selection_targets else {
+            return;
+        };
+        let reducer = SelectionPreviewReducer::ensure(
+            &mut self.selection_reducer,
+            device,
+            self.targets.msaa_samples(),
+        );
+        let Some((staging, word_count)) = reducer.encode(
+            device,
+            queue,
+            encoder,
+            targets.id_view(),
+            rect,
+            slot_count,
+            &self.selection_staging,
+        ) else {
+            return;
+        };
+        let scene_revisions = layers
+            .iter()
+            .map(|layer| (layer.id(), layer.revision().static_only()))
+            .collect();
+        let snapshot = SelectionPreviewSnapshot {
+            viewport_id: self.id,
+            target_generation: self.target_generation,
+            camera: self.camera.clone(),
+            rect_px: rect,
+            scene_revisions,
+        };
+        let superseded = self
+            .staged_selection_preview
+            .replace(StagedSlotPreview {
+                staging,
+                word_count,
+                slot_count,
+                cache: Arc::clone(&self.selection_staging),
+                snapshot,
+                stats_ready: Arc::clone(&self.selection_preview_stats),
+            })
+            .is_some();
+        if let Ok(mut stats) = self.selection_preview_stats.lock() {
+            stats.submitted = stats.submitted.saturating_add(1);
+            if superseded {
+                stats.superseded = stats.superseded.saturating_add(1);
+            }
+        }
     }
 
     fn prepare_layers<W>(
@@ -608,6 +917,7 @@ impl ViewportHost {
         world: &W,
         layers: &mut [&mut dyn ViewportLayer<W>],
         picking_rect: Option<[u32; 4]>,
+        selection_id_attachment: bool,
     ) -> (bool, bool) {
         let _profile = crate::trace::scope("layers.prepare");
         let size = self.targets.size();
@@ -615,6 +925,10 @@ impl ViewportHost {
         let mut prep_ctx = PrepareCtx {
             viewport_lifetime: &self.lifetime,
             section_antialiasing: self.section_antialiasing,
+            selection_id_attachment,
+            gpu_culling: picking_rect.is_none()
+                && self.targets.depth_sampleable()
+                && supports_hiz(device, self.targets.msaa_samples()),
             picking_rect,
             viewport_id: self.id,
             device,
@@ -755,7 +1069,7 @@ impl ViewportHost {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -783,28 +1097,252 @@ impl ViewportHost {
         );
     }
 
-    fn render_static_cache<W>(
+    #[allow(clippy::too_many_arguments)]
+    fn render_two_phase_scene<W>(
         &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         aw: u32,
         ah: u32,
+        color_view: &wgpu::TextureView,
+        final_resolve_target: Option<&wgpu::TextureView>,
+        final_store: wgpu::StoreOp,
+        selection_id_view: Option<&wgpu::TextureView>,
+        label_p1: &'static str,
+        label_p2: &'static str,
+        hiz: &HiZPyramid,
+        layers: &mut [&mut dyn ViewportLayer<W>],
+        paint_ctx: &PaintCtx<'_, W>,
+        stats: &mut FrameStats,
+    ) {
+        let cull_ctx = GpuCullCtx {
+            viewport_id: self.id,
+            device,
+            queue,
+            camera: &self.camera,
+            world: paint_ctx.world,
+            active_px: [aw, ah],
+            logical_size: paint_ctx.logical_size,
+        };
+        for layer in layers.iter_mut() {
+            if layer.uses_gpu_culling(self.id) {
+                layer.encode_gpu_cull_phase1(encoder, &cull_ctx);
+            }
+        }
+        {
+            let gpu_timer = crate::trace::pass(label_p1);
+            let color_attachment = Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
+                    store: wgpu::StoreOp::Store,
+                },
+            });
+            let single = [color_attachment.clone()];
+            let mrt = selection_id_view.map(|id_view| {
+                [
+                    color_attachment,
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: id_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ]
+            });
+            let attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>] = match &mrt {
+                Some(pair) => pair,
+                None => &single,
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label_p1),
+                color_attachments: attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.targets.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(timer) = &gpu_timer {
+                timer.begin_stats(&mut pass);
+            }
+            pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, aw, ah);
+            pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
+            for layer in layers.iter() {
+                if layer.phases().contains(DrawPhase::Opaque) {
+                    layer.paint(DrawPhase::Opaque, &mut pass, paint_ctx);
+                    stats.layer_draws = stats.layer_draws.saturating_add(1);
+                }
+            }
+            if let Some(timer) = &gpu_timer {
+                timer.end_stats(&mut pass);
+            }
+        }
+
+        hiz.encode(encoder);
+
+        for layer in layers.iter_mut() {
+            if layer.uses_gpu_culling(self.id) {
+                layer.encode_gpu_cull_phase2(
+                    encoder,
+                    hiz.full_view(),
+                    hiz.size(),
+                    hiz.mip_count(),
+                    hiz.generation(),
+                    &cull_ctx,
+                );
+            }
+        }
+
+        {
+            let gpu_timer = crate::trace::pass(label_p2);
+            let color_attachment = Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: final_resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: final_store,
+                },
+            });
+            let single = [color_attachment.clone()];
+            let mrt = selection_id_view.map(|id_view| {
+                [
+                    color_attachment,
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: id_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ]
+            });
+            let attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>] = match &mrt {
+                Some(pair) => pair,
+                None => &single,
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label_p2),
+                color_attachments: attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.targets.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(timer) = &gpu_timer {
+                timer.begin_stats(&mut pass);
+            }
+            pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, aw, ah);
+            pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
+            for layer in layers.iter() {
+                if layer.uses_gpu_culling(self.id) && layer.phases().contains(DrawPhase::Opaque) {
+                    layer.paint_phase2(DrawPhase::Opaque, &mut pass, paint_ctx);
+                    stats.layer_draws = stats.layer_draws.saturating_add(1);
+                }
+            }
+            for layer in layers.iter() {
+                if layer.phases().contains(DrawPhase::Transparent) {
+                    layer.paint(DrawPhase::Transparent, &mut pass, paint_ctx);
+                    stats.layer_draws = stats.layer_draws.saturating_add(1);
+                }
+            }
+            if let Some(timer) = &gpu_timer {
+                timer.end_stats(&mut pass);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_static_cache<W>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        aw: u32,
+        ah: u32,
+        selection_id_view: Option<&wgpu::TextureView>,
+        use_gpu_cull: bool,
         layers: &mut [&mut dyn ViewportLayer<W>],
         paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.static_color_views();
+        if let Some(hiz) = use_gpu_cull.then_some(self.hiz_pyramid.as_ref()).flatten() {
+            self.render_two_phase_scene(
+                device,
+                queue,
+                encoder,
+                aw,
+                ah,
+                color_view,
+                resolve_target,
+                resolved_color_store(resolve_target),
+                selection_id_view,
+                "iletki static scene",
+                "iletki static scene phase2",
+                hiz,
+                layers,
+                paint_ctx,
+                stats,
+            );
+            return;
+        }
         let gpu_timer = crate::trace::pass("iletki static scene");
+        let color_attachment = Some(wgpu::RenderPassColorAttachment {
+            view: color_view,
+            depth_slice: None,
+            resolve_target,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
+                store: resolved_color_store(resolve_target),
+            },
+        });
+        let single = [color_attachment.clone()];
+        let mrt = selection_id_view.map(|id_view| {
+            [
+                color_attachment,
+                Some(wgpu::RenderPassColorAttachment {
+                    view: id_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ]
+        });
+        let attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>] = match &mrt {
+            Some(pair) => pair,
+            None => &single,
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki static scene"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
-                depth_slice: None,
-                resolve_target,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
-                    store: resolved_color_store(resolve_target),
-                },
-            })],
+            color_attachments: attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: self.targets.depth_view(),
                 depth_ops: Some(wgpu::Operations {
@@ -814,10 +1352,13 @@ impl ViewportHost {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(timer) = &gpu_timer {
+            timer.begin_stats(&mut pass);
+        }
         pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
         pass.set_scissor_rect(0, 0, aw, ah);
         pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
@@ -829,6 +1370,9 @@ impl ViewportHost {
                     stats.layer_draws = stats.layer_draws.saturating_add(1);
                 }
             }
+        }
+        if let Some(timer) = &gpu_timer {
+            timer.end_stats(&mut pass);
         }
     }
 
@@ -865,7 +1409,7 @@ impl ViewportHost {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -905,12 +1449,17 @@ impl ViewportHost {
     #[allow(clippy::too_many_arguments)]
     fn render_continuous<W>(
         &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         aw: u32,
         ah: u32,
         outline_rect: Option<[u32; 4]>,
+        selection_id_view: Option<&wgpu::TextureView>,
+        use_gpu_cull: bool,
         layers: &mut [&mut dyn ViewportLayer<W>],
-        paint_ctx: &PaintCtx<'_, W>,
+        scene_paint_ctx: &PaintCtx<'_, W>,
+        overlay_paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.output_color_views();
@@ -919,27 +1468,76 @@ impl ViewportHost {
                 let m = l.phases();
                 m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
             });
-        {
+        if let Some(hiz) = use_gpu_cull.then_some(self.hiz_pyramid.as_ref()).flatten() {
+            let final_resolve = if has_second_pass {
+                None
+            } else {
+                resolve_target
+            };
+            let final_store = if has_second_pass {
+                wgpu::StoreOp::Store
+            } else {
+                resolved_color_store(resolve_target)
+            };
+            self.render_two_phase_scene(
+                device,
+                queue,
+                encoder,
+                aw,
+                ah,
+                color_view,
+                final_resolve,
+                final_store,
+                selection_id_view,
+                "iletki continuous scene",
+                "iletki continuous scene phase2",
+                hiz,
+                layers,
+                scene_paint_ctx,
+                stats,
+            );
+            stats.static_rebuilt = true;
+        } else {
             let gpu_timer = crate::trace::pass("iletki continuous scene");
+            let color_attachment = Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: if has_second_pass {
+                    None
+                } else {
+                    resolve_target
+                },
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
+                    store: if has_second_pass {
+                        wgpu::StoreOp::Store
+                    } else {
+                        resolved_color_store(resolve_target)
+                    },
+                },
+            });
+            let single = [color_attachment.clone()];
+            let mrt = selection_id_view.map(|id_view| {
+                [
+                    color_attachment,
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: id_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ]
+            });
+            let attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>] = match &mrt {
+                Some(pair) => pair,
+                None => &single,
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki continuous scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    depth_slice: None,
-                    resolve_target: if has_second_pass {
-                        None
-                    } else {
-                        resolve_target
-                    },
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
-                        store: if has_second_pass {
-                            wgpu::StoreOp::Store
-                        } else {
-                            resolved_color_store(resolve_target)
-                        },
-                    },
-                })],
+                color_attachments: attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.targets.depth_view(),
                     depth_ops: Some(wgpu::Operations {
@@ -948,20 +1546,26 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(timer) = &gpu_timer {
+                timer.begin_stats(&mut pass);
+            }
             pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, aw, ah);
             pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
             for phase in [DrawPhase::Opaque, DrawPhase::Transparent] {
                 for layer in layers.iter() {
                     if layer.phases().contains(phase) {
-                        layer.paint(phase, &mut pass, paint_ctx);
+                        layer.paint(phase, &mut pass, scene_paint_ctx);
                         stats.layer_draws = stats.layer_draws.saturating_add(1);
                     }
                 }
+            }
+            if let Some(timer) = &gpu_timer {
+                timer.end_stats(&mut pass);
             }
             stats.static_rebuilt = true;
         }
@@ -987,7 +1591,7 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1000,7 +1604,7 @@ impl ViewportHost {
             for phase in [DrawPhase::Gizmo, DrawPhase::Overlay] {
                 for layer in layers.iter() {
                     if layer.phases().contains(phase) {
-                        layer.paint(phase, &mut pass, paint_ctx);
+                        layer.paint(phase, &mut pass, overlay_paint_ctx);
                         stats.layer_draws = stats.layer_draws.saturating_add(1);
                     }
                 }
@@ -1137,7 +1741,7 @@ impl ViewportHost {
         let depth_layout = StagingLayout::compute(w, h, 4, max_buffer_size)?;
 
         self.streaming_pending |= self
-            .prepare_layers(device, queue, world, layers, Some([x0, y0, w, h]))
+            .prepare_layers(device, queue, world, layers, Some([x0, y0, w, h]), false)
             .1;
 
         let logical = self.logical_size();
@@ -1151,6 +1755,7 @@ impl ViewportHost {
         {
             let _profile = crate::trace::scope("pick.draw_encode");
             let paint_ctx = PaintCtx {
+                selection_id_attachment: false,
                 viewport_id: self.id,
                 camera: &self.camera,
                 camera_bind_group: self.camera_gpu.bind_group(),
@@ -1179,10 +1784,13 @@ impl ViewportHost {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(timer) = &gpu_timer {
+                timer.begin_stats(&mut pass);
+            }
             pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
             pass.set_scissor_rect(x0, y0, w, h);
             pass.set_bind_group(0, self.camera_gpu.bind_group(), &[]);
@@ -1190,6 +1798,9 @@ impl ViewportHost {
                 if layer.phases().contains(DrawPhase::Picking) {
                     layer.paint(DrawPhase::Picking, &mut pass, &paint_ctx);
                 }
+            }
+            if let Some(timer) = &gpu_timer {
+                timer.end_stats(&mut pass);
             }
         }
         let depth_r32f = {

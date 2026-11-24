@@ -1,6 +1,11 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
-use crate::{Vertex3D, face_batch::PackedDraws};
+use crate::gpu_cull::GpuCullView;
+use crate::{
+    Vertex3D,
+    face_batch::PackedDraws,
+    storage_batch::{StorageDraws, StorageViewBinding},
+};
 use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
 use iletki_core::{Bounds3, Camera, Frustum, MAX_CLIP_PLANES, Mat4, Vec3, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
@@ -66,6 +71,16 @@ impl FaceRanges {
         }
         omitted
     }
+
+    pub(crate) fn iter_ranges(&self) -> impl Iterator<Item = (Range<u32>, Bounds3)> + '_ {
+        self.bounds.iter().enumerate().map(|(block, &bounds)| {
+            let start = (block * FACE_RANGE_VERTICES) as u32;
+            let end = start
+                .saturating_add(FACE_RANGE_VERTICES as u32)
+                .min(self.vertex_count);
+            (start..end, bounds)
+        })
+    }
 }
 
 pub(crate) struct PreparedObject {
@@ -91,6 +106,15 @@ pub(crate) struct ViewObjects {
     pub(crate) faces: PackedDraws,
     pub(crate) edges: PackedDraws,
     pub(crate) mask: PackedDraws,
+    pub(crate) storage_binding: Option<StorageViewBinding>,
+    pub(crate) storage_faces: StorageDraws,
+    pub(crate) storage_edges: StorageDraws,
+    pub(crate) storage_mask: StorageDraws,
+    pub(crate) gpu_cull: Option<GpuCullView>,
+    pub(crate) gpu_cull_active: bool,
+    pub(crate) retained_geometry_rev: u64,
+    pub(crate) retained_full_scene: bool,
+    pub(crate) retained_has_edges: bool,
     pub(crate) outline_bounds: OutlineBounds,
     pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
@@ -120,6 +144,15 @@ impl ViewObjects {
             faces: PackedDraws::default(),
             edges: PackedDraws::default(),
             mask: PackedDraws::default(),
+            storage_binding: None,
+            storage_faces: StorageDraws::default(),
+            storage_edges: StorageDraws::default(),
+            storage_mask: StorageDraws::default(),
+            gpu_cull: None,
+            gpu_cull_active: false,
+            retained_geometry_rev: 0,
+            retained_full_scene: false,
+            retained_has_edges: false,
             outline_bounds: OutlineBounds::default(),
             direct_uniforms: Vec::new(),
             pages: Vec::new(),
@@ -283,7 +316,9 @@ pub(crate) enum SectionRelation {
 pub(crate) struct SectionGroup {
     origins: Bounds3,
     local: Bounds3,
+    world: Bounds3,
     invalid_origin: bool,
+    has_untrusted: bool,
 }
 
 impl SectionGroup {
@@ -297,12 +332,44 @@ impl SectionGroup {
         self.origins.max = self.origins.max.max(origin);
         self.local.min = self.local.min.min(local.min);
         self.local.max = self.local.max.max(local.max);
+        if !local.is_empty() {
+            let wmin = origin + local.min;
+            let wmax = origin + local.max;
+            if wmin.is_finite() && wmax.is_finite() {
+                self.world.include(wmin);
+                self.world.include(wmax);
+            } else {
+                self.invalid_origin = true;
+            }
+        }
     }
 
-    pub(crate) fn contains_origin(&self, origin: Vec3) -> bool {
-        !self.invalid_origin
-            && origin.min(self.origins.min) == self.origins.min
-            && origin.max(self.origins.max) == self.origins.max
+    pub(crate) fn mark_untrusted(&mut self) {
+        self.has_untrusted = true;
+    }
+
+    pub(crate) fn all_trusted(&self) -> bool {
+        !self.has_untrusted && !self.invalid_origin
+    }
+
+    pub(crate) fn contains_chunk(&self, origin: Vec3, local: Bounds3) -> bool {
+        if self.invalid_origin {
+            return false;
+        }
+        let origins_ok = origin.min(self.origins.min) == self.origins.min
+            && origin.max(self.origins.max) == self.origins.max;
+        if !origins_ok {
+            return false;
+        }
+        if local.is_empty() {
+            return true;
+        }
+        let wmin = origin + local.min;
+        let wmax = origin + local.max;
+        wmin.is_finite()
+            && wmax.is_finite()
+            && wmin.min(self.world.min) == self.world.min
+            && wmax.max(self.world.max) == self.world.max
     }
 
     pub(crate) fn section_relation(&self, volume: &SectionVolume, camera: Vec3) -> SectionRelation {
@@ -320,12 +387,19 @@ impl SectionGroup {
         }
     }
 
-    pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
-        if self.invalid_origin {
+    pub(crate) fn outside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
+        if self.has_untrusted || self.invalid_origin || self.world.is_empty() {
             return false;
         }
-        let lo = (self.origins.min + self.local.min) - camera;
-        let hi = (self.origins.max + self.local.max) - camera;
+        !frustum.intersects_bounds_world(self.world, camera)
+    }
+
+    pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
+        if self.invalid_origin || self.world.is_empty() {
+            return false;
+        }
+        let lo = self.world.min - camera;
+        let hi = self.world.max - camera;
         lo.is_finite()
             && hi.is_finite()
             && frustum.planes.iter().flatten().all(|plane| {

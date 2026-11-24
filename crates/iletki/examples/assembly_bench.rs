@@ -202,7 +202,10 @@ mod native {
                 wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
             );
             let adapter = block_on(instance.request_adapter(&Default::default()))?;
-            let mut required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+            let mut required_features = adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::PIPELINE_STATISTICS_QUERY
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
             if std::env::var_os("ILETKI_ASSEMBLY_SAMPLED_SECTION").is_none() {
                 required_features |= adapter.features() & wgpu::Features::CLIP_DISTANCES;
             }
@@ -297,6 +300,15 @@ mod native {
             }
             if std::env::var_os("ILETKI_ASSEMBLY_NO_REPEATED_PAGES").is_some() {
                 scene.set_profile_repeated_pages(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_INDEXED").is_some() {
+                scene.set_profile_indexed_geometry(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_STORAGE").is_some() {
+                scene.set_profile_storage_transforms(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_GPU_CULL").is_some() {
+                scene.set_profile_gpu_culling(false);
             }
             self.record_memory(case, "before-targets")?;
             let host = |initial_px| {
@@ -538,8 +550,9 @@ mod native {
             view: &str,
             image: &RgbaImage,
         ) -> Result<(), Error> {
+            let save_all = std::env::var_os("ILETKI_ASSEMBLY_ALL_IMAGES").is_some();
             if let Some(directory) = &self.images
-                && phase.is_multiple_of(10)
+                && (save_all || phase.is_multiple_of(10))
             {
                 let filename = format!(
                     "{}-{}-{phase:02}-{view}-{}x{}.rgba",
@@ -617,6 +630,68 @@ mod native {
                     }
                 }
             }
+            if main.supports_color_frame_selection(&gpu.device) {
+                let preview_samples = 120u32;
+                let [mx, my, mw, mh] = marquee;
+                for (label, moving) in [
+                    ("marquee-preview-static", false),
+                    ("marquee-preview-moving", true),
+                ] {
+                    *main.camera_mut() = case.camera(35, false);
+                    for frame in 0..WARMUP + preview_samples + if profile { 8 } else { 0 } {
+                        let trace = frame >= WARMUP + preview_samples;
+                        if trace {
+                            profiling::begin(&gpu.device);
+                        }
+                        if moving {
+                            *main.camera_mut() = case.camera(35 + frame, false);
+                        }
+                        let shift = frame % 17;
+                        let rect = [mx.saturating_add(shift), my, mw, mh];
+                        let start = Instant::now();
+                        main.set_color_frame_selection_rect(Some(rect));
+                        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                        main.render_to_texture(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            &(),
+                            &mut [scene],
+                        );
+                        let commands = encoder.finish();
+                        let encode = elapsed_ms(start);
+                        gpu.queue.submit([commands]);
+                        let slots = if let Some(mut pending) =
+                            main.take_color_frame_selection_preview(&gpu.device)
+                        {
+                            loop {
+                                match pending.try_read() {
+                                    Poll::Ready(res) => break res?,
+                                    Poll::Pending => std::thread::yield_now(),
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let wall = elapsed_ms(start);
+                        if trace {
+                            let capture = profiling::finish(&gpu.device, &gpu.queue)?;
+                            record_capture(&mut self.profile, label, frame, capture)?;
+                        } else if frame >= WARMUP {
+                            let sig = hash_bytes(slots.iter().flat_map(|s| s.to_le_bytes()));
+                            self.record(
+                                case,
+                                label,
+                                frame - WARMUP,
+                                encode,
+                                wall,
+                                &format!("{sig:016x}"),
+                            )?;
+                        }
+                    }
+                    main.set_color_frame_selection_rect(None);
+                }
+            }
             Ok(())
         }
 
@@ -635,6 +710,99 @@ mod native {
                 self.variant, self.run, case.chunks, case.view, workload, frame
             )
         }
+    }
+
+    fn make_smooth_scene(pack: bool) -> (Scene3DLayer, Vec<(Chunk3DId, Vec3)>, Vec3, f64, usize) {
+        use iletki::{Bounds3, Vertex3D};
+
+        let mut scene = Scene3DLayer::new(1);
+        scene.set_profile_batch_geometry(pack);
+        let mut edits = Vec::new();
+        let mut bounds = Bounds3::EMPTY;
+        let mut triangles = 0usize;
+
+        let build_sphere = |stacks: usize, slices: usize, r: f32, color: [u8; 4]| {
+            let mut verts = Vec::with_capacity(stacks * slices * 6);
+            for st in 0..stacks {
+                let phi0 = std::f32::consts::PI * (st as f32) / (stacks as f32);
+                let phi1 = std::f32::consts::PI * ((st + 1) as f32) / (stacks as f32);
+                for sl in 0..slices {
+                    let th0 = std::f32::consts::TAU * (sl as f32) / (slices as f32);
+                    let th1 = std::f32::consts::TAU * ((sl + 1) as f32) / (slices as f32);
+                    let pt = |phi: f32, th: f32| {
+                        let nx = phi.sin() * th.cos();
+                        let ny = phi.sin() * th.sin();
+                        let nz = phi.cos();
+                        Vertex3D::new([nx * r, ny * r, nz * r], [nx, ny, nz], color)
+                    };
+                    let v00 = pt(phi0, th0);
+                    let v10 = pt(phi1, th0);
+                    let v11 = pt(phi1, th1);
+                    let v01 = pt(phi0, th1);
+                    if st > 0 {
+                        verts.extend_from_slice(&[v00, v10, v11]);
+                    }
+                    if st + 1 < stacks {
+                        verts.extend_from_slice(&[v00, v11, v01]);
+                    }
+                }
+            }
+            verts
+        };
+
+        let build_cylinder = |segs: usize, rings: usize, r: f32, h: f32, color: [u8; 4]| {
+            let mut verts = Vec::with_capacity(segs * rings * 6);
+            for rg in 0..rings {
+                let z0 = -0.5 * h + h * (rg as f32) / (rings as f32);
+                let z1 = -0.5 * h + h * ((rg + 1) as f32) / (rings as f32);
+                for sg in 0..segs {
+                    let a0 = std::f32::consts::TAU * (sg as f32) / (segs as f32);
+                    let a1 = std::f32::consts::TAU * ((sg + 1) as f32) / (segs as f32);
+                    let n0 = [a0.cos(), a0.sin(), 0.0];
+                    let n1 = [a1.cos(), a1.sin(), 0.0];
+                    let v00 = Vertex3D::new([n0[0] * r, n0[1] * r, z0], n0, color);
+                    let v10 = Vertex3D::new([n1[0] * r, n1[1] * r, z0], n1, color);
+                    let v11 = Vertex3D::new([n1[0] * r, n1[1] * r, z1], n1, color);
+                    let v01 = Vertex3D::new([n0[0] * r, n0[1] * r, z1], n0, color);
+                    verts.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+                }
+            }
+            verts
+        };
+
+        for i in 0..500u32 {
+            let gx = f64::from(i % 25) * 3.0;
+            let gy = f64::from(i / 25) * 3.0;
+            let origin = Vec3::new(gx, gy, 0.0);
+            let color = [
+                ((i * 53 + 80) % 200 + 40) as u8,
+                ((i * 97 + 110) % 200 + 40) as u8,
+                ((i * 131 + 140) % 200 + 40) as u8,
+                255,
+            ];
+            let mut mesh = Mesh3D::at_origin(origin);
+            let verts = if i % 2 == 0 {
+                build_sphere(32, 48, 1.1, color)
+            } else {
+                build_cylinder(64, 24, 0.9, 2.2, color)
+            };
+            let pick = PickId::new(1, i + 1, 0).to_rg32u();
+            mesh.pick_ids.resize(verts.len(), pick);
+            mesh.local_bounds =
+                Bounds3::from_corners(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1));
+            triangles += verts.len() / 3;
+            mesh.vertices = verts;
+            let wb = mesh.world_bounds();
+            bounds.include(wb.min);
+            bounds.include(wb.max);
+            let id = scene.insert(mesh);
+            if i % 100 == 0 {
+                edits.push((id, origin));
+            }
+        }
+        let focus = bounds.center().unwrap_or(Vec3::ZERO);
+        let radius = bounds.radius() * 2.2;
+        (scene, edits, focus, radius, triangles)
     }
 
     fn elapsed_ms(start: Instant) -> f64 {
@@ -705,6 +873,22 @@ mod native {
             bench.variant.as_str(),
             "geometry-direct" | "visibility-only"
         );
+        if std::env::var_os("ILETKI_ASSEMBLY_SMOOTH").is_some() {
+            let started = Instant::now();
+            let (scene, edits, focus, radius, triangles) = make_smooth_scene(pack);
+            let case = Case {
+                chunks: 500,
+                view: "model",
+                model: Some((focus, radius)),
+                style,
+            };
+            eprintln!(
+                "smooth synthetic: 500 chunks, {triangles} triangles, {:?} pixels",
+                bench.size
+            );
+            bench.record(case, "scene-build", 0, 0.0, elapsed_ms(started), "")?;
+            return bench.run_case(case, scene, &edits);
+        }
         if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
             let started = Instant::now();
             let fixture = crate::assembly_fixture::load(Path::new(&path))?;

@@ -261,12 +261,46 @@ pub(crate) struct DepthCopyPipeline {
     scratch: Option<([u32; 2], wgpu::Texture, wgpu::TextureView)>,
 }
 
+const DEPTH_COPY_GL_WGSL: &str = r#"
+struct DepthCopyParams {
+    origin: vec2<u32>,
+    _pad: vec2<u32>,
+};
+
+@group(0) @binding(0) var src_depth: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> params: DepthCopyParams;
+
+@vertex
+fn vs_depth_copy(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((idx & 1u) * 4u) - 1.0;
+    let y = f32(((idx >> 1u) & 1u) * 4u) - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_depth_copy(@builtin(position) pos: vec4<f32>) -> @location(0) f32 {
+    let coord = vec2<i32>(params.origin) + vec2<i32>(pos.xy);
+    return textureLoad(src_depth, coord, 0).r;
+}
+"#;
+
 impl DepthCopyPipeline {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let gl_float = device.adapter_info().backend == wgpu::Backend::Gl;
+        let source = if gl_float {
+            DEPTH_COPY_GL_WGSL
+        } else {
+            include_str!("shaders/depth_copy.wgsl")
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iletki depth copy shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/depth_copy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
+        let sample_type = if gl_float {
+            wgpu::TextureSampleType::Float { filterable: false }
+        } else {
+            wgpu::TextureSampleType::Depth
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iletki depth copy layout"),
             entries: &[
@@ -274,7 +308,7 @@ impl DepthCopyPipeline {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -411,7 +445,7 @@ impl DepthCopyPipeline {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

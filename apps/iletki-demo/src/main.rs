@@ -29,8 +29,8 @@ use iletki::gpu::wgpu;
 use iletki::{
     Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DirtyFlags, DrawStyle2D,
     Grid3DConfig, GridStyle, InfiniteGrid3DLayer, Instance3D, InstancedMesh3DLayer, Mesh2D, Mesh3D,
-    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PickHit, PickId, Plane,
-    PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
+    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PendingSlotPreview, PickHit,
+    PickId, Plane, PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
     TransformGizmoLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
     ViewportMode, order_to_depth,
 };
@@ -170,8 +170,13 @@ struct PickRequest {
     input_at: Instant,
 }
 
+enum PendingSelection {
+    Exact(PendingPick),
+    ColorFrame(PendingSlotPreview),
+}
+
 struct SubmittedPick {
-    pick: PendingPick,
+    pick: PendingSelection,
     request: PickRequest,
     submitted_at: Instant,
 }
@@ -222,6 +227,7 @@ struct GpuState {
     pick_epoch: u64,
     pending_pick: Option<SubmittedPick>,
     queued_pick: Option<PickRequest>,
+    queued_color_frame_preview: Option<PickRequest>,
     preview_pacing: preview::PreviewPacing,
     frames_in_flight: Arc<AtomicUsize>,
     deferred_redraw: bool,
@@ -260,7 +266,7 @@ impl GpuState {
         let info = adapter.get_info();
         println!("iletki-demo GPU: {} ({:?})", info.name, info.backend);
 
-        let features = wgpu::Features::CLIP_DISTANCES;
+        let features = wgpu::Features::CLIP_DISTANCES | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         #[cfg(feature = "profiling")]
         let pick_profile = std::env::var_os("ILETKI_PICK_PROFILE").is_some();
         #[cfg(feature = "profiling")]
@@ -460,6 +466,7 @@ impl GpuState {
             pick_epoch: 0,
             pending_pick: None,
             queued_pick: None,
+            queued_color_frame_preview: None,
             preview_pacing,
             frames_in_flight: Arc::new(AtomicUsize::new(0)),
             deferred_redraw: false,
@@ -778,8 +785,13 @@ impl GpuState {
                 .and_then(|monitor| monitor.refresh_rate_millihertz()),
         );
         self.pick_epoch = self.pick_epoch.wrapping_add(1);
+        self.vp_main.set_color_frame_selection_rect(None);
         if let Some(queued) = self.queued_pick.take() {
             self.pick_status(queued.event, "cancelled", None);
+        }
+        if let Some(queued) = self.queued_color_frame_preview.take() {
+            self.pick_status(queued.event, "cancelled", None);
+            self.vp_main.record_selection_preview_superseded();
         }
         self.clear_preview("cancelled");
     }
@@ -860,6 +872,27 @@ impl GpuState {
 
     fn begin_pick(&mut self, mut request: PickRequest) {
         let rect = request.rect;
+        if request.kind == PickKind::Preview
+            && self.active_scene == DemoScene::Arch3D
+            && !self.quad_view
+            && !self.bench_dual
+            && self.vp_main.supports_color_frame_selection(&self.device)
+        {
+            if let Some(old) = self.queued_color_frame_preview.replace(request) {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
+            }
+            self.vp_main.set_color_frame_selection_rect(Some(rect));
+            self.window.request_redraw();
+            return;
+        }
+        if request.kind != PickKind::Preview {
+            self.vp_main.set_color_frame_selection_rect(None);
+            if let Some(old) = self.queued_color_frame_preview.take() {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
+            }
+        }
         #[cfg(feature = "profiling")]
         if self.pick_profile
             && self
@@ -901,7 +934,7 @@ impl GpuState {
             request.view = self.pick_view(request.kind);
             self.pick_status(request.event, "submitted", None);
             self.pending_pick = Some(SubmittedPick {
-                pick,
+                pick: PendingSelection::Exact(pick),
                 request,
                 submitted_at: Instant::now(),
             });
@@ -934,8 +967,22 @@ impl GpuState {
         let Some(pending) = &mut self.pending_pick else {
             return;
         };
-        let Poll::Ready(result) = pending.pick.try_read() else {
-            return;
+        enum ReadyResult {
+            Exact(Result<Vec<PickHit>, iletki::ViewportError>),
+            Slots(Result<Vec<u32>, iletki::ViewportError>, u64),
+        }
+        let ready = match &mut pending.pick {
+            PendingSelection::Exact(pick) => match pick.try_read() {
+                Poll::Ready(res) => ReadyResult::Exact(res),
+                Poll::Pending => return,
+            },
+            PendingSelection::ColorFrame(preview) => {
+                let target_gen = preview.snapshot().target_generation;
+                match preview.try_read() {
+                    Poll::Ready(res) => ReadyResult::Slots(res, target_gen),
+                    Poll::Pending => return,
+                }
+            }
         };
         let Some(SubmittedPick {
             mut request,
@@ -945,8 +992,14 @@ impl GpuState {
         else {
             return;
         };
-        if let Ok(hits) = &result {
-            self.pick_status(request.event, "ready", Some(hits.len()));
+        let is_color_frame = matches!(ready, ReadyResult::Slots(..));
+        let ready_len = match &ready {
+            ReadyResult::Exact(Ok(hits)) => Some(hits.len()),
+            ReadyResult::Slots(Ok(slots), _) => Some(slots.len()),
+            _ => None,
+        };
+        if let Some(len) = ready_len {
+            self.pick_status(request.event, "ready", Some(len));
         }
         let current = self.pick_view(request.kind);
         let preview = request.kind == PickKind::Preview;
@@ -954,45 +1007,78 @@ impl GpuState {
             .queued_pick
             .as_ref()
             .is_some_and(|queued| queued.kind == PickKind::Commit);
+        let target_ok = match &ready {
+            ReadyResult::Slots(_, target_gen) => *target_gen == self.vp_main.target_generation(),
+            ReadyResult::Exact(_) => true,
+        };
         let recent_preview = preview
+            && target_ok
             && !commit_queued
             && request.view.same_surface(&current)
             && now.saturating_duration_since(request.input_at) < MAX_MOVING_PREVIEW_AGE;
         if request.epoch != self.pick_epoch || self.quad_view {
             self.pick_status(request.event, "cancelled", None);
+            if is_color_frame {
+                self.vp_main.record_selection_preview_superseded();
+            }
             return;
         }
         if preview {
             self.preview_pacing.pick_ready(submitted_at, now);
         }
-        if request.view != current && !recent_preview {
+        if (request.view != current || !target_ok) && !recent_preview {
             if request.kind == PickKind::Commit {
                 request.view = current;
                 self.begin_pick(request);
                 return;
             }
             self.pick_status(request.event, "stale", None);
-        } else if let Ok(hits) = result {
-            let event = request.event;
-            if let Some(trace) = &mut self.latency
-                && let Some(id) = event
-            {
-                trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
+            if is_color_frame {
+                self.vp_main.record_selection_preview_stale();
             }
-            self.apply_pick(&hits, request);
-            if let Some(trace) = &mut self.latency
-                && let Some(id) = event
-            {
-                trace.selection_redraw(id);
-            }
-            if preview {
-                self.preview_pacing.request_frame(Instant::now());
-            }
-            self.window.request_redraw();
         } else {
-            self.pick_status(request.event, "error", None);
-            if request.kind == PickKind::Commit {
-                self.clear_preview("cancelled");
+            match ready {
+                ReadyResult::Exact(Ok(hits)) => {
+                    let event = request.event;
+                    if let Some(trace) = &mut self.latency
+                        && let Some(id) = event
+                    {
+                        trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
+                    }
+                    self.apply_pick(&hits, request);
+                    if let Some(trace) = &mut self.latency
+                        && let Some(id) = event
+                    {
+                        trace.selection_redraw(id);
+                    }
+                    if preview {
+                        self.preview_pacing.request_frame(Instant::now());
+                    }
+                    self.window.request_redraw();
+                }
+                ReadyResult::Slots(Ok(slots), _) => {
+                    let event = request.event;
+                    let selected: HashSet<_> = slots
+                        .into_iter()
+                        .filter_map(|slot| self.scene_3d.chunk_id_at_slot(slot as usize))
+                        .collect();
+                    self.preview_view = Some((request.view, request.input_at));
+                    self.sync_highlights(Some(selected));
+                    self.last_pick_text = format!("{} selected", self.visible_selection.len());
+                    self.vp_main.record_selection_preview_displayed();
+                    if let (Some(trace), Some(id)) = (&mut self.latency, event) {
+                        trace.highlighted(id, self.visible_selection.len());
+                        trace.selection_redraw(id);
+                    }
+                    self.preview_pacing.request_frame(Instant::now());
+                    self.window.request_redraw();
+                }
+                ReadyResult::Exact(Err(_)) | ReadyResult::Slots(Err(_), _) => {
+                    self.pick_status(request.event, "error", None);
+                    if request.kind == PickKind::Commit {
+                        self.clear_preview("cancelled");
+                    }
+                }
             }
         }
     }
@@ -1341,6 +1427,7 @@ impl GpuState {
         self.marquee_origin.is_some()
             || self.preview_view.is_some()
             || self.pending_preview().is_some()
+            || self.queued_color_frame_preview.is_some()
             || self
                 .queued_pick
                 .as_ref()
@@ -1415,6 +1502,21 @@ impl GpuState {
         let h = self.surface_config.height.max(1);
 
         self.clear_stale_preview(Instant::now());
+        let mut color_frame_preview_req = if !self.quad_view
+            && !self.bench_dual
+            && self.active_scene == DemoScene::Arch3D
+            && self.pending_pick.is_none()
+        {
+            self.queued_color_frame_preview.take()
+        } else {
+            None
+        };
+        if let Some(req) = &color_frame_preview_req {
+            self.pick_status(req.event, "encoding", None);
+            self.vp_main.set_color_frame_selection_rect(Some(req.rect));
+        } else if !self.preview_active() {
+            self.vp_main.set_color_frame_selection_rect(None);
+        }
         let mut streaming = false;
         let mut dynamic_drawn = false;
         if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
@@ -1554,6 +1656,22 @@ impl GpuState {
         let commands = enc.finish();
         let encoded = Instant::now();
         self.queue.submit([commands]);
+        if let Some(mut req) = color_frame_preview_req.take() {
+            if let Some(preview) = self
+                .vp_main
+                .take_color_frame_selection_preview(&self.device)
+            {
+                req.view = self.pick_view(req.kind);
+                self.pick_status(req.event, "submitted", None);
+                self.pending_pick = Some(SubmittedPick {
+                    pick: PendingSelection::ColorFrame(preview),
+                    request: req,
+                    submitted_at: Instant::now(),
+                });
+            } else {
+                self.pick_status(req.event, "error", None);
+            }
+        }
         if self.preview_active() {
             self.frames_in_flight.fetch_add(1, Ordering::Relaxed);
             let in_flight = self.frames_in_flight.clone();

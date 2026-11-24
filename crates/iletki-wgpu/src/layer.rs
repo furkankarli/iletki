@@ -134,6 +134,8 @@ impl UploadTracker {
 pub struct PrepareCtx<'a, W = ()> {
     pub(crate) viewport_lifetime: &'a Arc<()>,
     pub(crate) section_antialiasing: bool,
+    pub(crate) selection_id_attachment: bool,
+    pub(crate) gpu_culling: bool,
     pub(crate) picking_rect: Option<[u32; 4]>,
     /// Unique identifier of the viewport being prepared (use as key for per-viewport GPU buffers
     /// when one scene is shared across multiple split viewports).
@@ -181,6 +183,20 @@ impl<W> PrepareCtx<'_, W> {
         self.section_antialiasing
     }
 
+    /// Returns whether the upcoming color pass attaches a second [`crate::SELECTION_ID_FORMAT`]
+    /// target (`@location(1)`) for zero-extra-pass selection previews.
+    #[must_use]
+    pub const fn selection_id_attachment(&self) -> bool {
+        self.selection_id_attachment
+    }
+
+    /// Returns whether the host viewport supports two-phase GPU culling and Hi-Z occlusion
+    /// culling on this frame.
+    #[must_use]
+    pub const fn supports_gpu_culling(&self) -> bool {
+        self.gpu_culling
+    }
+
     /// Returns a weak reference that lets a layer retire viewport-local GPU state after close.
     #[must_use]
     pub fn viewport_lifetime(&self) -> ViewportLifetime {
@@ -199,8 +215,36 @@ impl<W> std::fmt::Debug for PrepareCtx<'_, W> {
     }
 }
 
+/// Context handed to two-phase GPU culling hooks before and between scene passes.
+pub struct GpuCullCtx<'a, W = ()> {
+    /// Unique identifier of the viewport being rendered.
+    pub viewport_id: ViewportId,
+    /// Shared GPU device.
+    pub device: &'a wgpu::Device,
+    /// Shared GPU command queue.
+    pub queue: &'a wgpu::Queue,
+    /// Current viewport camera.
+    pub camera: &'a Camera,
+    /// Shared application world/scene reference.
+    pub world: &'a W,
+    /// Active viewport size in physical pixels.
+    pub active_px: [u32; 2],
+    /// Active viewport size in logical points.
+    pub logical_size: Vec2,
+}
+
+impl<W> std::fmt::Debug for GpuCullCtx<'_, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuCullCtx")
+            .field("viewport_id", &self.viewport_id)
+            .field("active_px", &self.active_px)
+            .finish()
+    }
+}
+
 /// Context handed to [`ViewportLayer::paint`] during an active `wgpu::RenderPass`.
 pub struct PaintCtx<'a, W = ()> {
+    pub(crate) selection_id_attachment: bool,
     /// Unique identifier of the viewport being drawn.
     pub viewport_id: ViewportId,
     /// Current viewport camera.
@@ -215,6 +259,15 @@ pub struct PaintCtx<'a, W = ()> {
     pub logical_size: Vec2,
     /// Logical-to-physical DPI scale.
     pub dpi_scale: f32,
+}
+
+impl<W> PaintCtx<'_, W> {
+    /// Returns whether the active color render pass includes a second
+    /// [`crate::SELECTION_ID_FORMAT`] (`Rg16Uint`) color attachment at `@location(1)`.
+    #[must_use]
+    pub const fn selection_id_attachment(&self) -> bool {
+        self.selection_id_attachment
+    }
 }
 
 impl<W> std::fmt::Debug for PaintCtx<'_, W> {
@@ -275,6 +328,60 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
     /// rectangle before filtering. Update the layer revision when its outline geometry changes.
     fn outline_mask_rect(&self, _ctx: &PaintCtx<'_, W>) -> Option<[u32; 4]> {
         None
+    }
+
+    /// Returns whether this layer can paint into a color pass that attaches a second
+    /// [`crate::SELECTION_ID_FORMAT`] (`@location(1)`) slot ID target.
+    ///
+    /// Layers that return `true` must use pipelines whose fragment targets include
+    /// [`crate::SELECTION_ID_FORMAT`] at slot 1 whenever [`PaintCtx::selection_id_attachment`]
+    /// is `true` (writing either 1-based slot IDs or masking writes with `ColorWrites::empty()`).
+    fn supports_color_frame_selection(&self) -> bool {
+        false
+    }
+
+    /// Returns the exclusive upper bound on 0-based slot IDs written by this layer during
+    /// color-frame selection (`0` if this layer does not write slot IDs).
+    fn selection_slot_count(&self) -> u32 {
+        0
+    }
+
+    /// Returns whether this layer prepared two-phase GPU culling and Hi-Z occlusion culling for
+    /// `viewport_id` on the current frame.
+    fn uses_gpu_culling(&self, _viewport_id: ViewportId) -> bool {
+        false
+    }
+
+    /// Records phase-1 GPU compute culling work before the primary opaque render pass.
+    fn encode_gpu_cull_phase1(
+        &mut self,
+        _encoder: &mut wgpu::CommandEncoder,
+        _ctx: &GpuCullCtx<'_, W>,
+    ) {
+    }
+
+    /// Records phase-2 GPU Hi-Z occlusion culling work against the phase-1 Reversed-Z min-depth
+    /// pyramid (`hiz_view`, power-of-two mip 0 extent `hiz_size`, `hiz_mip_count` levels and
+    /// monotonic `hiz_generation` for bind-group caching).
+    fn encode_gpu_cull_phase2(
+        &mut self,
+        _encoder: &mut wgpu::CommandEncoder,
+        _hiz_view: &wgpu::TextureView,
+        _hiz_size: [u32; 2],
+        _hiz_mip_count: u32,
+        _hiz_generation: u64,
+        _ctx: &GpuCullCtx<'_, W>,
+    ) {
+    }
+
+    /// Records phase-2 draw commands (newly visible opaque, translucent and edge geometry) into
+    /// the second scene render pass after Hi-Z occlusion culling.
+    fn paint_phase2(
+        &self,
+        _phase: DrawPhase,
+        _pass: &mut wgpu::RenderPass<'_>,
+        _ctx: &PaintCtx<'_, W>,
+    ) {
     }
 
     /// Records draw commands for `phase` into `pass`.
