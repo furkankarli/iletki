@@ -24,6 +24,8 @@ const FLAG_FACE_INDEXED: u32 = 1 << 2;
 const FLAG_HAS_FACES: u32 = 1 << 3;
 const FLAG_HAS_EDGES: u32 = 1 << 4;
 const FLAG_EDGE_INDEXED: u32 = 1 << 5;
+const FLAG_FACE_REPEATED: u32 = 1 << 6;
+const FLAG_EDGE_REPEATED: u32 = 1 << 7;
 
 const DRAW_INDEXED_STRIDE: u64 = 20;
 const DRAW_NON_INDEXED_STRIDE: u64 = 16;
@@ -132,10 +134,39 @@ fn cull_phase1_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let item = items[idx];
     let slot = atomicAdd(&bucket_counts[u.bucket_count + item.face_bucket * 4u + band], 1u);
     let dst = item.face_indirect_base + slot;
-    if ((item.flags & FLAG_FACE_INDEXED) != 0u) {
+    if ((item.flags & FLAG_FACE_REPEATED) != 0u) {
+        repeated_instances[dst] = item.chunk_index;
+        if (slot == 0u) {
+            let total = atomicLoad(&bucket_counts[item.face_bucket]);
+            if ((item.flags & FLAG_FACE_INDEXED) != 0u) {
+                indexed_args[item.face_first] = DrawIndexedArgs(item.face_count, total, 0u, 0, 0u);
+            } else {
+                non_indexed_args[item.face_first] = DrawArgs(item.face_count, total, 0u, 0u);
+            }
+        }
+    } else if ((item.flags & FLAG_FACE_INDEXED) != 0u) {
         indexed_args[dst] = DrawIndexedArgs(item.face_count, 1u, item.face_first, 0, 0u);
     } else {
         non_indexed_args[dst] = DrawArgs(item.face_count, 1u, item.face_first, 0u);
+    }
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn cull_phase2_finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < u.repeated_indexed_count) {
+        let arg = indexed_args[idx];
+        if (arg.index_count != 0u) {
+            indexed_args[idx].instance_count = atomicLoad(&bucket_counts[arg.first_instance]);
+            indexed_args[idx].first_instance = 0u;
+        }
+    }
+    if (idx < u.repeated_non_indexed_count) {
+        let arg = non_indexed_args[idx];
+        if (arg.vertex_count != 0u) {
+            non_indexed_args[idx].instance_count = atomicLoad(&bucket_counts[arg.first_instance]);
+            non_indexed_args[idx].first_instance = 0u;
+        }
     }
 }
 "#;
@@ -218,22 +249,19 @@ fn cull_phase2(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 // Quarter-resolution Hi-Z pyramid (mip 0 covers 4x4 screen pixels, shift +2).
                 let max_mip = max(textureNumLevels(hiz_tex), 1u) - 1u;
-                var mip: u32 = 0u;
-                loop {
-                    if (mip >= max_mip) {
-                        break;
-                    }
-                    let shift = mip + 2u;
-                    if (((px1 >> shift) - (px0 >> shift)) <= 1u && ((py1 >> shift) - (py0 >> shift)) <= 1u) {
-                        break;
-                    }
+                let hx0 = px0 >> 2u;
+                let hy0 = py0 >> 2u;
+                let hx1 = px1 >> 2u;
+                let hy1 = py1 >> 2u;
+                let span = max(hx1 - hx0, hy1 - hy0);
+                var mip: u32 = min(select(0u, 31u - countLeadingZeros(span), span > 1u), max_mip);
+                if (mip < max_mip && (((hx1 >> mip) - (hx0 >> mip)) > 1u || ((hy1 >> mip) - (hy0 >> mip)) > 1u)) {
                     mip = mip + 1u;
                 }
-                let shift = mip + 2u;
-                let tx0 = i32(px0 >> shift);
-                let tx1 = i32(px1 >> shift);
-                let ty0 = i32(py0 >> shift);
-                let ty1 = i32(py1 >> shift);
+                let tx0 = i32(hx0 >> mip);
+                let tx1 = i32(hx1 >> mip);
+                let ty0 = i32(hy0 >> mip);
+                let ty1 = i32(hy1 >> mip);
                 let d00 = textureLoad(hiz_tex, vec2<i32>(tx0, ty0), i32(mip)).r;
                 let d10 = textureLoad(hiz_tex, vec2<i32>(tx1, ty0), i32(mip)).r;
                 let d01 = textureLoad(hiz_tex, vec2<i32>(tx0, ty1), i32(mip)).r;
@@ -251,22 +279,44 @@ fn cull_phase2(@builtin(global_invocation_id) gid: vec3<u32>) {
     vis_state[idx] = select(0u, VIS_PREV, face_vis && !translucent);
 
     if (has_faces && face_vis && (state & VIS_DRAWN_P1) == 0u) {
-        emit_draw(
-            item.face_bucket,
-            item.face_indirect_base,
-            item.face_first,
-            item.face_count,
-            (item.flags & FLAG_FACE_INDEXED) != 0u,
-        );
+        if ((item.flags & FLAG_FACE_REPEATED) != 0u) {
+            emit_repeated(
+                item.face_bucket,
+                item.face_indirect_base,
+                item.face_first,
+                item.face_count,
+                item.chunk_index,
+                (item.flags & FLAG_FACE_INDEXED) != 0u,
+            );
+        } else {
+            emit_draw(
+                item.face_bucket,
+                item.face_indirect_base,
+                item.face_first,
+                item.face_count,
+                (item.flags & FLAG_FACE_INDEXED) != 0u,
+            );
+        }
     }
     if (has_edges && edge_vis) {
-        emit_draw(
-            item.edge_bucket,
-            item.edge_indirect_base,
-            item.edge_first,
-            item.edge_count,
-            (item.flags & FLAG_EDGE_INDEXED) != 0u,
-        );
+        if ((item.flags & FLAG_EDGE_REPEATED) != 0u) {
+            emit_repeated(
+                item.edge_bucket,
+                item.edge_indirect_base,
+                item.edge_first,
+                item.edge_count,
+                item.chunk_index,
+                (item.flags & FLAG_EDGE_INDEXED) != 0u,
+            );
+        } else {
+            emit_draw(
+                item.edge_bucket,
+                item.edge_indirect_base,
+                item.edge_first,
+                item.edge_count,
+                (item.flags & FLAG_EDGE_INDEXED) != 0u,
+            );
+        }
     }
 }
 "#;
@@ -287,6 +337,10 @@ pub(crate) struct CullViewUniforms {
     pub(crate) active_w: u32,
     pub(crate) active_h: u32,
     pub(crate) bucket_count: u32,
+    pub(crate) repeated_indexed_count: u32,
+    pub(crate) repeated_non_indexed_count: u32,
+    pub(crate) _pad0: u32,
+    pub(crate) _pad1: u32,
 }
 
 impl CullViewUniforms {
@@ -298,10 +352,11 @@ impl CullViewUniforms {
         active_px: [u32; 2],
         anchor: Vec3,
         cull_sections: bool,
-        item_count: u32,
-        scene_bounds: Bounds3,
-        bucket_count: u32,
+        scene: &GpuCullScene,
     ) -> Self {
+        let item_count = scene.item_count;
+        let scene_bounds = scene.world_bounds;
+        let bucket_count = scene.bucket_count;
         let cam_data = camera.to_uniform_data(logical_size, dpi_scale);
         let cam_pos = camera.position_3d();
         let origin = ViewCameraOrigin::from_vec3(cam_pos - anchor);
@@ -362,6 +417,10 @@ impl CullViewUniforms {
             active_w: active_px[0].max(1),
             active_h: active_px[1].max(1),
             bucket_count,
+            repeated_indexed_count: scene.repeated_indexed_count,
+            repeated_non_indexed_count: scene.repeated_non_indexed_count,
+            _pad0: 0,
+            _pad1: 0,
         }
     }
 }
@@ -452,9 +511,30 @@ pub(crate) struct GpuCullBucket {
     pub(crate) kind: BucketKind,
     pub(crate) indexed: bool,
     pub(crate) flat: bool,
+    pub(crate) repeated_elements: u32,
     pub(crate) indirect_base: u32,
+    pub(crate) instance_base: u32,
     pub(crate) max_draws: u32,
     pub(crate) world_bounds: Bounds3,
+}
+
+/// Returns whether `vbuf` is handled by GPU culling (as opposed to `extra_chunks`).
+pub(crate) fn face_in_gpu_cull(vbuf: &VertexRange, has_face_ranges: bool) -> bool {
+    matches!(
+        vbuf,
+        VertexRange::Packed { page, .. }
+            if page.repeated_elements() == 0
+                || (page.repeated_chunk_ids().is_some() && !has_face_ranges)
+    )
+}
+
+/// Returns whether `ebuf` is handled by GPU culling (as opposed to `extra_chunks`).
+pub(crate) fn edge_in_gpu_cull(ebuf: &VertexRange) -> bool {
+    matches!(
+        ebuf,
+        VertexRange::Packed { page, .. }
+            if page.repeated_elements() == 0 || page.repeated_chunk_ids().is_some()
+    )
 }
 
 /// Returns whether `device` supports compute GPU culling + `multi_draw_*_indirect_count`.
@@ -471,7 +551,7 @@ pub(crate) fn supports(device: &wgpu::Device) -> bool {
     let limits = device.limits();
     limits.max_compute_workgroups_per_dimension >= 1024
         && limits.max_compute_invocations_per_workgroup >= 64
-        && limits.max_storage_buffers_per_shader_stage >= 6
+        && limits.max_storage_buffers_per_shader_stage >= 7
 }
 
 /// Shared compute pipelines and bind group layouts for GPU culling.
@@ -482,6 +562,7 @@ pub(crate) struct GpuCullPipelines {
     phase1_prefix_pipeline: wgpu::ComputePipeline,
     phase1_scatter_pipeline: wgpu::ComputePipeline,
     phase2_pipeline: wgpu::ComputePipeline,
+    phase2_finalize_pipeline: wgpu::ComputePipeline,
 }
 
 impl GpuCullPipelines {
@@ -515,6 +596,7 @@ impl GpuCullPipelines {
                 storage_entry(4, false, DRAW_INDEXED_STRIDE),
                 storage_entry(5, false, DRAW_NON_INDEXED_STRIDE),
                 storage_entry(6, false, 4),
+                storage_entry(7, false, 4),
             ],
         });
         let hiz_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -569,6 +651,8 @@ impl GpuCullPipelines {
             make_p1("iletki-3d gpu cull phase1 prefix", "cull_phase1_prefix");
         let phase1_scatter_pipeline =
             make_p1("iletki-3d gpu cull phase1 scatter", "cull_phase1_scatter");
+        let phase2_finalize_pipeline =
+            make_p1("iletki-3d gpu cull phase2 finalize", "cull_phase2_finalize");
         let phase2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("iletki-3d gpu cull phase2 pipeline"),
             layout: Some(&p2_layout),
@@ -585,6 +669,7 @@ impl GpuCullPipelines {
             phase1_prefix_pipeline,
             phase1_scatter_pipeline,
             phase2_pipeline,
+            phase2_finalize_pipeline,
         }
     }
 }
@@ -610,12 +695,19 @@ pub(crate) struct GpuCullScene {
     pub(crate) item_count: u32,
     pub(crate) total_indexed: u32,
     pub(crate) total_non_indexed: u32,
+    pub(crate) repeated_indexed_count: u32,
+    pub(crate) repeated_non_indexed_count: u32,
+    pub(crate) total_repeated_instances: u32,
     pub(crate) has_edges: bool,
     pub(crate) extra_chunks: Vec<usize>,
     items_buf: wgpu::Buffer,
 }
 
 impl GpuCullScene {
+    pub(crate) fn has_repeated(&self) -> bool {
+        self.repeated_indexed_count != 0 || self.repeated_non_indexed_count != 0
+    }
+
     pub(crate) fn build<'a>(
         device: &wgpu::Device,
         generation: u64,
@@ -629,32 +721,37 @@ impl GpuCullScene {
         let mut has_edges = false;
         let mut scene_world_bounds = Bounds3::EMPTY;
 
-        let mut get_or_add_bucket =
-            |page: &Arc<GeometryPage>, kind: BucketKind, world_bounds: Bounds3| -> u32 {
-                let key = (Arc::as_ptr(page) as usize, kind);
-                if let Some(&id) = bucket_map.get(&key) {
-                    if let Some(bucket) = buckets.get_mut(id as usize) {
-                        bucket.max_draws = bucket.max_draws.saturating_add(1);
-                        if !world_bounds.is_empty() {
-                            bucket.world_bounds.include(world_bounds.min);
-                            bucket.world_bounds.include(world_bounds.max);
-                        }
+        let mut get_or_add_bucket = |page: &Arc<GeometryPage>,
+                                     kind: BucketKind,
+                                     repeated_elements: u32,
+                                     world_bounds: Bounds3|
+         -> u32 {
+            let key = (Arc::as_ptr(page) as usize, kind);
+            if let Some(&id) = bucket_map.get(&key) {
+                if let Some(bucket) = buckets.get_mut(id as usize) {
+                    bucket.max_draws = bucket.max_draws.saturating_add(1);
+                    if !world_bounds.is_empty() {
+                        bucket.world_bounds.include(world_bounds.min);
+                        bucket.world_bounds.include(world_bounds.max);
                     }
-                    return id;
                 }
-                let id = buckets.len() as u32;
-                buckets.push(GpuCullBucket {
-                    page: Arc::clone(page),
-                    kind,
-                    indexed: page.indices().is_some(),
-                    flat: page.kind() == PageKind::IndexedFlat,
-                    indirect_base: 0,
-                    max_draws: 1,
-                    world_bounds,
-                });
-                bucket_map.insert(key, id);
-                id
-            };
+                return id;
+            }
+            let id = buckets.len() as u32;
+            buckets.push(GpuCullBucket {
+                page: Arc::clone(page),
+                kind,
+                indexed: page.indices().is_some(),
+                flat: page.kind() == PageKind::IndexedFlat,
+                repeated_elements,
+                indirect_base: 0,
+                instance_base: 0,
+                max_draws: 1,
+                world_bounds,
+            });
+            bucket_map.insert(key, id);
+            id
+        };
 
         for input in chunks {
             let mut is_extra = false;
@@ -675,7 +772,18 @@ impl GpuCullScene {
 
             if let Some(vbuf) = input.vertex_buf {
                 match vbuf {
-                    VertexRange::Packed { page, elements, .. } if page.repeated_elements() == 0 => {
+                    VertexRange::Packed { page, elements, .. }
+                        if page.repeated_elements() == 0
+                            || (page.repeated_chunk_ids().is_some()
+                                && input.face_ranges.is_none()) =>
+                    {
+                        let rep_elems = if page.repeated_elements() != 0
+                            && page.repeated_chunk_ids().is_some()
+                        {
+                            page.repeated_elements()
+                        } else {
+                            0
+                        };
                         let kind = if input.translucent {
                             BucketKind::TranslucentFace
                         } else {
@@ -688,6 +796,11 @@ impl GpuCullScene {
                         };
                         let trans_flag = if input.translucent {
                             FLAG_TRANSLUCENT
+                        } else {
+                            0
+                        };
+                        let rep_flag = if rep_elems != 0 {
+                            FLAG_FACE_REPEATED
                         } else {
                             0
                         };
@@ -707,7 +820,7 @@ impl GpuCullScene {
                                 } else {
                                     Bounds3::EMPTY
                                 };
-                                let bucket = get_or_add_bucket(page, kind, sub_world);
+                                let bucket = get_or_add_bucket(page, kind, 0, sub_world);
                                 let trusted = input.trusted && !sub_bounds.is_empty();
                                 let flags = FLAG_HAS_FACES
                                     | indexed_flag
@@ -725,13 +838,19 @@ impl GpuCullScene {
                                 });
                             }
                         } else {
-                            let count = elements.end.saturating_sub(elements.start);
+                            let count = if rep_elems != 0 {
+                                rep_elems
+                            } else {
+                                elements.end.saturating_sub(elements.start)
+                            };
                             if count > 0 {
-                                let bucket = get_or_add_bucket(page, kind, chunk_world_bounds);
+                                let bucket =
+                                    get_or_add_bucket(page, kind, rep_elems, chunk_world_bounds);
                                 let trusted = input.trusted && !input.local_bounds.is_empty();
                                 let flags = FLAG_HAS_FACES
                                     | indexed_flag
                                     | trans_flag
+                                    | rep_flag
                                     | if trusted { FLAG_TRUSTED } else { 0 };
                                 single_face_item = Some(items.len());
                                 items.push(ChunkCullItem {
@@ -755,22 +874,44 @@ impl GpuCullScene {
 
             if let Some(ebuf) = input.edge_buf {
                 match ebuf {
-                    VertexRange::Packed { page, elements, .. } if page.repeated_elements() == 0 => {
-                        let count = elements.end.saturating_sub(elements.start);
+                    VertexRange::Packed { page, elements, .. }
+                        if page.repeated_elements() == 0 || page.repeated_chunk_ids().is_some() =>
+                    {
+                        let rep_elems = if page.repeated_elements() != 0
+                            && page.repeated_chunk_ids().is_some()
+                        {
+                            page.repeated_elements()
+                        } else {
+                            0
+                        };
+                        let count = if rep_elems != 0 {
+                            rep_elems
+                        } else {
+                            elements.end.saturating_sub(elements.start)
+                        };
                         if count > 0 {
                             has_edges = true;
                             has_packed_item = true;
-                            let bucket =
-                                get_or_add_bucket(page, BucketKind::Edge, chunk_world_bounds);
+                            let bucket = get_or_add_bucket(
+                                page,
+                                BucketKind::Edge,
+                                rep_elems,
+                                chunk_world_bounds,
+                            );
                             let edge_idx_flag = if page.indices().is_some() {
                                 FLAG_EDGE_INDEXED
+                            } else {
+                                0
+                            };
+                            let edge_rep_flag = if rep_elems != 0 {
+                                FLAG_EDGE_REPEATED
                             } else {
                                 0
                             };
                             if let Some(item_idx) = single_face_item
                                 && let Some(item) = items.get_mut(item_idx)
                             {
-                                item.flags |= FLAG_HAS_EDGES | edge_idx_flag;
+                                item.flags |= FLAG_HAS_EDGES | edge_idx_flag | edge_rep_flag;
                                 item.edge_bucket = bucket;
                                 item.edge_first = elements.start;
                                 item.edge_count = count;
@@ -778,6 +919,7 @@ impl GpuCullScene {
                                 let trusted = input.trusted && !input.local_bounds.is_empty();
                                 let flags = FLAG_HAS_EDGES
                                     | edge_idx_flag
+                                    | edge_rep_flag
                                     | if trusted { FLAG_TRUSTED } else { 0 };
                                 items.push(ChunkCullItem {
                                     local_min: input.local_bounds.min.to_f32(),
@@ -811,16 +953,39 @@ impl GpuCullScene {
             return None;
         }
 
-        // Assign contiguous non-overlapping indirect buffer ranges per bucket.
+        // Assign repeated buckets to the front [0..repeated_*_count] (1 indirect draw each +
+        // compacted instance slice), then assign non-repeated multi-draw indirect ranges after them.
         let mut total_indexed = 0u32;
         let mut total_non_indexed = 0u32;
+        let mut repeated_indexed_count = 0u32;
+        let mut repeated_non_indexed_count = 0u32;
+        let mut total_repeated_instances = 0u32;
+
         for bucket in &mut buckets {
-            if bucket.indexed {
-                bucket.indirect_base = total_indexed;
-                total_indexed = total_indexed.saturating_add(bucket.max_draws);
-            } else {
-                bucket.indirect_base = total_non_indexed;
-                total_non_indexed = total_non_indexed.saturating_add(bucket.max_draws);
+            if bucket.repeated_elements != 0 {
+                if bucket.indexed {
+                    bucket.indirect_base = total_indexed;
+                    total_indexed = total_indexed.saturating_add(1);
+                    repeated_indexed_count = repeated_indexed_count.saturating_add(1);
+                } else {
+                    bucket.indirect_base = total_non_indexed;
+                    total_non_indexed = total_non_indexed.saturating_add(1);
+                    repeated_non_indexed_count = repeated_non_indexed_count.saturating_add(1);
+                }
+                bucket.instance_base = total_repeated_instances;
+                total_repeated_instances =
+                    total_repeated_instances.saturating_add(bucket.max_draws);
+            }
+        }
+        for bucket in &mut buckets {
+            if bucket.repeated_elements == 0 {
+                if bucket.indexed {
+                    bucket.indirect_base = total_indexed;
+                    total_indexed = total_indexed.saturating_add(bucket.max_draws);
+                } else {
+                    bucket.indirect_base = total_non_indexed;
+                    total_non_indexed = total_non_indexed.saturating_add(bucket.max_draws);
+                }
             }
         }
 
@@ -828,12 +993,22 @@ impl GpuCullScene {
             if (item.flags & FLAG_HAS_FACES) != 0
                 && let Some(bucket) = buckets.get(item.face_bucket as usize)
             {
-                item.face_indirect_base = bucket.indirect_base;
+                if (item.flags & FLAG_FACE_REPEATED) != 0 {
+                    item.face_first = bucket.indirect_base;
+                    item.face_indirect_base = bucket.instance_base;
+                } else {
+                    item.face_indirect_base = bucket.indirect_base;
+                }
             }
             if (item.flags & FLAG_HAS_EDGES) != 0
                 && let Some(bucket) = buckets.get(item.edge_bucket as usize)
             {
-                item.edge_indirect_base = bucket.indirect_base;
+                if (item.flags & FLAG_EDGE_REPEATED) != 0 {
+                    item.edge_first = bucket.indirect_base;
+                    item.edge_indirect_base = bucket.instance_base;
+                } else {
+                    item.edge_indirect_base = bucket.indirect_base;
+                }
             }
         }
 
@@ -853,6 +1028,9 @@ impl GpuCullScene {
             item_count,
             total_indexed,
             total_non_indexed,
+            repeated_indexed_count,
+            repeated_non_indexed_count,
+            total_repeated_instances,
             has_edges,
             extra_chunks,
             items_buf,
@@ -869,7 +1047,7 @@ impl GpuCullScene {
         pipelines: &PaintPipelines<'_>,
     ) {
         let mut group_bound = false;
-        let mut active_flat: Option<bool> = None;
+        let mut active_pipeline: Option<(bool, bool)> = None;
 
         for &bucket_idx in &view.opaque_order {
             let Some(bucket) = self.buckets.get(bucket_idx) else {
@@ -878,45 +1056,16 @@ impl GpuCullScene {
             if bucket.max_draws == 0 {
                 continue;
             }
-            if !group_bound {
-                pass.set_bind_group(1, storage_bg, &[]);
-                group_bound = true;
-            }
-            let use_flat = bucket.flat && pipelines.flat.is_some();
-            if active_flat != Some(use_flat) {
-                let pipeline = if use_flat {
-                    pipelines.flat.unwrap_or(pipelines.smooth)
-                } else {
-                    pipelines.smooth
-                };
-                pass.set_pipeline(pipeline);
-                active_flat = Some(use_flat);
-            }
-            let slot_binding = bucket.page.bind_vertices(pass);
-            pass.set_vertex_buffer(slot_binding, bucket.page.slots().slice(..));
-            let count_offset = (bucket_idx as u64).saturating_mul(4);
-            if let Some(indices) = bucket.page.indices() {
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
-                let indirect_offset =
-                    u64::from(bucket.indirect_base).saturating_mul(DRAW_INDEXED_STRIDE);
-                pass.multi_draw_indexed_indirect_count(
-                    &view.indexed_args_buf,
-                    indirect_offset,
-                    &view.bucket_counts_buf,
-                    count_offset,
-                    bucket.max_draws,
-                );
-            } else {
-                let indirect_offset =
-                    u64::from(bucket.indirect_base).saturating_mul(DRAW_NON_INDEXED_STRIDE);
-                pass.multi_draw_indirect_count(
-                    &view.non_indexed_args_buf,
-                    indirect_offset,
-                    &view.bucket_counts_buf,
-                    count_offset,
-                    bucket.max_draws,
-                );
-            }
+            Self::paint_one_bucket(
+                pass,
+                view,
+                storage_bg,
+                pipelines,
+                bucket_idx,
+                bucket,
+                &mut group_bound,
+                &mut active_pipeline,
+            );
         }
     }
 
@@ -927,7 +1076,7 @@ impl GpuCullScene {
         view: &GpuCullView,
         storage_bg: &wgpu::BindGroup,
         face_pipelines: &PaintPipelines<'_>,
-        edge_pipeline: &wgpu::RenderPipeline,
+        edge_pipelines: &PaintPipelines<'_>,
     ) {
         self.paint_buckets(
             pass,
@@ -944,14 +1093,7 @@ impl GpuCullScene {
             BucketKind::TranslucentFace,
         );
         if self.has_edges {
-            let edge_pipes = PaintPipelines {
-                smooth: edge_pipeline,
-                flat: None,
-                repeated_smooth: None,
-                repeated_flat: None,
-                repeated_slots: None,
-            };
-            self.paint_buckets(pass, view, storage_bg, &edge_pipes, BucketKind::Edge);
+            self.paint_buckets(pass, view, storage_bg, edge_pipelines, BucketKind::Edge);
         }
     }
 
@@ -964,27 +1106,86 @@ impl GpuCullScene {
         target_kind: BucketKind,
     ) {
         let mut group_bound = false;
-        let mut active_flat: Option<bool> = None;
+        let mut active_pipeline: Option<(bool, bool)> = None;
 
         for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
             if bucket.kind != target_kind || bucket.max_draws == 0 {
                 continue;
             }
-            if !group_bound {
-                pass.set_bind_group(1, storage_bg, &[]);
-                group_bound = true;
+            Self::paint_one_bucket(
+                pass,
+                view,
+                storage_bg,
+                pipelines,
+                bucket_idx,
+                bucket,
+                &mut group_bound,
+                &mut active_pipeline,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_one_bucket(
+        pass: &mut wgpu::RenderPass<'_>,
+        view: &GpuCullView,
+        storage_bg: &wgpu::BindGroup,
+        pipelines: &PaintPipelines<'_>,
+        bucket_idx: usize,
+        bucket: &GpuCullBucket,
+        group_bound: &mut bool,
+        active_pipeline: &mut Option<(bool, bool)>,
+    ) {
+        let is_repeated = bucket.repeated_elements != 0;
+        let use_flat = bucket.flat
+            && if is_repeated {
+                pipelines.repeated_flat.is_some()
+            } else {
+                pipelines.flat.is_some()
+            };
+        let pipeline = if is_repeated {
+            let Some(pl) = (if use_flat {
+                pipelines.repeated_flat.or(pipelines.repeated_smooth)
+            } else {
+                pipelines.repeated_smooth
+            }) else {
+                return;
+            };
+            pl
+        } else if use_flat {
+            pipelines.flat.unwrap_or(pipelines.smooth)
+        } else {
+            pipelines.smooth
+        };
+        if !*group_bound {
+            pass.set_bind_group(1, storage_bg, &[]);
+            *group_bound = true;
+        }
+        let key = (use_flat, is_repeated);
+        if *active_pipeline != Some(key) {
+            pass.set_pipeline(pipeline);
+            *active_pipeline = Some(key);
+        }
+        let slot_binding = bucket.page.bind_vertices(pass);
+        if is_repeated {
+            let byte_start = u64::from(bucket.instance_base).saturating_mul(4);
+            let byte_end =
+                u64::from(bucket.instance_base.saturating_add(bucket.max_draws)).saturating_mul(4);
+            pass.set_vertex_buffer(
+                slot_binding,
+                view.repeated_instances_buf.slice(byte_start..byte_end),
+            );
+            if let Some(indices) = bucket.page.indices() {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                let indirect_offset =
+                    u64::from(bucket.indirect_base).saturating_mul(DRAW_INDEXED_STRIDE);
+                pass.draw_indexed_indirect(&view.indexed_args_buf, indirect_offset);
+            } else {
+                let indirect_offset =
+                    u64::from(bucket.indirect_base).saturating_mul(DRAW_NON_INDEXED_STRIDE);
+                pass.draw_indirect(&view.non_indexed_args_buf, indirect_offset);
             }
-            let use_flat = bucket.flat && pipelines.flat.is_some();
-            if active_flat != Some(use_flat) {
-                let pipeline = if use_flat {
-                    pipelines.flat.unwrap_or(pipelines.smooth)
-                } else {
-                    pipelines.smooth
-                };
-                pass.set_pipeline(pipeline);
-                active_flat = Some(use_flat);
-            }
-            let slot_binding = bucket.page.bind_vertices(pass);
+        } else {
             pass.set_vertex_buffer(slot_binding, bucket.page.slots().slice(..));
             let count_offset = (bucket_idx as u64).saturating_mul(4);
             if let Some(indices) = bucket.page.indices() {
@@ -1022,6 +1223,7 @@ pub(crate) struct GpuCullView {
     indexed_args_buf: wgpu::Buffer,
     non_indexed_args_buf: wgpu::Buffer,
     bucket_counts_buf: wgpu::Buffer,
+    repeated_instances_buf: wgpu::Buffer,
     group0_bg: wgpu::BindGroup,
     cached_hiz: Option<(u64, wgpu::BindGroup)>,
     opaque_order: Vec<usize>,
@@ -1061,14 +1263,18 @@ impl GpuCullView {
             let indexed_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("iletki-3d gpu cull indexed args"),
                 size: u64::from(scene.total_indexed.max(1)).saturating_mul(DRAW_INDEXED_STRIDE),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let non_indexed_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("iletki-3d gpu cull non-indexed args"),
                 size: u64::from(scene.total_non_indexed.max(1))
                     .saturating_mul(DRAW_NON_INDEXED_STRIDE),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let count_words =
@@ -1081,6 +1287,12 @@ impl GpuCullView {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            let repeated_instances_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iletki-3d gpu cull repeated instances"),
+                size: u64::from(scene.total_repeated_instances.max(1)).saturating_mul(4),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            });
             let group0_bg = make_group0_bg(
                 device,
                 &pipelines.group0_layout,
@@ -1091,6 +1303,7 @@ impl GpuCullView {
                 &indexed_args_buf,
                 &non_indexed_args_buf,
                 &bucket_counts_buf,
+                &repeated_instances_buf,
             );
             let mut opaque_order: Vec<usize> = scene
                 .buckets
@@ -1113,6 +1326,7 @@ impl GpuCullView {
                 indexed_args_buf,
                 non_indexed_args_buf,
                 bucket_counts_buf,
+                repeated_instances_buf,
                 group0_bg,
                 cached_hiz: None,
                 opaque_order,
@@ -1140,10 +1354,31 @@ impl GpuCullView {
                 &view.indexed_args_buf,
                 &view.non_indexed_args_buf,
                 &view.bucket_counts_buf,
+                &view.repeated_instances_buf,
             );
             view.transforms_generation = transforms.generation();
         }
         Some(view)
+    }
+
+    fn clear_repeated_args(&self, encoder: &mut wgpu::CommandEncoder, scene: &GpuCullScene) {
+        if scene.repeated_indexed_count != 0 {
+            encoder.clear_buffer(
+                &self.indexed_args_buf,
+                0,
+                Some(u64::from(scene.repeated_indexed_count).saturating_mul(DRAW_INDEXED_STRIDE)),
+            );
+        }
+        if scene.repeated_non_indexed_count != 0 {
+            encoder.clear_buffer(
+                &self.non_indexed_args_buf,
+                0,
+                Some(
+                    u64::from(scene.repeated_non_indexed_count)
+                        .saturating_mul(DRAW_NON_INDEXED_STRIDE),
+                ),
+            );
+        }
     }
 
     pub(crate) fn encode_phase1(
@@ -1153,6 +1388,7 @@ impl GpuCullView {
         scene: &GpuCullScene,
     ) {
         encoder.clear_buffer(&self.bucket_counts_buf, 0, None);
+        self.clear_repeated_args(encoder, scene);
         let item_wgs = scene.item_count.div_ceil(64);
         let bucket_wgs = scene.bucket_count.div_ceil(64);
         {
@@ -1206,6 +1442,7 @@ impl GpuCullView {
         hiz_generation: u64,
     ) {
         encoder.clear_buffer(&self.bucket_counts_buf, 0, None);
+        self.clear_repeated_args(encoder, scene);
         let rebuild_hiz_bg = self
             .cached_hiz
             .as_ref()
@@ -1224,20 +1461,34 @@ impl GpuCullView {
         let Some((_, hiz_bg)) = &self.cached_hiz else {
             return;
         };
-        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        let gpu_timer = iletki_wgpu::profiling::pass("iletki gpu cull p2");
-        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.compute_writes());
-        #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
-        let timestamp_writes = None;
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("iletki-3d gpu cull phase2"),
-            timestamp_writes,
-        });
-        pass.set_pipeline(&pipelines.phase2_pipeline);
-        pass.set_bind_group(0, &self.group0_bg, &[]);
-        pass.set_bind_group(1, hiz_bg, &[]);
-        pass.dispatch_workgroups(scene.item_count.div_ceil(64), 1, 1);
+        {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let gpu_timer = iletki_wgpu::profiling::pass("iletki gpu cull p2");
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.compute_writes());
+            #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+            let timestamp_writes = None;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("iletki-3d gpu cull phase2"),
+                timestamp_writes,
+            });
+            pass.set_pipeline(&pipelines.phase2_pipeline);
+            pass.set_bind_group(0, &self.group0_bg, &[]);
+            pass.set_bind_group(1, hiz_bg, &[]);
+            pass.dispatch_workgroups(scene.item_count.div_ceil(64), 1, 1);
+        }
+        if scene.has_repeated() {
+            let count = scene
+                .repeated_indexed_count
+                .max(scene.repeated_non_indexed_count);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("iletki-3d gpu cull phase2 finalize"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipelines.phase2_finalize_pipeline);
+            pass.set_bind_group(0, &self.group0_bg, &[]);
+            pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+        }
     }
 }
 
@@ -1276,6 +1527,7 @@ fn make_group0_bg(
     indexed_args_buf: &wgpu::Buffer,
     non_indexed_args_buf: &wgpu::Buffer,
     bucket_counts_buf: &wgpu::Buffer,
+    repeated_instances_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("iletki-3d gpu cull group0 binding"),
@@ -1308,6 +1560,10 @@ fn make_group0_bg(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: bucket_counts_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: repeated_instances_buf.as_entire_binding(),
             },
         ],
     })

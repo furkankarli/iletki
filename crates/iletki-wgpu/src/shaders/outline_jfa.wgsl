@@ -9,7 +9,9 @@ struct JfaStepParams {
     _pad: u32,
     color: vec4<f32>,
     active_px: vec2<f32>,
-    _pad2: vec2<f32>,
+    rect_min: vec2<i32>,
+    rect_max: vec2<i32>,
+    _pad2: vec2<i32>,
 };
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -59,7 +61,6 @@ fn fs_seed(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
 @fragment
 fn fs_step(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
     let center = vec2<i32>(pos.xy);
-    let max_c = vec2<i32>(params.active_px) - vec2<i32>(1, 1);
     let step = i32(params.step_px);
 
     var best_seed = NO_SEED;
@@ -67,7 +68,7 @@ fn fs_step(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
 
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            let sc = clamp(center + vec2<i32>(dx * step, dy * step), vec2<i32>(0, 0), max_c);
+            let sc = clamp(center + vec2<i32>(dx * step, dy * step), params.rect_min, params.rect_max);
             let seed = textureLoad(src_tex, sc, 0).rg;
             if (seed.x > NO_SEED.x) {
                 let d = seed + vec2<f32>(sc - center);

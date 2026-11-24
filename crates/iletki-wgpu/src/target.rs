@@ -169,14 +169,13 @@ pub(crate) struct TargetSet {
     format: wgpu::TextureFormat,
     msaa_samples: u32,
     depth_sampleable: bool,
+    can_copy_output: bool,
     msaa_view: Option<wgpu::TextureView>,
     depth_view: wgpu::TextureView,
-    #[cfg(not(target_arch = "wasm32"))]
     static_texture: wgpu::Texture,
     static_view: wgpu::TextureView,
     static_identity_bg: wgpu::BindGroup,
     static_crop_bg: wgpu::BindGroup,
-    #[cfg(not(target_arch = "wasm32"))]
     output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     output_crop_bg: wgpu::BindGroup,
@@ -274,6 +273,15 @@ impl TargetSet {
         let single_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC;
+        let can_copy_output = format
+            .guaranteed_format_features(device.features())
+            .allowed_usages
+            .contains(wgpu::TextureUsages::COPY_DST);
+        let output_usage = if can_copy_output {
+            single_usage | wgpu::TextureUsages::COPY_DST
+        } else {
+            single_usage
+        };
 
         let static_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iletki static cache"),
@@ -296,7 +304,7 @@ impl TargetSet {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: single_usage,
+            usage: output_usage,
             view_formats: &[],
         });
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -307,14 +315,13 @@ impl TargetSet {
             format,
             msaa_samples,
             depth_sampleable,
+            can_copy_output,
             msaa_view,
             depth_view,
-            #[cfg(not(target_arch = "wasm32"))]
             static_texture,
             static_view,
             static_identity_bg,
             static_crop_bg,
-            #[cfg(not(target_arch = "wasm32"))]
             output_texture,
             output_view,
             output_crop_bg,
@@ -341,6 +348,10 @@ impl TargetSet {
         self.depth_sampleable
     }
 
+    pub(crate) const fn can_copy_output(&self) -> bool {
+        self.can_copy_output
+    }
+
     /// Returns `(color_attachment_view, resolve_target)` targeting the static cache texture.
     pub(crate) fn static_color_views(&self) -> (&wgpu::TextureView, Option<&wgpu::TextureView>) {
         match &self.msaa_view {
@@ -357,7 +368,6 @@ impl TargetSet {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn static_texture(&self) -> &wgpu::Texture {
         &self.static_texture
     }
@@ -374,7 +384,6 @@ impl TargetSet {
         &self.static_crop_bg
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn output_texture(&self) -> &wgpu::Texture {
         &self.output_texture
     }

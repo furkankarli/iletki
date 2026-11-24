@@ -1,8 +1,16 @@
 //! Immutable vertex/index pages and per-viewport draw ranges.
 
 use crate::{Vertex3D, scene::ObjectUniforms};
+use bytemuck::{Pod, Zeroable};
 use iletki_wgpu::wgpu::{self, util::DeviceExt};
 use std::{num::NonZeroU64, ops::Range, sync::Arc};
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadeAttributes {
+    normal: [f32; 3],
+    color: [u8; 4],
+}
 
 // The matching WGSL uniform array is 4 KiB, within the WebGPU uniform binding limit.
 pub(crate) const OBJECTS: usize = 256;
@@ -40,8 +48,8 @@ impl VertexLayout {
         use wgpu::{VertexBufferLayout, VertexStepMode::Vertex};
         const INTERLEAVED: [wgpu::VertexAttribute; 3] =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4];
-        const NORMAL: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![1 => Float32x3];
-        const COLOR: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Unorm8x4];
+        const SHADE_ATTRS: [wgpu::VertexAttribute; 2] =
+            wgpu::vertex_attr_array![1 => Float32x3, 2 => Unorm8x4];
         match self {
             Self::Interleaved => vec![Some(VertexBufferLayout {
                 array_stride: size_of::<Vertex3D>() as u64,
@@ -55,14 +63,9 @@ impl VertexLayout {
                     attributes: &POSITION,
                 }),
                 Some(VertexBufferLayout {
-                    array_stride: size_of::<[f32; 3]>() as u64,
+                    array_stride: size_of::<ShadeAttributes>() as u64,
                     step_mode: Vertex,
-                    attributes: &NORMAL,
-                }),
-                Some(VertexBufferLayout {
-                    array_stride: size_of::<[u8; 4]>() as u64,
-                    step_mode: Vertex,
-                    attributes: &COLOR,
+                    attributes: &SHADE_ATTRS,
                 }),
             ],
         }
@@ -86,7 +89,7 @@ impl VertexLayout {
 
 pub(crate) enum VertexBuffers {
     Interleaved(wgpu::Buffer),
-    Separate([wgpu::Buffer; 3]),
+    Separate([wgpu::Buffer; 2]),
 }
 
 impl VertexBuffers {
@@ -109,17 +112,17 @@ impl VertexBuffers {
             )),
             VertexLayout::Separate => {
                 let mut positions = Vec::with_capacity(vertices.len());
-                let mut normals = Vec::with_capacity(vertices.len());
-                let mut colors = Vec::with_capacity(vertices.len());
+                let mut attrs = Vec::with_capacity(vertices.len());
                 for vertex in vertices {
                     positions.push(vertex.position);
-                    normals.push(vertex.normal);
-                    colors.push(vertex.color);
+                    attrs.push(ShadeAttributes {
+                        normal: vertex.normal,
+                        color: vertex.color,
+                    });
                 }
                 Self::Separate([
                     buffer("iletki-3d positions", bytemuck::cast_slice(&positions)),
-                    buffer("iletki-3d normals", bytemuck::cast_slice(&normals)),
-                    buffer("iletki-3d colors", bytemuck::cast_slice(&colors)),
+                    buffer("iletki-3d shade attrs", bytemuck::cast_slice(&attrs)),
                 ])
             }
         }
@@ -129,7 +132,7 @@ impl VertexBuffers {
         let (buffer, layout) = match self {
             Self::Interleaved(buffer) => (buffer, VertexLayout::Interleaved),
             Self::Separate(buffers) => {
-                let [positions, ..] = buffers;
+                let [positions, _] = buffers;
                 (positions, VertexLayout::Separate)
             }
         };
@@ -142,10 +145,15 @@ impl VertexBuffers {
         match self {
             Self::Interleaved(_) => 1,
             Self::Separate(buffers) => {
-                let [_, normals, colors] = buffers;
-                bind_vertices(pass, 1, normals, size_of::<[f32; 3]>() as u64, vertices);
-                bind_vertices(pass, 2, colors, size_of::<[u8; 4]>() as u64, vertices);
-                3
+                let [_, attrs] = buffers;
+                bind_vertices(
+                    pass,
+                    1,
+                    attrs,
+                    size_of::<ShadeAttributes>() as u64,
+                    vertices,
+                );
+                2
             }
         }
     }

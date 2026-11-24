@@ -359,6 +359,10 @@ impl Trace {
         time.saturating_duration_since(self.epoch).as_nanos()
     }
 
+    pub(crate) fn start_replay(&mut self, now: Instant) {
+        self.next = now;
+    }
+
     pub(crate) fn tick(&mut self, now: Instant) -> Option<(u32, usize)> {
         if self.options.action == Action::Live || self.end.is_some() || now < self.next {
             return None;

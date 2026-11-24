@@ -8,6 +8,7 @@ use crate::face_batch::{GeometryPage, PageKind, PaintPipelines, VertexRange};
 use bytemuck::{Pod, Zeroable};
 use iletki_core::Vec3;
 use iletki_wgpu::wgpu;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
@@ -17,8 +18,13 @@ const MIN_TRANSFORM_CAPACITY: usize = 256;
 const MAX_SECTION_GAP_ELEMENTS: u32 = 256;
 // Safe range for Q32.32 signed differences without i32 overflow (+/- 536,870 km from anchor).
 const MAX_Q32_COORD: f64 = 536_870_912.0;
-// Merge nearby dirty transform writes (up to 256 entries = 8 KiB) to avoid many tiny queue writes.
-const DIRTY_SPAN_GAP: usize = 256;
+// Merge nearby dirty transform writes (up to 16 entries = 512 B) to avoid many tiny queue writes
+// without turning sparse strided edits into multi-megabyte uploads.
+const DIRTY_SPAN_GAP: usize = 16;
+// Threshold at which unordered masks pack into per-page multi-draw indirect buffers.
+const MIN_INDIRECT_DRAWS: usize = 32;
+const DRAW_INDEXED_STRIDE: u64 = 20;
+const DRAW_NON_INDEXED_STRIDE: u64 = 16;
 
 /// Per-viewport Q32.32 fixed-point camera origin relative to the scene anchor (`@group(1) @binding(1)`).
 #[repr(C)]
@@ -335,11 +341,87 @@ impl StorageViewBinding {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DrawIndexedIndirectArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DrawIndirectArgs {
+    vertex_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_instance: u32,
+}
+
+struct IndirectPageGroup {
+    geometry: Arc<GeometryPage>,
+    indexed: bool,
+    first_arg: u32,
+    arg_count: u32,
+}
+
+struct RepeatedMaskGroup {
+    geometry: Arc<GeometryPage>,
+    elements: u32,
+    indexed: bool,
+    first_instance: u32,
+    instance_count: u32,
+}
+
+#[derive(Default)]
+struct IndirectMaskState {
+    active: bool,
+    direct: Vec<usize>,
+    groups: Vec<IndirectPageGroup>,
+    indexed_args: Vec<DrawIndexedIndirectArgs>,
+    non_indexed_args: Vec<DrawIndirectArgs>,
+    indexed_buf: Option<wgpu::Buffer>,
+    indexed_capacity: usize,
+    non_indexed_buf: Option<wgpu::Buffer>,
+    non_indexed_capacity: usize,
+    // Instanced mask groups for repeated geometry pages (1 draw call per page).
+    rep_groups: Vec<RepeatedMaskGroup>,
+    rep_entries: Vec<(u32, u32)>,
+    rep_chunk_ids: Vec<u32>,
+    rep_counts: Vec<u32>,
+    rep_offsets: Vec<u32>,
+    rep_buf: Option<wgpu::Buffer>,
+    rep_capacity: usize,
+    // Reusable scratch for zero-per-chunk-Arc::clone unordered mask builds.
+    page_table: Vec<Arc<GeometryPage>>,
+    page_index: HashMap<usize, u32>,
+    raw_ranges: Vec<(u32, u32, u32)>,
+}
+
+impl IndirectMaskState {
+    fn reset(&mut self) {
+        self.active = false;
+        self.direct.clear();
+        self.groups.clear();
+        self.indexed_args.clear();
+        self.non_indexed_args.clear();
+        self.rep_groups.clear();
+        self.rep_entries.clear();
+        self.rep_chunk_ids.clear();
+        self.page_table.clear();
+        self.page_index.clear();
+        self.raw_ranges.clear();
+    }
+}
+
 /// Retained draw list for storage-buffer packed geometry (zero per-frame uniform copies).
 #[derive(Default)]
 pub(crate) struct StorageDraws {
     commands: Vec<StorageDraw>,
     section_gap_end: Option<u32>,
+    indirect: IndirectMaskState,
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     section_gap_vertices: usize,
 }
@@ -358,6 +440,7 @@ impl StorageDraws {
     pub(crate) fn clear(&mut self) {
         self.commands.clear();
         self.section_gap_end = None;
+        self.indirect.reset();
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         {
             self.section_gap_vertices = 0;
@@ -365,14 +448,25 @@ impl StorageDraws {
     }
 
     pub(crate) fn has_packed(&self) -> bool {
-        self.commands
-            .iter()
-            .any(|cmd| matches!(cmd, StorageDraw::Packed { .. }))
+        !self.indirect.rep_groups.is_empty()
+            || (self.indirect.active && !self.indirect.groups.is_empty())
+            || self
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, StorageDraw::Packed { .. }))
     }
 
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
     pub(crate) fn count(&self) -> usize {
-        self.commands.len()
+        let base = if self.indirect.active {
+            self.indirect
+                .direct
+                .len()
+                .saturating_add(self.indirect.groups.len())
+        } else {
+            self.commands.len()
+        };
+        base.saturating_add(self.indirect.rep_groups.len())
     }
 
     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -422,6 +516,7 @@ impl StorageDraws {
     }
 
     fn push_inner(&mut self, geometry: &VertexRange, draw_index: usize, repeat: bool) {
+        self.indirect.active = false;
         let gap_end = self.section_gap_end.take();
         let VertexRange::Packed {
             page,
@@ -478,6 +573,335 @@ impl StorageDraws {
         });
     }
 
+    /// Rebuilds an order-independent draw list directly from `(chunk_slot, geometry)` pairs without
+    /// per-chunk `Arc::clone` refcount traffic, coalesces contiguous ranges per geometry page, and
+    /// uploads per-page multi-draw indirect buffers when supported and worthwhile.
+    pub(crate) fn rebuild_unordered<'a>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        items: impl Iterator<Item = (usize, &'a VertexRange)>,
+    ) {
+        self.clear();
+        let mut last_ptr: usize = 0;
+        let mut last_page_idx: u32 = 0;
+
+        for (slot_index, geometry) in items {
+            match geometry {
+                VertexRange::Packed { page, elements, .. } => {
+                    let is_repeated =
+                        page.repeated_elements() != 0 && page.repeated_chunk_ids().is_some();
+                    if !is_repeated && elements.end <= elements.start {
+                        continue;
+                    }
+                    let ptr = Arc::as_ptr(page) as usize;
+                    let page_idx = if ptr == last_ptr {
+                        last_page_idx
+                    } else if let Some(&existing) = self.indirect.page_index.get(&ptr) {
+                        last_ptr = ptr;
+                        last_page_idx = existing;
+                        existing
+                    } else {
+                        let Ok(idx) = u32::try_from(self.indirect.page_table.len()) else {
+                            continue;
+                        };
+                        self.indirect.page_table.push(page.clone());
+                        self.indirect.page_index.insert(ptr, idx);
+                        last_ptr = ptr;
+                        last_page_idx = idx;
+                        idx
+                    };
+                    if is_repeated {
+                        if let Ok(slot_u32) = u32::try_from(slot_index) {
+                            self.indirect.rep_entries.push((page_idx, slot_u32));
+                        }
+                    } else {
+                        self.indirect
+                            .raw_ranges
+                            .push((page_idx, elements.start, elements.end));
+                    }
+                }
+                VertexRange::Direct(_) | VertexRange::DirectIndexed { .. } => {
+                    self.indirect.direct.push(slot_index);
+                }
+            }
+        }
+
+        // Pack repeated-page selections into one instanced draw per page using O(N) counting sort.
+        self.pack_repeated_entries(device, queue, None);
+
+        if self.indirect.raw_ranges.is_empty() {
+            for &slot in &self.indirect.direct {
+                self.commands.push(StorageDraw::Direct(slot));
+            }
+            self.indirect.direct.clear();
+            self.indirect.page_table.clear();
+            self.indirect.page_index.clear();
+            return;
+        }
+
+        // Sort flat 12-byte Copy triples (page_idx, start, end) and coalesce adjacent ranges.
+        self.indirect.raw_ranges.sort_unstable();
+        let mut write = 0usize;
+        for read in 0..self.indirect.raw_ranges.len() {
+            let Some(&(page_idx, start, end)) = self.indirect.raw_ranges.get(read) else {
+                continue;
+            };
+            if write > 0
+                && let Some((prev_page, _, prev_end)) = self.indirect.raw_ranges.get_mut(write - 1)
+                && *prev_page == page_idx
+                && start <= *prev_end
+            {
+                *prev_end = (*prev_end).max(end);
+            } else {
+                if let Some(dst) = self.indirect.raw_ranges.get_mut(write) {
+                    *dst = (page_idx, start, end);
+                }
+                write += 1;
+            }
+        }
+        self.indirect.raw_ranges.truncate(write);
+
+        let use_indirect = write >= MIN_INDIRECT_DRAWS
+            && device
+                .features()
+                .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+        if !use_indirect {
+            for &slot in &self.indirect.direct {
+                self.commands.push(StorageDraw::Direct(slot));
+            }
+            for &(page_idx, start, end) in &self.indirect.raw_ranges {
+                if let Some(page) = self.indirect.page_table.get(page_idx as usize) {
+                    self.commands.push(StorageDraw::Packed {
+                        geometry: page.clone(),
+                        elements: start..end,
+                        instances: None,
+                    });
+                }
+            }
+            self.indirect.direct.clear();
+            self.indirect.page_table.clear();
+            self.indirect.page_index.clear();
+            self.indirect.raw_ranges.clear();
+            return;
+        }
+
+        let mut active_page: Option<(u32, usize)> = None;
+        for &(page_idx, start, end) in &self.indirect.raw_ranges {
+            let count = end.saturating_sub(start);
+            if count == 0 {
+                continue;
+            }
+            let Some(page) = self.indirect.page_table.get(page_idx as usize) else {
+                continue;
+            };
+            let indexed = page.indices().is_some();
+            let arg_index = if indexed {
+                let Ok(idx) = u32::try_from(self.indirect.indexed_args.len()) else {
+                    self.indirect.reset();
+                    return;
+                };
+                self.indirect.indexed_args.push(DrawIndexedIndirectArgs {
+                    index_count: count,
+                    instance_count: 1,
+                    first_index: start,
+                    base_vertex: 0,
+                    first_instance: 0,
+                });
+                idx
+            } else {
+                let Ok(idx) = u32::try_from(self.indirect.non_indexed_args.len()) else {
+                    self.indirect.reset();
+                    return;
+                };
+                self.indirect.non_indexed_args.push(DrawIndirectArgs {
+                    vertex_count: count,
+                    instance_count: 1,
+                    first_vertex: start,
+                    first_instance: 0,
+                });
+                idx
+            };
+            if let Some((prev_page, group_idx)) = active_page
+                && prev_page == page_idx
+                && let Some(group) = self.indirect.groups.get_mut(group_idx)
+            {
+                group.arg_count = group.arg_count.saturating_add(1);
+            } else {
+                let group_idx = self.indirect.groups.len();
+                self.indirect.groups.push(IndirectPageGroup {
+                    geometry: page.clone(),
+                    indexed,
+                    first_arg: arg_index,
+                    arg_count: 1,
+                });
+                active_page = Some((page_idx, group_idx));
+            }
+        }
+        self.indirect.page_table.clear();
+        self.indirect.page_index.clear();
+        self.indirect.raw_ranges.clear();
+
+        if self.indirect.groups.is_empty() {
+            for &slot in &self.indirect.direct {
+                self.commands.push(StorageDraw::Direct(slot));
+            }
+            self.indirect.reset();
+            return;
+        }
+
+        if !self.indirect.indexed_args.is_empty() {
+            let needed = self.indirect.indexed_args.len();
+            if self.indirect.indexed_buf.is_none() || self.indirect.indexed_capacity < needed {
+                let capacity = needed.max(64).next_power_of_two();
+                let byte_size = (capacity as u64).saturating_mul(DRAW_INDEXED_STRIDE);
+                self.indirect.indexed_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iletki-3d mask indirect indexed args"),
+                    size: byte_size,
+                    usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.indirect.indexed_capacity = capacity;
+            }
+            if let Some(buf) = &self.indirect.indexed_buf {
+                queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.indirect.indexed_args));
+            }
+        }
+
+        if !self.indirect.non_indexed_args.is_empty() {
+            let needed = self.indirect.non_indexed_args.len();
+            if self.indirect.non_indexed_buf.is_none()
+                || self.indirect.non_indexed_capacity < needed
+            {
+                let capacity = needed.max(64).next_power_of_two();
+                let byte_size = (capacity as u64).saturating_mul(DRAW_NON_INDEXED_STRIDE);
+                self.indirect.non_indexed_buf =
+                    Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("iletki-3d mask indirect args"),
+                        size: byte_size,
+                        usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                self.indirect.non_indexed_capacity = capacity;
+            }
+            if let Some(buf) = &self.indirect.non_indexed_buf {
+                queue.write_buffer(
+                    buf,
+                    0,
+                    bytemuck::cast_slice(&self.indirect.non_indexed_args),
+                );
+            }
+        }
+
+        self.indirect.active = true;
+    }
+
+    /// Fast-path mask rebuild for pre-indexed `(repeated_page_idx, chunk_slot)` entries with zero
+    /// `HashMap` lookups or per-chunk `GeometryPage` dereferences.
+    pub(crate) fn rebuild_repeated_only(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pages: &[Arc<GeometryPage>],
+        entries: impl Iterator<Item = (u32, u32)>,
+    ) {
+        self.clear();
+        if pages.len() == 1
+            && let Some(page) = pages.first()
+        {
+            self.indirect
+                .rep_chunk_ids
+                .extend(entries.map(|(_, slot)| slot));
+            if let Ok(count) = u32::try_from(self.indirect.rep_chunk_ids.len())
+                && count > 0
+            {
+                self.indirect.rep_groups.push(RepeatedMaskGroup {
+                    geometry: page.clone(),
+                    elements: page.repeated_elements(),
+                    indexed: page.indices().is_some(),
+                    first_instance: 0,
+                    instance_count: count,
+                });
+                self.upload_repeated_instances(device, queue);
+            }
+            return;
+        }
+        self.indirect.rep_entries.extend(entries);
+        self.pack_repeated_entries(device, queue, Some(pages));
+    }
+
+    fn upload_repeated_instances(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.indirect.rep_chunk_ids.is_empty() {
+            return;
+        }
+        let needed = self.indirect.rep_chunk_ids.len();
+        if self.indirect.rep_buf.is_none() || self.indirect.rep_capacity < needed {
+            let capacity = needed.max(256).next_power_of_two();
+            let byte_size = (capacity as u64).saturating_mul(4);
+            self.indirect.rep_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iletki-3d repeated mask instances"),
+                size: byte_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.indirect.rep_capacity = capacity;
+        }
+        if let Some(buf) = &self.indirect.rep_buf {
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.indirect.rep_chunk_ids));
+        }
+    }
+
+    fn pack_repeated_entries(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        external_pages: Option<&[Arc<GeometryPage>]>,
+    ) {
+        if self.indirect.rep_entries.is_empty() {
+            return;
+        }
+        let pages = external_pages.unwrap_or(&self.indirect.page_table);
+        let num_pages = pages.len();
+        self.indirect.rep_counts.clear();
+        self.indirect.rep_counts.resize(num_pages, 0);
+        for &(page_idx, _) in &self.indirect.rep_entries {
+            if let Some(c) = self.indirect.rep_counts.get_mut(page_idx as usize) {
+                *c = c.saturating_add(1);
+            }
+        }
+        self.indirect.rep_offsets.clear();
+        self.indirect.rep_offsets.resize(num_pages, 0);
+        let mut running: u32 = 0;
+        for (page_idx, &count) in self.indirect.rep_counts.iter().enumerate() {
+            if let Some(off) = self.indirect.rep_offsets.get_mut(page_idx) {
+                *off = running;
+            }
+            if count > 0
+                && let Some(page) = pages.get(page_idx)
+            {
+                self.indirect.rep_groups.push(RepeatedMaskGroup {
+                    geometry: page.clone(),
+                    elements: page.repeated_elements(),
+                    indexed: page.indices().is_some(),
+                    first_instance: running,
+                    instance_count: count,
+                });
+                running = running.saturating_add(count);
+            }
+        }
+        self.indirect.rep_chunk_ids.resize(running as usize, 0);
+        for &(page_idx, chunk_slot) in &self.indirect.rep_entries {
+            if let Some(cursor) = self.indirect.rep_offsets.get_mut(page_idx as usize) {
+                if let Some(dst) = self.indirect.rep_chunk_ids.get_mut(*cursor as usize) {
+                    *dst = chunk_slot;
+                }
+                *cursor = cursor.saturating_add(1);
+            }
+        }
+        self.indirect.rep_entries.clear();
+        self.upload_repeated_instances(device, queue);
+    }
+
     /// Replays the retained draw list into `pass` with a single `@group(1)` storage binding.
     pub(crate) fn paint(
         &self,
@@ -485,8 +909,107 @@ impl StorageDraws {
         storage_bg: &wgpu::BindGroup,
         pipelines: &PaintPipelines<'_>,
         picking: bool,
+        direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
+    ) {
+        self.paint_inner(pass, storage_bg, pipelines, picking, picking, direct);
+    }
+
+    /// Replays the retained draw list binding only position (`@location(0)`) and chunk slot
+    /// (`@location(3)`), avoiding normal/color vertex-stream binds and fetches in mask passes.
+    pub(crate) fn paint_position_only(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        storage_bg: &wgpu::BindGroup,
+        pipeline: &wgpu::RenderPipeline,
+        repeated_pipeline: Option<&wgpu::RenderPipeline>,
+        direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
+    ) {
+        if !self.indirect.rep_groups.is_empty()
+            && let (Some(rep_pl), Some(rep_buf)) =
+                (repeated_pipeline, self.indirect.rep_buf.as_ref())
+        {
+            pass.set_bind_group(1, storage_bg, &[]);
+            pass.set_pipeline(rep_pl);
+            for group in &self.indirect.rep_groups {
+                group.geometry.bind_position(pass);
+                let byte_start = u64::from(group.first_instance).saturating_mul(4);
+                let byte_end = u64::from(group.first_instance.saturating_add(group.instance_count))
+                    .saturating_mul(4);
+                pass.set_vertex_buffer(1, rep_buf.slice(byte_start..byte_end));
+                if group.indexed {
+                    if let Some(indices) = group.geometry.indices() {
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                        pass.draw_indexed(0..group.elements, 0, 0..group.instance_count);
+                    }
+                } else {
+                    pass.draw(0..group.elements, 0..group.instance_count);
+                }
+            }
+        }
+        let pipelines = PaintPipelines {
+            smooth: pipeline,
+            flat: None,
+            repeated_smooth: None,
+            repeated_flat: None,
+            repeated_slots: None,
+        };
+        self.paint_inner(pass, storage_bg, &pipelines, true, false, direct);
+    }
+
+    fn paint_inner(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        storage_bg: &wgpu::BindGroup,
+        pipelines: &PaintPipelines<'_>,
+        position_only: bool,
+        picking: bool,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
+        if self.indirect.active && !picking {
+            for &index in &self.indirect.direct {
+                direct(pass, index);
+            }
+            if !self.indirect.groups.is_empty() {
+                pass.set_bind_group(1, storage_bg, &[]);
+                let mut active_flat: Option<bool> = None;
+                for group in &self.indirect.groups {
+                    let use_flat =
+                        group.geometry.kind() == PageKind::IndexedFlat && pipelines.flat.is_some();
+                    if active_flat != Some(use_flat) {
+                        let pipeline = if use_flat {
+                            pipelines.flat.unwrap_or(pipelines.smooth)
+                        } else {
+                            pipelines.smooth
+                        };
+                        pass.set_pipeline(pipeline);
+                        active_flat = Some(use_flat);
+                    }
+                    let slot_binding = if position_only {
+                        group.geometry.bind_position(pass);
+                        1
+                    } else {
+                        group.geometry.bind_vertices(pass)
+                    };
+                    pass.set_vertex_buffer(slot_binding, group.geometry.slots().slice(..));
+                    if group.indexed {
+                        if let (Some(indices), Some(buf)) =
+                            (group.geometry.indices(), self.indirect.indexed_buf.as_ref())
+                        {
+                            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                            let offset =
+                                u64::from(group.first_arg).saturating_mul(DRAW_INDEXED_STRIDE);
+                            pass.multi_draw_indexed_indirect(buf, offset, group.arg_count);
+                        }
+                    } else if let Some(buf) = self.indirect.non_indexed_buf.as_ref() {
+                        let offset =
+                            u64::from(group.first_arg).saturating_mul(DRAW_NON_INDEXED_STRIDE);
+                        pass.multi_draw_indirect(buf, offset, group.arg_count);
+                    }
+                }
+            }
+            return;
+        }
+
         let mut group_bound = false;
         let mut bound_page: Option<(*const GeometryPage, bool)> = None;
 
@@ -532,7 +1055,7 @@ impl StorageDraws {
                             pass.set_pipeline(pipeline);
                             geometry.slots()
                         };
-                        let slot_binding = if picking {
+                        let slot_binding = if position_only {
                             geometry.bind_position(pass);
                             1
                         } else {

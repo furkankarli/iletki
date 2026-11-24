@@ -1387,6 +1387,47 @@ impl ViewportHost {
         paint_ctx: &PaintCtx<'_, W>,
         stats: &mut FrameStats,
     ) {
+        let has_gizmo_or_overlay = layers.iter().any(|l| {
+            let m = l.phases();
+            m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
+        });
+        if !has_gizmo_or_overlay
+            && let (Some(rect), Some(outline)) = (outline_rect, &self.outline)
+            && self.targets.can_copy_output()
+        {
+            // Fast 1x outline-only path: copy the resolved static cache directly into the output
+            // texture and alpha-blend the Jump-Flood outline halo in 1x without clearing, blitting
+            // or resolving the 4x MSAA color/depth targets.
+            encoder.copy_texture_to_texture(
+                self.targets.static_texture().as_image_copy(),
+                self.targets.output_texture().as_image_copy(),
+                wgpu::Extent3d {
+                    width: aw,
+                    height: ah,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let gpu_timer = crate::trace::pass("iletki outline composite 1x");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iletki outline composite 1x"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.targets.output_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            outline.composite_into_pass_1x(&mut pass, rect);
+            return;
+        }
+
         let (color_view, resolve_target) = self.targets.output_color_views();
         let gpu_timer = crate::trace::pass("iletki dynamic overlay");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

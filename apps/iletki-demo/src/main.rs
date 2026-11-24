@@ -48,7 +48,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
-const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
+const PICK_POLL_INTERVAL: Duration = Duration::from_micros(150);
 const MAX_MOVING_PREVIEW_AGE: Duration = Duration::from_millis(50);
 const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
 
@@ -207,6 +207,9 @@ struct GpuState {
     chunk_by_object: HashMap<u32, usize>,
     committed_selection: HashSet<Chunk3DId>,
     visible_selection: HashSet<Chunk3DId>,
+    slot_preview_active: bool,
+    visible_slot_preview: Vec<(u32, Chunk3DId)>,
+    next_slot_preview: Vec<(u32, Chunk3DId)>,
     preview_view: Option<(PickView, Instant)>,
     grid_3d: InfiniteGrid3DLayer,
     gizmo_3d: TransformGizmoLayer,
@@ -234,9 +237,11 @@ struct GpuState {
     latency: Option<latency::Trace>,
     #[cfg(feature = "profiling")]
     pick_profile: bool,
+    no_mrt_preview: bool,
     bench_fit: Option<(Vec3, f64)>,
     bench_edits: Vec<(Chunk3DId, Vec3)>,
     bench_dual: bool,
+    initial_streaming_done: bool,
     last_pick_text: String,
     timing_samples: u8,
     title_updated_at: Instant,
@@ -269,6 +274,7 @@ impl GpuState {
         let features = wgpu::Features::CLIP_DISTANCES | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         #[cfg(feature = "profiling")]
         let pick_profile = std::env::var_os("ILETKI_PICK_PROFILE").is_some();
+        let no_mrt_preview = std::env::var_os("ILETKI_NO_MRT_PREVIEW").is_some();
         #[cfg(feature = "profiling")]
         let features = if pick_profile {
             features | wgpu::Features::TIMESTAMP_QUERY
@@ -448,6 +454,9 @@ impl GpuState {
             chunk_by_object,
             committed_selection,
             visible_selection,
+            slot_preview_active: false,
+            visible_slot_preview: Vec::new(),
+            next_slot_preview: Vec::new(),
             preview_view: None,
             grid_3d,
             gizmo_3d,
@@ -473,9 +482,11 @@ impl GpuState {
             latency,
             #[cfg(feature = "profiling")]
             pick_profile,
+            no_mrt_preview,
             bench_fit,
             bench_edits,
             bench_dual,
+            initial_streaming_done: false,
             last_pick_text: String::from("Click any 3D object to pick"),
             timing_samples: 0,
             title_updated_at: Instant::now(),
@@ -806,6 +817,13 @@ impl GpuState {
         }
     }
 
+    fn uses_color_frame_preview(&self) -> bool {
+        !self.no_mrt_preview
+            && self.active_scene == DemoScene::Arch3D
+            && !self.quad_view
+            && self.vp_main.supports_color_frame_selection(&self.device)
+    }
+
     fn request_pick(&mut self, rect: [u32; 4], kind: PickKind, event: Option<usize>) {
         if self.quad_view {
             self.pick_status(event, "unsupported-view", None);
@@ -832,6 +850,21 @@ impl GpuState {
             {
                 self.pick_status(event, "coalesced-before-submit", None);
                 return;
+            }
+            if self.uses_color_frame_preview() {
+                if let Some(old) = self.queued_color_frame_preview.replace(request) {
+                    self.pick_status(old.event, "coalesced-before-submit", None);
+                    self.vp_main.record_selection_preview_superseded();
+                }
+                self.vp_main.set_color_frame_selection_rect(Some(rect));
+                self.window.request_redraw();
+                return;
+            }
+        } else {
+            self.vp_main.set_color_frame_selection_rect(None);
+            if let Some(old) = self.queued_color_frame_preview.take() {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
             }
         }
         if let Some(old) = self.queued_pick.replace(request) {
@@ -872,12 +905,7 @@ impl GpuState {
 
     fn begin_pick(&mut self, mut request: PickRequest) {
         let rect = request.rect;
-        if request.kind == PickKind::Preview
-            && self.active_scene == DemoScene::Arch3D
-            && !self.quad_view
-            && !self.bench_dual
-            && self.vp_main.supports_color_frame_selection(&self.device)
-        {
+        if request.kind == PickKind::Preview && self.uses_color_frame_preview() {
             if let Some(old) = self.queued_color_frame_preview.replace(request) {
                 self.pick_status(old.event, "coalesced-before-submit", None);
                 self.vp_main.record_selection_preview_superseded();
@@ -961,7 +989,7 @@ impl GpuState {
         }
     }
 
-    fn poll_pick(&mut self) {
+    fn poll_pick(&mut self, from_render: bool) {
         let now = Instant::now();
         self.clear_stale_preview(now);
         let Some(pending) = &mut self.pending_pick else {
@@ -1054,24 +1082,25 @@ impl GpuState {
                     if preview {
                         self.preview_pacing.request_frame(Instant::now());
                     }
-                    self.window.request_redraw();
+                    if !from_render {
+                        self.window.request_redraw();
+                    }
                 }
                 ReadyResult::Slots(Ok(slots), _) => {
                     let event = request.event;
-                    let selected: HashSet<_> = slots
-                        .into_iter()
-                        .filter_map(|slot| self.scene_3d.chunk_id_at_slot(slot as usize))
-                        .collect();
                     self.preview_view = Some((request.view, request.input_at));
-                    self.sync_highlights(Some(selected));
-                    self.last_pick_text = format!("{} selected", self.visible_selection.len());
+                    self.sync_slot_preview(&slots);
+                    let count = self.visible_slot_preview.len();
+                    self.last_pick_text = format!("{count} selected");
                     self.vp_main.record_selection_preview_displayed();
                     if let (Some(trace), Some(id)) = (&mut self.latency, event) {
-                        trace.highlighted(id, self.visible_selection.len());
+                        trace.highlighted(id, count);
                         trace.selection_redraw(id);
                     }
                     self.preview_pacing.request_frame(Instant::now());
-                    self.window.request_redraw();
+                    if !from_render {
+                        self.window.request_redraw();
+                    }
                 }
                 ReadyResult::Exact(Err(_)) | ReadyResult::Slots(Err(_), _) => {
                     self.pick_status(request.event, "error", None);
@@ -1081,9 +1110,102 @@ impl GpuState {
                 }
             }
         }
+        if !from_render
+            && self.pending_pick.is_none()
+            && (self.queued_color_frame_preview.is_some() || self.deferred_redraw)
+        {
+            self.deferred_redraw = false;
+            self.window.request_redraw();
+        }
+    }
+
+    fn sync_slot_preview(&mut self, slots: &[u32]) {
+        if !self.slot_preview_active {
+            let mut changed = !self.visible_selection.is_empty();
+            for id in self.visible_selection.drain() {
+                self.scene_3d.set_selected(id, false);
+            }
+            self.visible_slot_preview.clear();
+            for &slot in slots {
+                if let Some(id) = self.scene_3d.chunk_id_at_slot(slot as usize) {
+                    self.scene_3d.set_selected(id, true);
+                    self.visible_slot_preview.push((slot, id));
+                    changed = true;
+                }
+            }
+            self.slot_preview_active = true;
+            if changed {
+                self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+                if self.bench_dual {
+                    self.vp_top.mark_dirty(DirtyFlags::SELECTION);
+                }
+            }
+            return;
+        }
+        self.next_slot_preview.clear();
+        let mut old_iter = self.visible_slot_preview.iter().copied().peekable();
+        let mut new_iter = slots.iter().copied().peekable();
+        let mut changed = false;
+        while let (Some(&(old_slot, old_id)), Some(&new_slot)) = (old_iter.peek(), new_iter.peek())
+        {
+            match old_slot.cmp(&new_slot) {
+                std::cmp::Ordering::Less => {
+                    self.scene_3d.set_selected(old_id, false);
+                    changed = true;
+                    old_iter.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                        self.scene_3d.set_selected(new_id, true);
+                        self.next_slot_preview.push((new_slot, new_id));
+                        changed = true;
+                    }
+                    new_iter.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                        if new_id != old_id {
+                            self.scene_3d.set_selected(old_id, false);
+                            self.scene_3d.set_selected(new_id, true);
+                            changed = true;
+                        }
+                        self.next_slot_preview.push((new_slot, new_id));
+                    } else {
+                        self.scene_3d.set_selected(old_id, false);
+                        changed = true;
+                    }
+                    old_iter.next();
+                    new_iter.next();
+                }
+            }
+        }
+        for (_, old_id) in old_iter {
+            self.scene_3d.set_selected(old_id, false);
+            changed = true;
+        }
+        for new_slot in new_iter {
+            if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                self.scene_3d.set_selected(new_id, true);
+                self.next_slot_preview.push((new_slot, new_id));
+                changed = true;
+            }
+        }
+        std::mem::swap(&mut self.visible_slot_preview, &mut self.next_slot_preview);
+        if changed {
+            self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+            if self.bench_dual {
+                self.vp_top.mark_dirty(DirtyFlags::SELECTION);
+            }
+        }
     }
 
     fn sync_highlights(&mut self, preview: Option<HashSet<Chunk3DId>>) {
+        if self.slot_preview_active {
+            self.visible_selection.clear();
+            self.visible_selection
+                .extend(self.visible_slot_preview.drain(..).map(|(_, id)| id));
+            self.slot_preview_active = false;
+        }
         let desired = preview.as_ref().unwrap_or(&self.committed_selection);
         for &id in self.visible_selection.difference(desired) {
             self.scene_3d.set_selected(id, false);
@@ -1239,6 +1361,9 @@ impl GpuState {
     }
 
     fn replay_latency(&mut self, now: Instant) {
+        if !self.initial_streaming_done {
+            return;
+        }
         let Some(trace) = &mut self.latency else {
             return;
         };
@@ -1435,8 +1560,22 @@ impl GpuState {
     }
 
     fn render_backlogged(&self, now: Instant) -> bool {
-        self.frames_in_flight.load(Ordering::Relaxed) != 0
-            && self.preview_active()
+        if self.uses_color_frame_preview() && self.pending_preview().is_some() {
+            // While an MRT color-frame selection capture is already executing on the GPU, defer
+            // any intermediate redraw so poll_pick observes completion immediately and coalesces
+            // the highlight display with the next tick's capture into a single frame.
+            return true;
+        }
+        let in_flight = self.frames_in_flight.load(Ordering::Relaxed);
+        if in_flight == 0 || !self.preview_active() {
+            return false;
+        }
+        if in_flight >= 2 {
+            return true;
+        }
+        // Only cap overlap to 1 frame while a pick readback is actively pending so a second heavy
+        // scene cannot stall it; allow encoding the next tick while a light highlight frame finishes.
+        self.pending_preview().is_some()
             && self
                 .preview_pacing
                 .gpu_backlogged(now, self.pending_preview().map(|pick| pick.submitted_at))
@@ -1444,6 +1583,7 @@ impl GpuState {
 
     fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
+        self.poll_pick(true);
         if self.render_backlogged(frame_start) {
             self.deferred_redraw = true;
             return Ok(());
@@ -1502,16 +1642,16 @@ impl GpuState {
         let h = self.surface_config.height.max(1);
 
         self.clear_stale_preview(Instant::now());
-        let mut color_frame_preview_req = if !self.quad_view
-            && !self.bench_dual
-            && self.active_scene == DemoScene::Arch3D
-            && self.pending_pick.is_none()
-        {
-            self.queued_color_frame_preview.take()
-        } else {
-            None
-        };
+        let mut color_frame_preview_req =
+            if self.uses_color_frame_preview() && self.pending_pick.is_none() {
+                self.queued_color_frame_preview
+                    .take()
+                    .filter(|req| req.epoch == self.pick_epoch)
+            } else {
+                None
+            };
         if let Some(req) = &color_frame_preview_req {
+            self.preview_pacing.submitted(frame_start);
             self.pick_status(req.event, "encoding", None);
             self.vp_main.set_color_frame_selection_rect(Some(req.rect));
         } else if !self.preview_active() {
@@ -1748,6 +1888,12 @@ impl GpuState {
             self.update_title();
             self.title_updated_at = Instant::now();
         }
+        if !streaming && !self.initial_streaming_done {
+            self.initial_streaming_done = true;
+            if let Some(trace) = &mut self.latency {
+                trace.start_replay(presented);
+            }
+        }
         if streaming
             || self.vp_main.mode() == ViewportMode::Continuous
             || self.transition.is_active()
@@ -1809,7 +1955,7 @@ impl ApplicationHandler for DemoApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
-            state.poll_pick();
+            state.poll_pick(false);
             let now = Instant::now();
             state.replay_latency(now);
             state.submit_queued_pick(Instant::now());
@@ -1836,7 +1982,9 @@ impl ApplicationHandler for DemoApp {
                 }
                 if trace.finished(
                     now,
-                    state.pending_pick.is_some() || state.queued_pick.is_some(),
+                    state.pending_pick.is_some()
+                        || state.queued_pick.is_some()
+                        || state.queued_color_frame_preview.is_some(),
                 ) {
                     if let Err(error) = trace.write(&state.window, state.vp_main.camera()) {
                         eprintln!("latency trace write failed: {error}");

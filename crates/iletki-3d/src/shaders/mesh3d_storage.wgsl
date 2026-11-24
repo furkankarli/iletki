@@ -100,9 +100,9 @@ fn vs_pick_storage(
 }
 
 @vertex
-fn vs_mask_storage(v: VertIn, @location(3) slot: u32) -> MaskOut {
+fn vs_mask_storage(@location(0) position: vec3<f32>, @location(3) slot: u32) -> MaskOut {
     let st = load_storage_transform(slot);
-    var out = mask_vertex(v, st.placement);
+    var out = mask_vertex_pos(position, st.placement);
     if (!st.visible) {
         out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }

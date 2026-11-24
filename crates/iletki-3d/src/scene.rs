@@ -3,7 +3,8 @@
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
 use crate::face_batch::{
-    self, PageBuilder, PageKind, PaintPipelines, VertexBuffers, VertexLayout, VertexRange,
+    self, GeometryPage, PageBuilder, PageKind, PaintPipelines, VertexBuffers, VertexLayout,
+    VertexRange,
 };
 use crate::gpu_cull::{
     self, CullChunkInput, CullViewUniforms, GpuCullPipelines, GpuCullScene, GpuCullView,
@@ -15,7 +16,7 @@ use crate::objects::{
 use crate::outline_bounds::OutlineUpdate;
 use crate::provoking::{self, DedupScratch, FlatSupport};
 use crate::section::SectionAa;
-use crate::storage_batch::{self, ChunkTransformTable, StorageViewBinding};
+use crate::storage_batch::{self, ChunkTransformTable, StorageDraws, StorageViewBinding};
 use crate::vertex::Mesh3D;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
@@ -25,16 +26,19 @@ use iletki_wgpu::{
     CAMERA_WGSL, DEPTH_FORMAT, GpuCullCtx, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT,
     PaintCtx, PrepareCtx, SELECTION_ID_FORMAT, ViewportLayer,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{
-    cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap},
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 const SECTION_GROUP_SIZE: usize = 32;
 // Keep tiny packed objects together in groups that need raster clipping anyway.
 const MAX_DEFERRED_SECTION_VERTICES: usize = 64;
+// Above this chunk count, project one shared conservative world envelope instead of per-chunk AABBs.
+const LARGE_SELECTION_ENVELOPE_THRESHOLD: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -50,12 +54,146 @@ pub struct Chunk3DId {
     generation: u64,
 }
 
+/// Compact L1-cache-resident bitset of selected chunk slot indices (O(1) toggle, sequential scan).
+#[derive(Default)]
+struct SelectionSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl SelectionSet {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.words
+            .get(index >> 6)
+            .is_some_and(|&word| (word & (1u64 << (index & 63))) != 0)
+    }
+
+    fn insert(&mut self, index: usize) -> bool {
+        let word = index >> 6;
+        let bit = 1u64 << (index & 63);
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        if let Some(slot) = self.words.get_mut(word)
+            && (*slot & bit) == 0
+        {
+            *slot |= bit;
+            self.len = self.len.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn remove(&mut self, index: usize) -> bool {
+        let word = index >> 6;
+        let bit = 1u64 << (index & 63);
+        if let Some(slot) = self.words.get_mut(word)
+            && (*slot & bit) != 0
+        {
+            *slot &= !bit;
+            self.len = self.len.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
+    fn clear(&mut self) {
+        self.words.fill(0);
+        self.len = 0;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(w_idx, &word)| {
+            let base = w_idx << 6;
+            let mut rem = word;
+            std::iter::from_fn(move || {
+                if rem == 0 {
+                    return None;
+                }
+                let tz = rem.trailing_zeros() as usize;
+                rem &= rem - 1;
+                Some(base + tz)
+            })
+        })
+    }
+}
+
+const SELECT_META_VISIBLE: u32 = 1 << 0;
+const SELECT_META_HAS_VERTS: u32 = 1 << 1;
+const SELECT_META_BOUNDS_F32: u32 = 1 << 2;
+const MAX_SELECT_BOUNDS_REL: f64 = 16_777_216.0;
+
+/// Compact 32-byte L3-cache-resident per-chunk selection metadata (avoids striding `ChunkEntry`).
+#[derive(Clone, Copy)]
+struct ChunkSelectMeta {
+    /// Dense index into `Scene3DLayer::repeated_face_pages`, or `u32::MAX` for non-repeated/direct.
+    repeated_face_page: u32,
+    flags: u32,
+    /// Conservative anchor-relative world AABB `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    bounds_rel: [f32; 6],
+}
+
+impl ChunkSelectMeta {
+    const EMPTY: Self = Self {
+        repeated_face_page: u32::MAX,
+        flags: 0,
+        bounds_rel: [0.0; 6],
+    };
+}
+
+fn pack_select_bounds(origin: Vec3, local_bounds: Bounds3, anchor: Vec3) -> Option<[f32; 6]> {
+    if !origin.is_finite() || local_bounds.is_empty() || !anchor.is_finite() {
+        return None;
+    }
+    let rel = origin - anchor;
+    let min = rel + local_bounds.min;
+    let max = rel + local_bounds.max;
+    let coords = [min.x, min.y, min.z, max.x, max.y, max.z];
+    if !coords
+        .iter()
+        .all(|&v| v.is_finite() && v.abs() < MAX_SELECT_BOUNDS_REL)
+    {
+        return None;
+    }
+    let floor_f32 = |v: f64| -> f32 {
+        let f = v as f32;
+        if f64::from(f) > v {
+            f - (f.abs() * 1e-6).max(1e-6)
+        } else {
+            f
+        }
+    };
+    let ceil_f32 = |v: f64| -> f32 {
+        let f = v as f32;
+        if f64::from(f) < v {
+            f + (f.abs() * 1e-6).max(1e-6)
+        } else {
+            f
+        }
+    };
+    Some([
+        floor_f32(min.x),
+        floor_f32(min.y),
+        floor_f32(min.z),
+        ceil_f32(max.x),
+        ceil_f32(max.y),
+        ceil_f32(max.z),
+    ])
+}
+
 struct ChunkEntry {
     generation: u64,
     origin: Vec3,
     local_bounds: Bounds3,
     visible: bool,
-    selected: bool,
     pending_mesh: Option<Box<Mesh3D>>,
     vertex_buf: Option<VertexRange>,
     vertex_count: u32,
@@ -414,6 +552,49 @@ fn color_pipeline<W>(
         })
 }
 
+fn mask_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    vertex: &str,
+    fragment: &str,
+    count: u32,
+    layout: &wgpu::PipelineLayout,
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iletki-3d outline mask"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vertex),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fragment),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OUTLINE_MASK_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 struct PackedPipelines {
     layout: wgpu::BindGroupLayout,
     storage: bool,
@@ -444,6 +625,9 @@ struct RepeatedPipelines {
     section: Option<ColorPipelines>,
     flat_section: Option<wgpu::RenderPipeline>,
     slots: wgpu::Buffer,
+    mask: Option<wgpu::RenderPipeline>,
+    multisampled_mask: Option<wgpu::RenderPipeline>,
+    section_mask: Option<wgpu::RenderPipeline>,
 }
 
 impl PackedPipelines {
@@ -558,6 +742,54 @@ impl PackedPipelines {
             )
         };
         let slots = (0..face_batch::OBJECTS as u32).collect::<Vec<_>>();
+        let (mask, multisampled_mask, section_mask) = if storage {
+            let mask_buffers = [
+                Some(vertex_layout.position()),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<u32>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![3 => Uint32],
+                }),
+            ];
+            let m1 = mask_pipeline(
+                ctx.device,
+                &self.shader,
+                "vs_mask_storage",
+                "fs_mask",
+                1,
+                &self.pipeline_layout,
+                &mask_buffers,
+            );
+            let m4 = (ctx.msaa_samples == 4).then(|| {
+                mask_pipeline(
+                    ctx.device,
+                    &self.shader,
+                    "vs_mask_storage",
+                    "fs_mask",
+                    4,
+                    &self.pipeline_layout,
+                    &mask_buffers,
+                )
+            });
+            let ms = self.section_shader.as_ref().map(|(aa, shader)| {
+                let (vertex, fragment) = match aa {
+                    SectionAa::Sampled => ("vs_mask_storage_sampled", "fs_mask_sampled_pos"),
+                    SectionAa::Raster => ("vs_mask_storage_raster", "fs_mask_unclipped"),
+                };
+                mask_pipeline(
+                    ctx.device,
+                    shader,
+                    vertex,
+                    fragment,
+                    4,
+                    &self.pipeline_layout,
+                    &mask_buffers,
+                )
+            });
+            (Some(m1), m4, ms)
+        } else {
+            (None, None, None)
+        };
         self.repeated = Some(RepeatedPipelines {
             base: color(&self.shader, None, false),
             unclipped: color(&self.shader, None, true),
@@ -584,6 +816,9 @@ impl PackedPipelines {
                     contents: bytemuck::cast_slice(&slots),
                     usage: wgpu::BufferUsages::VERTEX,
                 }),
+            mask,
+            multisampled_mask,
+            section_mask,
         });
     }
     fn select_color(
@@ -668,8 +903,21 @@ pub struct Scene3DLayer {
     pipelines: Option<Pipelines>,
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
+    /// Compact per-slot generation (`0` = vacant) for cache-hot `chunk_id_at_slot` / `set_selected`.
+    chunk_generations: Vec<u64>,
+    /// Compact 32-byte per-slot visibility, repeated-page index, and anchor-relative bounds.
+    chunk_select_meta: Vec<ChunkSelectMeta>,
+    repeated_face_pages: Vec<Arc<GeometryPage>>,
+    repeated_face_page_map: HashMap<usize, u32>,
+    repeated_mask_scratch: Vec<(u32, u32)>,
     free_chunks: BinaryHeap<Reverse<usize>>,
-    selected_slots: BTreeSet<usize>,
+    selected_slots: SelectionSet,
+    selected_revision: u64,
+    selected_bounds_revision: u64,
+    shared_mask_rev: u64,
+    shared_mask_bounds_rev: u64,
+    shared_selected_envelope: Option<(Bounds3, Vec3)>,
+    shared_storage_mask: StorageDraws,
     pending_meshes: usize,
     hidden_chunks: usize,
     has_repeated_pages: bool,
@@ -736,8 +984,19 @@ impl Scene3DLayer {
             pipelines: None,
             use_antialiased_section: false,
             chunks: Vec::new(),
+            chunk_generations: Vec::new(),
+            chunk_select_meta: Vec::new(),
+            repeated_face_pages: Vec::new(),
+            repeated_face_page_map: HashMap::new(),
+            repeated_mask_scratch: Vec::new(),
             free_chunks: BinaryHeap::new(),
-            selected_slots: BTreeSet::new(),
+            selected_slots: SelectionSet::default(),
+            selected_revision: 1,
+            selected_bounds_revision: 1,
+            shared_mask_rev: 0,
+            shared_mask_bounds_rev: 0,
+            shared_selected_envelope: None,
+            shared_storage_mask: StorageDraws::default(),
             pending_meshes: 0,
             hidden_chunks: 0,
             has_repeated_pages: false,
@@ -882,13 +1141,13 @@ impl Scene3DLayer {
         self.pending_meshes += 1;
         let generation = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
         let origin = mesh.origin;
+        let local_bounds = mesh.local_bounds;
         let has_picks = !mesh.pick_ids.is_empty();
         let entry = ChunkEntry {
             generation,
             origin,
-            local_bounds: mesh.local_bounds,
+            local_bounds,
             visible: true,
-            selected: false,
             pending_mesh: Some(Box::new(mesh)),
             vertex_buf: None,
             vertex_count: 0,
@@ -915,6 +1174,26 @@ impl Scene3DLayer {
         };
         self.transform_table
             .mark_chunk(index, origin, true, has_picks);
+        if index >= self.chunk_generations.len() {
+            self.chunk_generations.resize(index.saturating_add(1), 0);
+            self.chunk_select_meta
+                .resize(index.saturating_add(1), ChunkSelectMeta::EMPTY);
+        }
+        if let Some(gen_slot) = self.chunk_generations.get_mut(index) {
+            *gen_slot = generation;
+        }
+        if let Some(meta) = self.chunk_select_meta.get_mut(index) {
+            let (bounds_flag, bounds_rel) =
+                match pack_select_bounds(origin, local_bounds, self.transform_table.anchor()) {
+                    Some(bounds) => (SELECT_META_BOUNDS_F32, bounds),
+                    None => (0, [0.0; 6]),
+                };
+            *meta = ChunkSelectMeta {
+                repeated_face_page: u32::MAX,
+                flags: SELECT_META_VISIBLE | bounds_flag,
+                bounds_rel,
+            };
+        }
         Chunk3DId { index, generation }
     }
 
@@ -924,10 +1203,10 @@ impl Scene3DLayer {
     /// compact 0-based slot indices from color-frame selection previews in O(1).
     #[must_use]
     pub fn chunk_id_at_slot(&self, slot: usize) -> Option<Chunk3DId> {
-        let entry = self.chunks.get(slot)?.as_ref()?;
-        Some(Chunk3DId {
+        let &generation = self.chunk_generations.get(slot)?;
+        (generation != 0).then_some(Chunk3DId {
             index: slot,
-            generation: entry.generation,
+            generation,
         })
     }
 
@@ -941,8 +1220,22 @@ impl Scene3DLayer {
             let local_bounds = entry.local_bounds;
             let trusted = entry.section_bounds_trusted;
             entry.origin = origin;
+            if self.selected_slots.contains(id.index) {
+                self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
+            }
             self.transform_table
                 .mark_chunk(id.index, origin, visible, has_picks);
+            if let Some(meta) = self.chunk_select_meta.get_mut(id.index) {
+                match pack_select_bounds(origin, local_bounds, self.transform_table.anchor()) {
+                    Some(bounds) => {
+                        meta.bounds_rel = bounds;
+                        meta.flags |= SELECT_META_BOUNDS_F32;
+                    }
+                    None => {
+                        meta.flags &= !SELECT_META_BOUNDS_F32;
+                    }
+                }
+            }
             // Conservatively expand the group and scene envelopes in O(1) if chunk moves outside.
             if trusted {
                 if let Some(Some(group)) =
@@ -979,6 +1272,17 @@ impl Scene3DLayer {
                 } else {
                     self.hidden_chunks = self.hidden_chunks.saturating_add(1);
                 }
+                if let Some(meta) = self.chunk_select_meta.get_mut(id.index) {
+                    if visible {
+                        meta.flags |= SELECT_META_VISIBLE;
+                    } else {
+                        meta.flags &= !SELECT_META_VISIBLE;
+                    }
+                }
+                if self.selected_slots.contains(id.index) {
+                    self.selected_revision = self.selected_revision.wrapping_add(1);
+                    self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
+                }
                 self.transform_table
                     .mark_chunk(id.index, origin, visible, has_picks);
                 if is_direct {
@@ -995,12 +1299,20 @@ impl Scene3DLayer {
     /// [`DrawPhase::OutlineMask`] so [`iletki_wgpu::ViewportHost`] renders a crisp screen-space
     /// Jump-Flood silhouette outline around it.
     pub fn set_selected(&mut self, id: Chunk3DId, selected: bool) {
-        if let Some(entry) = self.chunk_mut(id) {
-            entry.selected = selected;
-            if selected {
-                self.selected_slots.insert(id.index);
+        if id.generation != 0
+            && self
+                .chunk_generations
+                .get(id.index)
+                .is_some_and(|&g| g == id.generation)
+        {
+            let changed = if selected {
+                self.selected_slots.insert(id.index)
             } else {
-                self.selected_slots.remove(&id.index);
+                self.selected_slots.remove(id.index)
+            };
+            if changed {
+                self.selected_revision = self.selected_revision.wrapping_add(1);
+                self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
             }
             self.revision.mark_dynamic();
         }
@@ -1009,21 +1321,22 @@ impl Scene3DLayer {
     /// Returns whether `id` is currently marked as selected.
     #[must_use]
     pub fn is_selected(&self, id: Chunk3DId) -> bool {
-        self.chunks
-            .get(id.index)
-            .and_then(|s| s.as_ref())
-            .is_some_and(|entry| entry.generation == id.generation && entry.selected)
+        id.generation != 0
+            && self
+                .chunk_generations
+                .get(id.index)
+                .is_some_and(|&g| g == id.generation)
+            && self.selected_slots.contains(id.index)
     }
 
     /// Clears selection on all chunks.
     pub fn clear_selection(&mut self) {
         self.revision.mark_dynamic();
-        for index in &self.selected_slots {
-            if let Some(Some(chunk)) = self.chunks.get_mut(*index) {
-                chunk.selected = false;
-            }
+        if !self.selected_slots.is_empty() {
+            self.selected_revision = self.selected_revision.wrapping_add(1);
+            self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
+            self.selected_slots.clear();
         }
-        self.selected_slots.clear();
     }
 
     /// Removes a chunk and releases its GPU resources. Other chunks can retain a shared page.
@@ -1041,21 +1354,32 @@ impl Scene3DLayer {
                     self.hidden_chunks = self.hidden_chunks.saturating_sub(1);
                 }
             }
+            if let Some(gen_slot) = self.chunk_generations.get_mut(id.index) {
+                *gen_slot = 0;
+            }
+            if let Some(meta) = self.chunk_select_meta.get_mut(id.index) {
+                *meta = ChunkSelectMeta::EMPTY;
+            }
             self.transform_table.clear_chunk(id.index);
-            self.selected_slots.remove(&id.index);
+            self.selected_slots.remove(id.index);
             self.free_chunks.push(Reverse(id.index));
             if let Some(group) = self.section_groups.get_mut(id.index / SECTION_GROUP_SIZE) {
                 *group = None;
             }
             self.scene_envelope = None;
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
+            self.selected_revision = self.selected_revision.wrapping_add(1);
+            self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
+            self.shared_storage_mask.clear();
+            self.shared_mask_rev = 0;
+            self.shared_mask_bounds_rev = 0;
+            self.shared_selected_envelope = None;
             for view in &mut self.views {
                 view.faces.clear();
                 view.edges.clear();
                 view.mask.clear();
                 view.storage_faces.clear();
                 view.storage_edges.clear();
-                view.storage_mask.clear();
                 view.gpu_cull_active = false;
                 view.retained_full_scene = false;
             }
@@ -1407,9 +1731,29 @@ impl Scene3DLayer {
             } else {
                 "vs_mask_batched"
             };
-            let mask = make_mask(&shader, mask_vs, "fs_mask", 1, &pipeline_layout, &buffers);
-            let multisampled_mask = (ctx.msaa_samples == 4)
-                .then(|| make_mask(&shader, mask_vs, "fs_mask", 4, &pipeline_layout, &buffers));
+            let mask_buffers = if is_storage {
+                vec![Some(vertex_layout.position()), Some(slot_layout.clone())]
+            } else {
+                buffers.clone()
+            };
+            let mask = make_mask(
+                &shader,
+                mask_vs,
+                "fs_mask",
+                1,
+                &pipeline_layout,
+                &mask_buffers,
+            );
+            let multisampled_mask = (ctx.msaa_samples == 4).then(|| {
+                make_mask(
+                    &shader,
+                    mask_vs,
+                    "fs_mask",
+                    4,
+                    &pipeline_layout,
+                    &mask_buffers,
+                )
+            });
             let sampled_extra = if is_storage {
                 concat!(
                     include_str!("shaders/mesh3d_sampled.wgsl"),
@@ -1484,10 +1828,12 @@ impl Scene3DLayer {
                 let (vertex, fragment) = match (is_storage, aa) {
                     (false, SectionAa::Sampled) => ("vs_mesh_batched_sampled", "fs_mask_sampled"),
                     (false, SectionAa::Raster) => ("vs_mesh_batched_raster", "fs_mask_unclipped"),
-                    (true, SectionAa::Sampled) => ("vs_mesh_storage_sampled", "fs_mask_sampled"),
-                    (true, SectionAa::Raster) => ("vs_mesh_storage_raster", "fs_mask_unclipped"),
+                    (true, SectionAa::Sampled) => {
+                        ("vs_mask_storage_sampled", "fs_mask_sampled_pos")
+                    }
+                    (true, SectionAa::Raster) => ("vs_mask_storage_raster", "fs_mask_unclipped"),
                 };
-                make_mask(shader, vertex, fragment, 4, &pipeline_layout, &buffers)
+                make_mask(shader, vertex, fragment, 4, &pipeline_layout, &mask_buffers)
             });
             let limits = ctx.device.limits();
             let pick_vs = if is_storage {
@@ -2025,52 +2371,212 @@ impl Scene3DLayer {
         });
     }
 
-    fn prepare_storage_mask(
-        chunks: &[Option<ChunkEntry>],
-        selected: &BTreeSet<usize>,
-        view: &mut ViewObjects,
+    fn sync_shared_selection(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        use_storage: bool,
     ) {
-        view.storage_mask.clear();
-        if selected.is_empty() {
+        if !use_storage && self.shared_storage_mask.has_packed() {
+            self.shared_storage_mask.clear();
+            self.shared_mask_rev = 0;
+        }
+        if self.selected_slots.is_empty() {
+            if self.shared_mask_rev != self.selected_revision {
+                self.shared_storage_mask.clear();
+                self.shared_selected_envelope = None;
+                self.shared_mask_rev = self.selected_revision;
+                self.shared_mask_bounds_rev = self.selected_bounds_revision;
+            }
+            return;
+        }
+        let large_sel = self.selected_slots.len() > LARGE_SELECTION_ENVELOPE_THRESHOLD;
+        let need_mask = use_storage && self.shared_mask_rev != self.selected_revision;
+        let need_env = large_sel && self.shared_mask_bounds_rev != self.selected_bounds_revision;
+        if !need_mask && !need_env {
             return;
         }
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let _scope = iletki_wgpu::profiling::scope("scene.outline_mask_prepare");
-        for &slot in selected {
-            let Some(Some(chunk)) = chunks.get(slot) else {
-                continue;
-            };
-            if !chunk.visible || chunk.vertex_count == 0 {
-                continue;
-            }
-            let Some(geometry) = &chunk.vertex_buf else {
-                continue;
-            };
-            if geometry.is_direct() {
-                if let Some(draw_index) = view.draws.iter().position(|d| d.chunk == slot) {
-                    view.storage_mask.push(geometry, draw_index);
+
+        let mut env_bounds = Bounds3::EMPTY;
+        let mut env_valid = true;
+        let mut env_rel_min = [f32::INFINITY; 3];
+        let mut env_rel_max = [f32::NEG_INFINITY; 3];
+        let mut used_rel_env = false;
+        let mut used_world_env = false;
+
+        if need_mask {
+            let mut fast_repeated = !self.repeated_face_pages.is_empty();
+            if fast_repeated {
+                self.repeated_mask_scratch.clear();
+                let required = SELECT_META_VISIBLE | SELECT_META_HAS_VERTS;
+                for slot in self.selected_slots.iter() {
+                    let Some(&meta) = self.chunk_select_meta.get(slot) else {
+                        continue;
+                    };
+                    if (meta.flags & required) != required {
+                        continue;
+                    }
+                    if meta.repeated_face_page == u32::MAX {
+                        fast_repeated = false;
+                        break;
+                    }
+                    if let Ok(slot_u32) = u32::try_from(slot) {
+                        self.repeated_mask_scratch
+                            .push((meta.repeated_face_page, slot_u32));
+                    }
+                    if need_env && env_valid {
+                        if (meta.flags & SELECT_META_BOUNDS_F32) != 0 {
+                            env_rel_min[0] = env_rel_min[0].min(meta.bounds_rel[0]);
+                            env_rel_min[1] = env_rel_min[1].min(meta.bounds_rel[1]);
+                            env_rel_min[2] = env_rel_min[2].min(meta.bounds_rel[2]);
+                            env_rel_max[0] = env_rel_max[0].max(meta.bounds_rel[3]);
+                            env_rel_max[1] = env_rel_max[1].max(meta.bounds_rel[4]);
+                            env_rel_max[2] = env_rel_max[2].max(meta.bounds_rel[5]);
+                            used_rel_env = true;
+                        } else if let Some(Some(chunk)) = self.chunks.get(slot) {
+                            if chunk.local_bounds.is_empty() || !chunk.origin.is_finite() {
+                                env_valid = false;
+                            } else {
+                                env_bounds.include(chunk.origin + chunk.local_bounds.min);
+                                env_bounds.include(chunk.origin + chunk.local_bounds.max);
+                                used_world_env = true;
+                            }
+                        }
+                    }
                 }
+            }
+            if fast_repeated {
+                self.shared_storage_mask.rebuild_repeated_only(
+                    device,
+                    queue,
+                    &self.repeated_face_pages,
+                    self.repeated_mask_scratch.iter().copied(),
+                );
             } else {
-                view.storage_mask.push(geometry, 0);
+                env_bounds = Bounds3::EMPTY;
+                env_valid = true;
+                used_rel_env = false;
+                used_world_env = false;
+                let chunks = &self.chunks;
+                let selected = &self.selected_slots;
+                let iter = selected.iter().filter_map(|slot| {
+                    let chunk = chunks.get(slot)?.as_ref()?;
+                    if !chunk.visible || chunk.vertex_count == 0 {
+                        return None;
+                    }
+                    if need_env && env_valid {
+                        if chunk.local_bounds.is_empty() || !chunk.origin.is_finite() {
+                            env_valid = false;
+                        } else {
+                            env_bounds.include(chunk.origin + chunk.local_bounds.min);
+                            env_bounds.include(chunk.origin + chunk.local_bounds.max);
+                            used_world_env = true;
+                        }
+                    }
+                    let geometry = chunk.vertex_buf.as_ref()?;
+                    Some((slot, geometry))
+                });
+                self.shared_storage_mask
+                    .rebuild_unordered(device, queue, iter);
+            }
+            self.shared_mask_rev = self.selected_revision;
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            iletki_wgpu::profiling::count(
+                "scene.outline_mask_draws",
+                self.shared_storage_mask.count(),
+            );
+        } else if need_env {
+            let required = SELECT_META_VISIBLE | SELECT_META_HAS_VERTS;
+            for slot in self.selected_slots.iter() {
+                let Some(&meta) = self.chunk_select_meta.get(slot) else {
+                    continue;
+                };
+                if (meta.flags & required) != required {
+                    continue;
+                }
+                if (meta.flags & SELECT_META_BOUNDS_F32) != 0 {
+                    env_rel_min[0] = env_rel_min[0].min(meta.bounds_rel[0]);
+                    env_rel_min[1] = env_rel_min[1].min(meta.bounds_rel[1]);
+                    env_rel_min[2] = env_rel_min[2].min(meta.bounds_rel[2]);
+                    env_rel_max[0] = env_rel_max[0].max(meta.bounds_rel[3]);
+                    env_rel_max[1] = env_rel_max[1].max(meta.bounds_rel[4]);
+                    env_rel_max[2] = env_rel_max[2].max(meta.bounds_rel[5]);
+                    used_rel_env = true;
+                } else if let Some(Some(chunk)) = self.chunks.get(slot) {
+                    if chunk.local_bounds.is_empty() || !chunk.origin.is_finite() {
+                        env_valid = false;
+                        break;
+                    }
+                    env_bounds.include(chunk.origin + chunk.local_bounds.min);
+                    env_bounds.include(chunk.origin + chunk.local_bounds.max);
+                    used_world_env = true;
+                }
             }
         }
-        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-        iletki_wgpu::profiling::count("scene.outline_mask_draws", view.storage_mask.count());
+
+        if need_env {
+            let anchor = self.transform_table.anchor();
+            self.shared_selected_envelope = if !env_valid {
+                None
+            } else if used_rel_env && !used_world_env {
+                let local = Bounds3::from_corners(
+                    Vec3::new(
+                        f64::from(env_rel_min[0]),
+                        f64::from(env_rel_min[1]),
+                        f64::from(env_rel_min[2]),
+                    ),
+                    Vec3::new(
+                        f64::from(env_rel_max[0]),
+                        f64::from(env_rel_max[1]),
+                        f64::from(env_rel_max[2]),
+                    ),
+                );
+                (!local.is_empty()).then_some((local, anchor))
+            } else {
+                if used_rel_env {
+                    env_bounds.include(
+                        anchor
+                            + Vec3::new(
+                                f64::from(env_rel_min[0]),
+                                f64::from(env_rel_min[1]),
+                                f64::from(env_rel_min[2]),
+                            ),
+                    );
+                    env_bounds.include(
+                        anchor
+                            + Vec3::new(
+                                f64::from(env_rel_max[0]),
+                                f64::from(env_rel_max[1]),
+                                f64::from(env_rel_max[2]),
+                            ),
+                    );
+                }
+                env_bounds.center().map(|center| {
+                    let local =
+                        Bounds3::from_corners(env_bounds.min - center, env_bounds.max - center);
+                    (local, center)
+                })
+            };
+            self.shared_mask_bounds_rev = self.selected_bounds_revision;
+        }
     }
 
     fn prepare_packed_mask<W>(
         ctx: &PrepareCtx<'_, W>,
         layout: &wgpu::BindGroupLayout,
         chunks: &[Option<ChunkEntry>],
+        selected_slots: &SelectionSet,
         view: &mut ViewObjects,
     ) -> bool {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let _scope = iletki_wgpu::profiling::scope("scene.outline_mask_prepare");
         let selected = view.draws.iter().enumerate().filter_map(|(index, object)| {
-            let chunk = chunks.get(object.chunk)?.as_ref()?;
-            if !chunk.selected {
+            if !selected_slots.contains(object.chunk) {
                 return None;
             }
+            let chunk = chunks.get(object.chunk)?.as_ref()?;
             Some((index, object.uniforms, chunk.vertex_buf.as_ref()?))
         });
         if selected.clone().take(128).count() < 128 {
@@ -2091,6 +2597,7 @@ impl Scene3DLayer {
         pipeline: &wgpu::RenderPipeline,
         packed: Option<&wgpu::RenderPipeline>,
         storage: Option<&wgpu::RenderPipeline>,
+        repeated_storage: Option<&wgpu::RenderPipeline>,
         pass: &mut wgpu::RenderPass<'_>,
         ctx: &PaintCtx<'_, W>,
     ) {
@@ -2106,9 +2613,9 @@ impl Scene3DLayer {
         };
         let draw_direct = |pass: &mut wgpu::RenderPass<'_>, index: usize| {
             if let Some(object) = view.draws.get(index)
+                && self.selected_slots.contains(object.chunk)
                 && let Some(Some(chunk)) = self.chunks.get(object.chunk)
                 && chunk.visible
-                && chunk.selected
                 && let Some(vertices) = &chunk.vertex_buf
                 && view.bind(pass, index, p.dynamic_uniforms)
             {
@@ -2120,20 +2627,21 @@ impl Scene3DLayer {
             view.storage_binding
                 .as_ref()
                 .and_then(StorageViewBinding::bind_group),
-        ) && view.storage_mask.has_packed()
+        ) && self.shared_storage_mask.has_packed()
         {
-            let pipelines = PaintPipelines {
-                smooth: storage_pl,
-                flat: None,
-                repeated_smooth: None,
-                repeated_flat: None,
-                repeated_slots: None,
-            };
-            view.storage_mask
-                .paint(pass, storage_bg, &pipelines, false, |pass, index| {
-                    pass.set_pipeline(pipeline);
-                    draw_direct(pass, index);
-                });
+            self.shared_storage_mask.paint_position_only(
+                pass,
+                storage_bg,
+                storage_pl,
+                repeated_storage,
+                |pass, chunk_slot| {
+                    if let Some(draw_index) = view.draws.iter().position(|d| d.chunk == chunk_slot)
+                    {
+                        pass.set_pipeline(pipeline);
+                        draw_direct(pass, draw_index);
+                    }
+                },
+            );
         } else if let Some(packed) = packed
             && view.mask.has_packed()
         {
@@ -2175,10 +2683,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             mask = mask.union(DrawPhaseMask::PICKING);
         }
         let any_selected = self.selected_slots.iter().any(|index| {
-            self.chunks
-                .get(*index)
-                .and_then(Option::as_ref)
-                .is_some_and(|chunk| chunk.visible)
+            self.chunk_select_meta
+                .get(index)
+                .is_some_and(|meta| (meta.flags & SELECT_META_VISIBLE) != 0)
         });
         if any_selected {
             mask = mask.union(DrawPhaseMask::OUTLINE_MASK);
@@ -2448,6 +2955,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     chunk.visible,
                     chunk.has_picks,
                 );
+                if let Some(meta) = self.chunk_select_meta.get_mut(chunk_index) {
+                    meta.repeated_face_page = u32::MAX;
+                    if chunk.vertex_count != 0 {
+                        meta.flags |= SELECT_META_HAS_VERTS;
+                    } else {
+                        meta.flags &= !SELECT_META_HAS_VERTS;
+                    }
+                }
                 if mesh.edges.is_empty() {
                     chunk.edge_buf = None;
                     chunk.edge_count = 0;
@@ -2475,6 +2990,24 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         builder.flush(ctx.device, &mut uploaded_faces);
         for (index, faces) in uploaded_faces {
             self.has_repeated_pages |= faces.repeats();
+            if let VertexRange::Packed { page, .. } = &faces
+                && page.repeated_elements() != 0
+                && page.repeated_chunk_ids().is_some()
+            {
+                let ptr = Arc::as_ptr(page) as usize;
+                let page_idx = if let Some(&existing) = self.repeated_face_page_map.get(&ptr) {
+                    existing
+                } else if let Ok(idx) = u32::try_from(self.repeated_face_pages.len()) {
+                    self.repeated_face_pages.push(Arc::clone(page));
+                    self.repeated_face_page_map.insert(ptr, idx);
+                    idx
+                } else {
+                    u32::MAX
+                };
+                if let Some(meta) = self.chunk_select_meta.get_mut(index) {
+                    meta.repeated_face_page = page_idx;
+                }
+            }
             if let Some(Some(chunk)) = self.chunks.get_mut(index) {
                 chunk.vertex_buf = Some(faces);
             }
@@ -2490,6 +3023,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         if uploaded_any {
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
             self.scene_envelope = None;
+            if !self.selected_slots.is_empty() {
+                self.selected_revision = self.selected_revision.wrapping_add(1);
+                self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
+            }
         }
 
         if ctx.selection_id_attachment() {
@@ -2552,13 +3089,16 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 self.gpu_cull_built_rev = self.geometry_revision;
             }
         }
+        let picking = ctx.picking_rect_px();
+        if picking.is_none() {
+            self.sync_shared_selection(ctx.device, ctx.queue, use_storage);
+        }
         let Some(p) = self.pipelines.as_ref() else {
             return pending;
         };
         let batch = p.dynamic_uniforms;
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let batch = batch && self.profile_batch_uniforms;
-        let picking = ctx.picking_rect_px();
         let index = self
             .views
             .iter()
@@ -2585,26 +3125,35 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             );
         }
         if picking.is_none() {
-            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
-            let _scope = iletki_wgpu::profiling::scope("scene.outline_bounds_prepare");
-            let update = view.outline_bounds.update(
-                ctx,
-                self.revision,
-                self.chunks.len(),
-                self.selected_slots.iter().filter_map(|&index| {
-                    let chunk = self.chunks.get(index)?.as_ref()?;
-                    (chunk.visible && chunk.vertex_count != 0).then_some((
-                        index,
-                        chunk.local_bounds,
-                        chunk.origin,
-                    ))
-                }),
-            );
+            let update = {
+                #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                let _scope = iletki_wgpu::profiling::scope("scene.outline_bounds_prepare");
+                if self.selected_slots.len() > LARGE_SELECTION_ENVELOPE_THRESHOLD {
+                    view.outline_bounds.update_envelope(
+                        ctx,
+                        self.revision,
+                        self.shared_selected_envelope,
+                    )
+                } else {
+                    view.outline_bounds.update(
+                        ctx,
+                        self.revision,
+                        self.chunks.len(),
+                        self.selected_slots.iter().filter_map(|index| {
+                            let chunk = self.chunks.get(index)?.as_ref()?;
+                            (chunk.visible && chunk.vertex_count != 0).then_some((
+                                index,
+                                chunk.local_bounds,
+                                chunk.origin,
+                            ))
+                        }),
+                    )
+                }
+            };
             match update {
                 OutlineUpdate::Unchanged => return pending,
                 OutlineUpdate::Selection if self.selected_slots.is_empty() => {
                     view.mask.clear();
-                    view.storage_mask.clear();
                     return pending;
                 }
                 OutlineUpdate::Selection
@@ -2613,14 +3162,19 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             || view.retained_full_scene
                             || view.gpu_cull_active) =>
                 {
-                    Self::prepare_storage_mask(&self.chunks, &self.selected_slots, view);
                     return pending;
                 }
                 OutlineUpdate::Selection
                     if pack_geometry && !use_storage && view.faces.has_packed() =>
                 {
                     if let Some(packed) = &p.packed
-                        && Self::prepare_packed_mask(ctx, &packed.layout, &self.chunks, view)
+                        && Self::prepare_packed_mask(
+                            ctx,
+                            &packed.layout,
+                            &self.chunks,
+                            &self.selected_slots,
+                            view,
+                        )
                     {
                         // A dense mask uses the cached face ranges and its own uniform pages.
                         // Direct face draws already have their own transform slots.
@@ -2666,9 +3220,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         ctx.active_px,
                         self.transform_table.anchor(),
                         cull_sections,
-                        gpu_scene.item_count,
-                        gpu_scene.world_bounds,
-                        gpu_scene.bucket_count,
+                        gpu_scene,
                     );
                     if GpuCullView::ensure_and_update(
                         &mut view.gpu_cull,
@@ -2688,7 +3240,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         view.direct_uniforms.clear();
                         view.storage_faces.clear();
                         view.storage_edges.clear();
-                        view.storage_mask.clear();
                         view.has_edges = gpu_scene.has_edges;
 
                         for &chunk_index in &gpu_scene.extra_chunks {
@@ -2718,14 +3269,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             {
                                 continue;
                             }
-                            let face_extra = chunk
-                                .vertex_buf
-                                .as_ref()
-                                .filter(|v| v.is_direct() || v.repeats());
+                            let face_extra = chunk.vertex_buf.as_ref().filter(|v| {
+                                !gpu_cull::face_in_gpu_cull(v, chunk.face_ranges.is_some())
+                            });
                             let edge_extra = chunk
                                 .edge_buf
                                 .as_ref()
-                                .filter(|e| e.is_direct() || e.repeats());
+                                .filter(|e| !gpu_cull::edge_in_gpu_cull(e));
                             let needs_direct = face_extra.is_some_and(VertexRange::is_direct)
                                 || edge_extra.is_some_and(VertexRange::is_direct);
                             let draw_index = if needs_direct {
@@ -2759,7 +3309,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         if !view.direct_uniforms.is_empty() {
                             view.upload(ctx.device, ctx.queue, &p.object_layout);
                         }
-                        Self::prepare_storage_mask(&self.chunks, &self.selected_slots, view);
                         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                         if profiling {
                             iletki_wgpu::profiling::count("scene.gpu_cull_active", 1);
@@ -2995,7 +3544,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     }
                     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                     drop(visibility);
-                    Self::prepare_storage_mask(&self.chunks, &self.selected_slots, view);
                     #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                     if profiling {
                         let draws = view
@@ -3048,7 +3596,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 view.direct_uniforms.clear();
                 view.storage_faces.clear();
                 view.storage_edges.clear();
-                view.storage_mask.clear();
                 view.has_edges = false;
                 let [width, height] = ctx.active_px;
                 let viewport_volume =
@@ -3147,7 +3694,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             .is_some_and(VertexRange::is_direct);
                         let edge_direct =
                             chunk.edge_buf.as_ref().is_some_and(VertexRange::is_direct);
-                        let draw_index = if (face_direct && (!section_culled || chunk.selected))
+                        let chunk_slot = group_index * SECTION_GROUP_SIZE + slot;
+                        let draw_index = if (face_direct
+                            && (!section_culled || self.selected_slots.contains(chunk_slot)))
                             || (edge_direct && !section_culled)
                         {
                             let idx = view.draws.len();
@@ -3156,7 +3705,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 scale: 1.0,
                             };
                             view.draws.push(PreparedObject {
-                                chunk: group_index * SECTION_GROUP_SIZE + slot,
+                                chunk: chunk_slot,
                                 section_culled,
                                 bridge_section_gap: bridge_group,
                                 direct_slot: Some(view.direct_uniforms.len()),
@@ -3234,7 +3783,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 }
                 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
                 drop(visibility);
-                Self::prepare_storage_mask(&self.chunks, &self.selected_slots, view);
                 if !view.direct_uniforms.is_empty() {
                     view.upload(ctx.device, ctx.queue, &p.object_layout);
                 }
@@ -3310,7 +3858,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             view.direct_uniforms.clear();
             view.storage_faces.clear();
             view.storage_edges.clear();
-            view.storage_mask.clear();
             view.has_edges = false;
             let storage_pick = p.storage.as_ref().is_some_and(|s| s.pick.is_some());
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -3465,7 +4012,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         view.gpu_cull_active = false;
         view.storage_faces.clear();
         view.storage_edges.clear();
-        view.storage_mask.clear();
         view.draws.clear();
         view.has_edges = false;
         view.faces.clear();
@@ -3626,8 +4172,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             .map(|packed| &packed.layout);
         let packed_mask = picking.is_none()
             && self.selected_slots.len() >= 128
-            && packed_layout
-                .is_some_and(|layout| Self::prepare_packed_mask(ctx, layout, &self.chunks, view));
+            && packed_layout.is_some_and(|layout| {
+                Self::prepare_packed_mask(ctx, layout, &self.chunks, &self.selected_slots, view)
+            });
         let [width, height] = ctx.active_px;
         let viewport_volume = PickVolume::new(projection, ctx.active_px, [0, 0, width, height]);
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
@@ -3640,7 +4187,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     continue;
                 };
                 let mut direct = packed_layout.is_none()
-                    || (picking.is_none() && chunk.selected && !packed_mask);
+                    || (picking.is_none()
+                        && self.selected_slots.contains(object.chunk)
+                        && !packed_mask);
                 if packed_layout.is_some() {
                     if let Some(geometry) = &chunk.vertex_buf {
                         // A direct face can still be selected even when its opaque draw is culled.
@@ -3826,7 +4375,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     .filter(|_| self.use_antialiased_section)
                     .or(storage.multisampled_mask.as_ref())
             });
-            self.paint_outline_mask(mask, packed, storage, pass, ctx);
+            let repeated_storage = p.storage.as_ref().and_then(|storage| {
+                let rep = storage.repeated.as_ref()?;
+                rep.section_mask
+                    .as_ref()
+                    .filter(|_| self.use_antialiased_section)
+                    .or(rep.multisampled_mask.as_ref())
+            });
+            self.paint_outline_mask(mask, packed, storage, repeated_storage, pass, ctx);
         }
     }
 
@@ -3969,7 +4525,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             repeated_flat: rep.and_then(|(_, f)| f),
             repeated_slots: None,
         };
-        gpu_scene.paint_phase2(pass, gpu_view, storage_bg, &face_pipelines, &color.edges);
+        let edge_pipelines = PaintPipelines {
+            smooth: &color.edges,
+            flat: None,
+            repeated_smooth: rep.map(|(c, _)| &c.edges),
+            repeated_flat: None,
+            repeated_slots: None,
+        };
+        gpu_scene.paint_phase2(pass, gpu_view, storage_bg, &face_pipelines, &edge_pipelines);
 
         // Draw any extra direct/repeated edges (hybrid scenes).
         if view.has_edges && (view.storage_edges.has_packed() || !view.draws.is_empty()) {
@@ -4315,6 +4878,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     &p.mask,
                     p.packed.as_ref().map(|packed| &packed.mask),
                     p.storage.as_ref().map(|storage| &storage.mask),
+                    p.storage
+                        .as_ref()
+                        .and_then(|storage| storage.repeated.as_ref())
+                        .and_then(|rep| rep.mask.as_ref()),
                     pass,
                     ctx,
                 );

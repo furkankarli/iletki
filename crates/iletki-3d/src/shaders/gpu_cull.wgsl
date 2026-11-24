@@ -6,6 +6,8 @@ const FLAG_FACE_INDEXED: u32 = 4u;
 const FLAG_HAS_FACES: u32 = 8u;
 const FLAG_HAS_EDGES: u32 = 16u;
 const FLAG_EDGE_INDEXED: u32 = 32u;
+const FLAG_FACE_REPEATED: u32 = 64u;
+const FLAG_EDGE_REPEATED: u32 = 128u;
 
 const VIS_PREV: u32 = 1u;
 const VIS_DRAWN_P1: u32 = 2u;
@@ -29,6 +31,10 @@ struct CullViewUniforms {
     active_w: u32,
     active_h: u32,
     bucket_count: u32,
+    repeated_indexed_count: u32,
+    repeated_non_indexed_count: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 struct ChunkTransformGpu {
@@ -89,6 +95,9 @@ var<storage, read_write> non_indexed_args: array<DrawArgs>;
 @group(0) @binding(6)
 var<storage, read_write> bucket_counts: array<atomic<u32>>;
 
+@group(0) @binding(7)
+var<storage, read_write> repeated_instances: array<u32>;
+
 // Exact 64-bit Q32.32 fixed-point subtraction matching `mesh3d_storage.wgsl`.
 fn sub_q32_32(
     a_hi: vec3<i32>,
@@ -125,5 +134,24 @@ fn emit_draw(bucket: u32, indirect_base: u32, first: u32, count: u32, indexed: b
         indexed_args[dst] = DrawIndexedArgs(count, 1u, first, 0, 0u);
     } else {
         non_indexed_args[dst] = DrawArgs(count, 1u, first, 0u);
+    }
+}
+
+fn emit_repeated(
+    bucket: u32,
+    inst_base: u32,
+    arg_idx: u32,
+    elem_count: u32,
+    chunk_index: u32,
+    indexed: bool,
+) {
+    let slot = atomicAdd(&bucket_counts[bucket], 1u);
+    repeated_instances[inst_base + slot] = chunk_index;
+    if (slot == 0u) {
+        if (indexed) {
+            indexed_args[arg_idx] = DrawIndexedArgs(elem_count, 0u, 0u, 0, bucket);
+        } else {
+            non_indexed_args[arg_idx] = DrawArgs(elem_count, 0u, 0u, bucket);
+        }
     }
 }
