@@ -38,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -48,6 +49,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
+const MAX_MOVING_PREVIEW_AGE: Duration = Duration::from_millis(50);
 const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
 
 const MARQUEE_SHADER: &str = r#"
@@ -144,6 +146,14 @@ struct PickView {
     revision: iletki::gpu::LayerRevision,
 }
 
+impl PickView {
+    fn same_surface(&self, other: &Self) -> bool {
+        self.scene == other.scene
+            && self.size == other.size
+            && self.dpi.to_bits() == other.dpi.to_bits()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickKind {
     Click,
@@ -157,6 +167,13 @@ struct PickRequest {
     event: Option<usize>,
     kind: PickKind,
     epoch: u64,
+    input_at: Instant,
+}
+
+struct SubmittedPick {
+    pick: PendingPick,
+    request: PickRequest,
+    submitted_at: Instant,
 }
 
 struct GpuState {
@@ -185,7 +202,7 @@ struct GpuState {
     chunk_by_object: HashMap<u32, usize>,
     committed_selection: HashSet<Chunk3DId>,
     visible_selection: HashSet<Chunk3DId>,
-    preview_view: Option<PickView>,
+    preview_view: Option<(PickView, Instant)>,
     grid_3d: InfiniteGrid3DLayer,
     gizmo_3d: TransformGizmoLayer,
     instanced_3d: InstancedMesh3DLayer,
@@ -203,9 +220,11 @@ struct GpuState {
     marquee_rect: Option<[u32; 4]>,
     marquee_border: wgpu::RenderPipeline,
     pick_epoch: u64,
-    pending_pick: Option<(PendingPick, PickRequest)>,
+    pending_pick: Option<SubmittedPick>,
     queued_pick: Option<PickRequest>,
     preview_pacing: preview::PreviewPacing,
+    frames_in_flight: Arc<AtomicUsize>,
+    deferred_redraw: bool,
     latency: Option<latency::Trace>,
     #[cfg(feature = "profiling")]
     pick_profile: bool,
@@ -442,6 +461,8 @@ impl GpuState {
             pending_pick: None,
             queued_pick: None,
             preview_pacing,
+            frames_in_flight: Arc::new(AtomicUsize::new(0)),
+            deferred_redraw: false,
             latency,
             #[cfg(feature = "profiling")]
             pick_profile,
@@ -781,14 +802,15 @@ impl GpuState {
         if let (Some(trace), Some(id)) = (&mut self.latency, event) {
             trace.selection_rect(id, rect);
         }
+        let now = Instant::now();
         let request = PickRequest {
             rect,
             view: self.pick_view(kind),
             event,
             kind,
             epoch: self.pick_epoch,
+            input_at: now,
         };
-        let now = Instant::now();
         if kind == PickKind::Preview {
             self.preview_pacing.input(now);
             if self
@@ -878,7 +900,11 @@ impl GpuState {
             // Picking can itself finish progressive uploads during preparation.
             request.view = self.pick_view(request.kind);
             self.pick_status(request.event, "submitted", None);
-            self.pending_pick = Some((pick, request));
+            self.pending_pick = Some(SubmittedPick {
+                pick,
+                request,
+                submitted_at: Instant::now(),
+            });
         } else {
             self.pick_status(request.event, "error", None);
             if request.kind == PickKind::Commit {
@@ -887,11 +913,15 @@ impl GpuState {
         }
     }
 
-    fn clear_stale_preview(&mut self) {
+    fn preview_deadline(&self) -> Option<Instant> {
+        let (view, input_at) = self.preview_view.as_ref()?;
+        (*view != self.pick_view(PickKind::Preview)).then(|| *input_at + MAX_MOVING_PREVIEW_AGE)
+    }
+
+    fn clear_stale_preview(&mut self, now: Instant) {
         if self
-            .preview_view
-            .as_ref()
-            .is_some_and(|view| *view != self.pick_view(PickKind::Preview))
+            .preview_deadline()
+            .is_some_and(|deadline| now >= deadline)
         {
             self.clear_preview("stale-before-frame");
             self.window.request_redraw();
@@ -899,31 +929,51 @@ impl GpuState {
     }
 
     fn poll_pick(&mut self) {
-        self.clear_stale_preview();
-        let Some((pick, _)) = &mut self.pending_pick else {
+        let now = Instant::now();
+        self.clear_stale_preview(now);
+        let Some(pending) = &mut self.pending_pick else {
             return;
         };
-        let Poll::Ready(result) = pick.try_read() else {
+        let Poll::Ready(result) = pending.pick.try_read() else {
             return;
         };
-        let Some((_, mut request)) = self.pending_pick.take() else {
+        let Some(SubmittedPick {
+            mut request,
+            submitted_at,
+            ..
+        }) = self.pending_pick.take()
+        else {
             return;
         };
         if let Ok(hits) = &result {
             self.pick_status(request.event, "ready", Some(hits.len()));
         }
+        let current = self.pick_view(request.kind);
+        let preview = request.kind == PickKind::Preview;
+        let commit_queued = self
+            .queued_pick
+            .as_ref()
+            .is_some_and(|queued| queued.kind == PickKind::Commit);
+        let recent_preview = preview
+            && !commit_queued
+            && request.view.same_surface(&current)
+            && now.saturating_duration_since(request.input_at) < MAX_MOVING_PREVIEW_AGE;
         if request.epoch != self.pick_epoch || self.quad_view {
             self.pick_status(request.event, "cancelled", None);
-        } else if request.view != self.pick_view(request.kind) {
+            return;
+        }
+        if preview {
+            self.preview_pacing.pick_ready(submitted_at, now);
+        }
+        if request.view != current && !recent_preview {
             if request.kind == PickKind::Commit {
-                request.view = self.pick_view(request.kind);
+                request.view = current;
                 self.begin_pick(request);
                 return;
             }
             self.pick_status(request.event, "stale", None);
         } else if let Ok(hits) = result {
             let event = request.event;
-            let preview = request.kind == PickKind::Preview;
             if let Some(trace) = &mut self.latency
                 && let Some(id) = event
             {
@@ -978,7 +1028,7 @@ impl GpuState {
                 self.committed_selection = selected;
                 self.sync_highlights(None);
             } else {
-                self.preview_view = Some(request.view);
+                self.preview_view = Some((request.view, request.input_at));
                 self.sync_highlights(Some(selected));
             }
             if request.kind == PickKind::Commit {
@@ -1276,12 +1326,42 @@ impl GpuState {
                 status,
                 streaming: false,
                 dynamic_drawn: false,
+                preview_view_changed: false,
             });
         }
     }
 
+    fn pending_preview(&self) -> Option<&SubmittedPick> {
+        self.pending_pick
+            .as_ref()
+            .filter(|pending| pending.request.kind == PickKind::Preview)
+    }
+
+    fn preview_active(&self) -> bool {
+        self.marquee_origin.is_some()
+            || self.preview_view.is_some()
+            || self.pending_preview().is_some()
+            || self
+                .queued_pick
+                .as_ref()
+                .is_some_and(|request| request.kind == PickKind::Preview)
+    }
+
+    fn render_backlogged(&self, now: Instant) -> bool {
+        self.frames_in_flight.load(Ordering::Relaxed) != 0
+            && self.preview_active()
+            && self
+                .preview_pacing
+                .gpu_backlogged(now, self.pending_preview().map(|pick| pick.submitted_at))
+    }
+
     fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
+        if self.render_backlogged(frame_start) {
+            self.deferred_redraw = true;
+            return Ok(());
+        }
+        self.deferred_redraw = false;
         self.preview_pacing.frame_started();
         #[cfg(feature = "profiling")]
         if self.pick_profile
@@ -1334,7 +1414,7 @@ impl GpuState {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
 
-        self.clear_stale_preview();
+        self.clear_stale_preview(Instant::now());
         let mut streaming = false;
         let mut dynamic_drawn = false;
         if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
@@ -1474,6 +1554,13 @@ impl GpuState {
         let commands = enc.finish();
         let encoded = Instant::now();
         self.queue.submit([commands]);
+        if self.preview_active() {
+            self.frames_in_flight.fetch_add(1, Ordering::Relaxed);
+            let in_flight = self.frames_in_flight.clone();
+            self.queue.on_submitted_work_done(move || {
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         let submitted = self.latency.as_ref().map(|_| Instant::now());
         if let Some(trace) = &self.latency {
             trace.track_gpu(&self.queue, trace.frame_id());
@@ -1485,6 +1572,7 @@ impl GpuState {
         }
         self.queue.present(output);
         let presented = Instant::now();
+        let preview_view_changed = self.latency.is_some() && self.preview_deadline().is_some();
         if let (Some(trace), Some(viewport_encoded), Some(submitted)) =
             (&mut self.latency, viewport_encoded, submitted)
         {
@@ -1499,6 +1587,7 @@ impl GpuState {
                 status: "present-called",
                 streaming,
                 dynamic_drawn,
+                preview_view_changed,
             });
         }
 
@@ -1611,6 +1700,18 @@ impl ApplicationHandler for DemoApp {
                 .as_ref()
                 .map(|_| Instant::now() + PICK_POLL_INTERVAL)
                 .or_else(|| state.queued_pick_deadline());
+            if state.deferred_redraw {
+                let _ = state.device.poll(wgpu::PollType::Poll);
+                if state.render_backlogged(Instant::now()) {
+                    let poll = Instant::now() + PICK_POLL_INTERVAL;
+                    deadline = Some(deadline.map_or(poll, |existing| existing.min(poll)));
+                } else {
+                    state.window.request_redraw();
+                }
+            }
+            if let Some(expiry) = state.preview_deadline() {
+                deadline = Some(deadline.map_or(expiry, |existing| existing.min(expiry)));
+            }
             if let Some(trace) = &state.latency {
                 if trace.pending_gpu() {
                     let _ = state.device.poll(wgpu::PollType::Poll);
@@ -1690,8 +1791,8 @@ impl ApplicationHandler for DemoApp {
                                 || s.queued_pick
                                     .as_ref()
                                     .is_some_and(|request| request.kind == PickKind::Commit)
-                                || s.pending_pick.as_ref().is_some_and(|(_, request)| {
-                                    request.kind == PickKind::Commit
+                                || s.pending_pick.as_ref().is_some_and(|pending| {
+                                    pending.request.kind == PickKind::Commit
                                 }) =>
                         {
                             s.cancel_selection()

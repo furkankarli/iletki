@@ -241,6 +241,7 @@ pub(crate) struct Event {
     submitted: Option<u128>,
     ready: Option<u128>,
     highlight_applied: Option<u128>,
+    preview_view_changed: Option<bool>,
     frame: Option<u32>,
     hits: Option<usize>,
     rect: Option<[u32; 4]>,
@@ -262,6 +263,7 @@ pub(crate) struct Frame {
     pub(crate) status: &'static str,
     pub(crate) streaming: bool,
     pub(crate) dynamic_drawn: bool,
+    pub(crate) preview_view_changed: bool,
 }
 
 pub(crate) struct Trace {
@@ -384,6 +386,7 @@ impl Trace {
             submitted: None,
             ready: None,
             highlight_applied: None,
+            preview_view_changed: None,
             frame: None,
             hits: None,
             rect: None,
@@ -509,6 +512,9 @@ impl Trace {
                 if let Some(event) = self.events.get_mut(id) {
                     event.frame = Some(frame.id);
                     event.status = "applied";
+                    if event.kind == "marquee" {
+                        event.preview_view_changed = Some(frame.preview_view_changed);
+                    }
                 }
             }
         }
@@ -606,7 +612,7 @@ impl Trace {
         let mut events = BufWriter::new(File::create(self.options.directory.join("events.csv"))?);
         writeln!(
             events,
-            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest,highlight_applied_ns"
+            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest,highlight_applied_ns,preview_view_changed"
         )?;
         for (id, event) in self.events.iter().enumerate() {
             fn field<T: ToString>(value: Option<T>) -> String {
@@ -618,7 +624,7 @@ impl Trace {
                 .unwrap_or_default();
             writeln!(
                 events,
-                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{},{}",
+                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{},{},{}",
                 event.kind,
                 event.warmup,
                 event.scheduled,
@@ -634,6 +640,7 @@ impl Trace {
                 field(event.highlighted),
                 field(event.release_digest),
                 field(event.highlight_applied),
+                field(event.preview_view_changed),
             )?;
         }
         events.flush()?;

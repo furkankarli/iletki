@@ -751,11 +751,7 @@ impl ViewportHost {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: if resolve_target.is_some() {
-                            wgpu::StoreOp::Discard
-                        } else {
-                            wgpu::StoreOp::Store
-                        },
+                        store: resolved_color_store(resolve_target),
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -806,7 +802,7 @@ impl ViewportHost {
                 resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
-                    store: wgpu::StoreOp::Store,
+                    store: resolved_color_store(resolve_target),
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -814,7 +810,7 @@ impl ViewportHost {
                 depth_ops: Some(wgpu::Operations {
                     // Reversed-Z clear: 0.0 is far plane.
                     load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
             }),
@@ -857,7 +853,7 @@ impl ViewportHost {
                 resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
-                    store: wgpu::StoreOp::Store,
+                    store: resolved_color_store(resolve_target),
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -937,7 +933,11 @@ impl ViewportHost {
                     },
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.config.wgpu_clear_color()),
-                        store: wgpu::StoreOp::Store,
+                        store: if has_second_pass {
+                            wgpu::StoreOp::Store
+                        } else {
+                            resolved_color_store(resolve_target)
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -976,7 +976,7 @@ impl ViewportHost {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
+                        store: resolved_color_store(resolve_target),
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1329,6 +1329,15 @@ impl StagedPick {
             *available = Some(self.buffers);
         }
         decode_pick_hits(camera, self.logical, dpi_scale, self.rect, ids, depths)
+    }
+}
+
+// Only the single-sample output is used after the final color pass.
+fn resolved_color_store(resolve_target: Option<&wgpu::TextureView>) -> wgpu::StoreOp {
+    if resolve_target.is_some() {
+        wgpu::StoreOp::Discard
+    } else {
+        wgpu::StoreOp::Store
     }
 }
 

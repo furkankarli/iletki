@@ -180,6 +180,25 @@ impl VertexRange {
         matches!(self, Self::Packed { page, .. } if page.repeated_vertices != 0)
     }
 
+    pub(crate) fn packed_subrange(&self, range: Range<u32>) -> Option<Self> {
+        let Self::Packed {
+            page,
+            vertices,
+            slot,
+        } = self
+        else {
+            return None;
+        };
+        if range.start >= range.end || range.end > vertices.end - vertices.start {
+            return None;
+        }
+        Some(Self::Packed {
+            page: page.clone(),
+            vertices: vertices.start + range.start..vertices.start + range.end,
+            slot: *slot,
+        })
+    }
+
     pub(crate) fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
         match self {
             Self::Direct(buffers) => buffers.bind(pass, None),

@@ -5,9 +5,68 @@ use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
 use iletki_core::{Bounds3, Camera, Frustum, MAX_CLIP_PLANES, Mat4, Vec3, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 const OBJECT_BYTES: usize = std::mem::size_of::<ObjectUniforms>();
 const PAGE_BYTES: usize = 1024 * 1024;
+// Whole triangle lists, in submission order, so equal-depth color and pick ties are unchanged.
+const FACE_RANGE_VERTICES: usize = 1536;
+
+pub(crate) struct FaceRanges {
+    bounds: Box<[Bounds3]>,
+    vertex_count: u32,
+}
+
+impl FaceRanges {
+    pub(crate) fn new(vertices: &[Vertex3D]) -> Option<Self> {
+        if vertices.len() < 4 * FACE_RANGE_VERTICES {
+            return None;
+        }
+        let bounds = vertices.chunks(FACE_RANGE_VERTICES).map(|vertices| {
+            let mut bounds = Bounds3::EMPTY;
+            for vertex in vertices {
+                let [x, y, z] = vertex.position.map(f64::from);
+                let position = Vec3::new(x, y, z);
+                if !position.is_finite() {
+                    // An uncertain range must always go through the rasterizer.
+                    return Bounds3::EMPTY;
+                }
+                bounds.include(position);
+            }
+            bounds
+        });
+        Some(Self {
+            bounds: bounds.collect(),
+            vertex_count: u32::try_from(vertices.len()).ok()?,
+        })
+    }
+
+    /// Emits adjacent visible blocks in a single draw and returns the number of omitted vertices.
+    pub(crate) fn visit_visible(
+        &self,
+        mut visible: impl FnMut(Bounds3) -> bool,
+        mut emit: impl FnMut(Range<u32>),
+    ) -> u32 {
+        let mut start = 0;
+        let mut omitted = 0;
+        for (block, &bounds) in self.bounds.iter().enumerate() {
+            if !visible(bounds) {
+                let end = (block * FACE_RANGE_VERTICES) as u32;
+                if start < end {
+                    emit(start..end);
+                }
+                start = end
+                    .saturating_add(FACE_RANGE_VERTICES as u32)
+                    .min(self.vertex_count);
+                omitted += start - end;
+            }
+        }
+        if start < self.vertex_count {
+            emit(start..self.vertex_count);
+        }
+        omitted
+    }
+}
 
 pub(crate) struct PreparedObject {
     pub(crate) chunk: usize,

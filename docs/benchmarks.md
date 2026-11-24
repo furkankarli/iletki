@@ -89,6 +89,8 @@ plane inside the camera frustum.
 `scene.section_deferred_chunks` counts small packed chunks tested only by the rasterizer.
 The `scene.section_bridged_triangles` and
 `scene.section_bridged_edge_vertices` counters track clipped geometry retained to merge draws.
+`scene.range_culled_triangles` counts triangles omitted from large packed meshes when
+a whole consecutive range falls outside the viewport, selection rectangle, or section.
 Use `ILETKI_ASSEMBLY_NO_SECTION_GROUPS=1` to compare grouped bounds against
 per-chunk culling. The `scene.section_chunk_tests` and `scene.frustum_chunk_tests` counters
 track individual bounds tests, and `scene.opaque_triangles` counts triangles submitted
@@ -150,7 +152,12 @@ final release event. Set `--input-hz 240 --samples 1440` or
 `--input-hz 500 --samples 3000` to replay six seconds of input faster than the display.
 During a burst, the demo keeps the newest pending preview and schedules GPU work against
 the window's nominal refresh interval. A ready preview gets a redraw opportunity before
-the next preview is encoded. Release requests take priority.
+the next preview is encoded. When a readback exceeds three quarters of a refresh interval,
+the demo defers redraws while submitted frames finish so the render queue can drain.
+A moving marquee can show a preview from the same viewport sized at the same DPI for
+up to 50 ms from its input timestamp. The event CSV's `preview_view_changed` field
+identifies previews drawn after the camera or scene changed. Release requests take
+priority and resolve an exact pick for the current view.
 
 For simultaneous orbit, live section, scene edits, and marquee previews, use
 `--action marquee --style edges-section --motion combined`. Add `--dual` to split

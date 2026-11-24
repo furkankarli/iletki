@@ -4,8 +4,8 @@
 
 use crate::face_batch::{self, PageBuilder, VertexBuffers, VertexLayout, VertexRange};
 use crate::objects::{
-    PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume, ViewObjects,
-    bounds_cover_vertices,
+    FaceRanges, PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume,
+    ViewObjects, bounds_cover_vertices,
 };
 use crate::outline_bounds::OutlineUpdate;
 use crate::section::SectionAa;
@@ -52,6 +52,7 @@ struct ChunkEntry {
     pending_mesh: Option<Box<Mesh3D>>,
     vertex_buf: Option<VertexRange>,
     vertex_count: u32,
+    face_ranges: Option<Box<FaceRanges>>,
     edge_buf: Option<VertexRange>,
     edge_count: u32,
     pick_buf: Option<Box<wgpu::Buffer>>,
@@ -376,6 +377,7 @@ impl Scene3DLayer {
             pending_mesh: Some(Box::new(mesh)),
             vertex_buf: None,
             vertex_count: 0,
+            face_ranges: None,
             edge_buf: None,
             edge_count: 0,
             pick_buf: None,
@@ -1044,6 +1046,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     let picks = (mesh.pick_ids.len() == mesh.vertices.len())
                         .then_some(mesh.pick_ids.as_slice());
                     if pack {
+                        chunk.face_ranges = FaceRanges::new(&mesh.vertices).map(Box::new);
                         builder.push(
                             chunk_index,
                             &mesh.vertices,
@@ -1332,6 +1335,10 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             && self.selected_slots.len() >= 128
             && packed_layout
                 .is_some_and(|layout| Self::prepare_packed_mask(ctx, layout, &self.chunks, view));
+        let [width, height] = ctx.active_px;
+        let viewport_volume = PickVolume::new(projection, ctx.active_px, [0, 0, width, height]);
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let mut omitted_face_vertices = 0usize;
         {
             #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
             let _profile = iletki_wgpu::profiling::scope("scene.geometry_batch");
@@ -1345,14 +1352,53 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     if let Some(geometry) = &chunk.vertex_buf {
                         // A direct face can still be selected even when its opaque draw is culled.
                         direct |= matches!(geometry, VertexRange::Direct(_));
-                        view.faces.push_color(
-                            geometry,
-                            object.uniforms,
-                            index,
-                            object.section_culled,
-                            object.bridge_section_gap,
-                            picking.is_none(),
-                        );
+                        if !object.section_culled
+                            && let Some(ranges) = &chunk.face_ranges
+                        {
+                            let (relation, inside_frustum) = self
+                                .section_relations
+                                .get(object.chunk / SECTION_GROUP_SIZE)
+                                .copied()
+                                .unwrap_or((SectionRelation::Crossing, false));
+                            let section = section_volume.as_ref().filter(|_| {
+                                relation != SectionRelation::Inside || !chunk.section_bounds_trusted
+                            });
+                            let volume = pick_volume.as_ref().or_else(|| {
+                                (!inside_frustum || !chunk.section_bounds_trusted)
+                                    .then_some(&viewport_volume)
+                            });
+                            let offset = object.uniforms.offset_rel;
+                            if volume.is_some() || section.is_some() {
+                                let _omitted = ranges.visit_visible(
+                                    |bounds| {
+                                        volume.map_or_else(
+                                            || section.is_none_or(|s| !s.excludes(bounds, offset)),
+                                            |volume| volume.intersects(bounds, offset, section),
+                                        )
+                                    },
+                                    |range| {
+                                        if let Some(range) = geometry.packed_subrange(range) {
+                                            view.faces.push(&range, object.uniforms, index);
+                                        }
+                                    },
+                                );
+                                #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                                {
+                                    omitted_face_vertices += _omitted as usize;
+                                }
+                            } else {
+                                view.faces.push(geometry, object.uniforms, index);
+                            }
+                        } else {
+                            view.faces.push_color(
+                                geometry,
+                                object.uniforms,
+                                index,
+                                object.section_culled,
+                                object.bridge_section_gap,
+                                picking.is_none(),
+                            );
+                        }
                     }
                     if picking.is_none()
                         && let Some(geometry) = &chunk.edge_buf
@@ -1382,6 +1428,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         if profiling {
             let bridged_triangles = view.faces.section_gap_vertices() / 3;
+            let omitted_ranges = omitted_face_vertices / 3;
+            iletki_wgpu::profiling::count("scene.range_culled_triangles", omitted_ranges);
             iletki_wgpu::profiling::count("scene.section_bridged_triangles", bridged_triangles);
             iletki_wgpu::profiling::count(
                 "scene.section_bridged_edge_vertices",
@@ -1396,7 +1444,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             iletki_wgpu::profiling::count("scene.frustum_chunk_tests", frustum_tests);
             iletki_wgpu::profiling::count(
                 "scene.opaque_triangles",
-                opaque_triangles + bridged_triangles,
+                (opaque_triangles + bridged_triangles).saturating_sub(omitted_ranges),
             );
             iletki_wgpu::profiling::count("scene.scanned_slots", self.chunks.len());
             iletki_wgpu::profiling::count("scene.candidates", view.draws.len());

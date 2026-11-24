@@ -183,9 +183,28 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
         );
         scene.insert(moved_mesh);
         scene.remove(removed.unwrap());
+        let mut large = Mesh3D::at_origin(Vec3::new(0.0, -1.2, 0.0));
+        for (sub, x) in [(1, 1.0), (2, -2.0), (3, 8.0), (4, 2.5)] {
+            // Each block has the same visibility, and the chunk straddles both cut and view.
+            for _ in 0..512 {
+                large.push_triangle(
+                    Vec3::new(x, 0.0, -0.5),
+                    Vec3::new(x + 0.4, 0.0, -0.5),
+                    Vec3::new(x, 0.0, 0.2),
+                    COLOR,
+                    PickId::new(1, 291, sub),
+                );
+            }
+        }
+        scene.insert(large);
         iletki_wgpu::profiling::begin(&device);
         let image = render(&device, &queue, &mut host, &mut scene, camera.clone()).unwrap();
         let capture = iletki_wgpu::profiling::finish(&device, &queue).unwrap();
+        assert!(capture.counters.iter().any(|&(label, value)| {
+            label == "scene.range_culled_triangles"
+                && value
+                    == 512 * (1 + usize::from(features.contains(wgpu::Features::CLIP_DISTANCES)))
+        }));
         if features.contains(wgpu::Features::CLIP_DISTANCES) {
             for counter in [
                 "scene.section_bridged_triangles",
@@ -236,6 +255,7 @@ fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
             .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], area)
             .unwrap();
         assert!(!packed.is_empty());
+        assert!(packed.iter().any(|hit| hit.id == PickId::new(1, 291, 4)));
         assert_eq!(
             packed
                 .iter()
