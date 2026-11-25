@@ -85,6 +85,33 @@ jobs:
           cargo clippy --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- -D warnings
           xvfb-run -a cargo run --locked --manifest-path examples/slint/Cargo.toml --target-dir target/slint-demo -- --smoke
 
+  opengl:
+    name: Native OpenGL (ubuntu-24.04, Mesa GL)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WGPU_BACKEND: gl
+      ILETKI_EXPECT_BACKEND: gl
+      LIBGL_ALWAYS_SOFTWARE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Mesa OpenGL runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1-mesa-dri libgles2 mesa-utils
+
+      - name: Verify OpenGL fallback, provoking-vertex self-test and depth copy
+        run: >-
+          cargo test --locked -p iletki-wgpu -p iletki-2d -p iletki-3d --all-features
+          -- --test-threads=1
+
   webgpu:
     name: Browser WebGPU (headless Chrome)
     runs-on: ubuntu-24.04
@@ -130,7 +157,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: [ci, webgpu]
+    needs: [ci, opengl, webgpu]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:

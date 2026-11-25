@@ -24,14 +24,8 @@ impl SectionAa {
         })
     }
 
-    pub(crate) fn shader(
-        self,
-        device: &wgpu::Device,
-        base: &str,
-        sampled: &str,
-        raster: &str,
-    ) -> wgpu::ShaderModule {
-        let source = match self {
+    pub(crate) fn shader_source(self, base: &str, sampled: &str, raster: &str) -> String {
+        match self {
             Self::Sampled => format!(
                 "{base}\n{}\n{sampled}",
                 include_str!("shaders/sampled_section.wgsl")
@@ -40,7 +34,17 @@ impl SectionAa {
                 "enable clip_distances;\n{base}\n{}\n{raster}",
                 include_str!("shaders/raster_section.wgsl")
             ),
-        };
+        }
+    }
+
+    pub(crate) fn shader(
+        self,
+        device: &wgpu::Device,
+        base: &str,
+        sampled: &str,
+        raster: &str,
+    ) -> wgpu::ShaderModule {
+        let source = self.shader_source(base, sampled, raster);
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iletki-3d antialiased section shader"),
             source: wgpu::ShaderSource::Wgsl(source.into()),

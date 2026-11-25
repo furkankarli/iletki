@@ -8,6 +8,9 @@ use iletki_core::{BlockSizing, OutlineConfig, TargetSize, UploadBudget, Viewport
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Standard GPU picking ID texture format (64-bit packed [`iletki_core::PickId`]).
 pub const PICK_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+/// Compact 1-based 32-bit slot ID attachment format (`Rg16Uint`, guaranteed 4× MSAA in WebGPU core)
+/// for color-frame selection previews.
+pub const SELECTION_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Uint;
 
 /// Configuration for creating a [`crate::ViewportHost`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -165,14 +168,14 @@ pub(crate) struct TargetSet {
     sizing: BlockSizing,
     format: wgpu::TextureFormat,
     msaa_samples: u32,
+    depth_sampleable: bool,
+    can_copy_output: bool,
     msaa_view: Option<wgpu::TextureView>,
     depth_view: wgpu::TextureView,
-    #[cfg(not(target_arch = "wasm32"))]
     static_texture: wgpu::Texture,
     static_view: wgpu::TextureView,
     static_identity_bg: wgpu::BindGroup,
     static_crop_bg: wgpu::BindGroup,
-    #[cfg(not(target_arch = "wasm32"))]
     output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     output_crop_bg: wgpu::BindGroup,
@@ -244,6 +247,17 @@ impl TargetSet {
             tex.create_view(&wgpu::TextureViewDescriptor::default())
         });
 
+        let depth_features = DEPTH_FORMAT.guaranteed_format_features(device.features());
+        let depth_sampleable = device.adapter_info().backend != wgpu::Backend::Gl
+            && depth_features
+                .allowed_usages
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            && depth_features.flags.sample_count_supported(msaa_samples);
+        let depth_usage = if depth_sampleable {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iletki depth32"),
             size,
@@ -251,7 +265,7 @@ impl TargetSet {
             sample_count: msaa_samples,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: depth_usage,
             view_formats: &[],
         });
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -259,6 +273,15 @@ impl TargetSet {
         let single_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC;
+        let can_copy_output = format
+            .guaranteed_format_features(device.features())
+            .allowed_usages
+            .contains(wgpu::TextureUsages::COPY_DST);
+        let output_usage = if can_copy_output {
+            single_usage | wgpu::TextureUsages::COPY_DST
+        } else {
+            single_usage
+        };
 
         let static_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iletki static cache"),
@@ -281,7 +304,7 @@ impl TargetSet {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: single_usage,
+            usage: output_usage,
             view_formats: &[],
         });
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -291,14 +314,14 @@ impl TargetSet {
             sizing,
             format,
             msaa_samples,
+            depth_sampleable,
+            can_copy_output,
             msaa_view,
             depth_view,
-            #[cfg(not(target_arch = "wasm32"))]
             static_texture,
             static_view,
             static_identity_bg,
             static_crop_bg,
-            #[cfg(not(target_arch = "wasm32"))]
             output_texture,
             output_view,
             output_crop_bg,
@@ -321,6 +344,14 @@ impl TargetSet {
         &self.depth_view
     }
 
+    pub(crate) const fn depth_sampleable(&self) -> bool {
+        self.depth_sampleable
+    }
+
+    pub(crate) const fn can_copy_output(&self) -> bool {
+        self.can_copy_output
+    }
+
     /// Returns `(color_attachment_view, resolve_target)` targeting the static cache texture.
     pub(crate) fn static_color_views(&self) -> (&wgpu::TextureView, Option<&wgpu::TextureView>) {
         match &self.msaa_view {
@@ -337,7 +368,6 @@ impl TargetSet {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn static_texture(&self) -> &wgpu::Texture {
         &self.static_texture
     }
@@ -354,7 +384,6 @@ impl TargetSet {
         &self.static_crop_bg
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn output_texture(&self) -> &wgpu::Texture {
         &self.output_texture
     }
@@ -443,5 +472,66 @@ impl PickTargets {
 
     pub(crate) fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
+    }
+}
+
+/// Lazily allocated `Rg16Uint` MRT attachment matching the color pass sample count for active
+/// selection previews.
+pub(crate) struct SelectionPreviewTargets {
+    extent: [u32; 2],
+    msaa_samples: u32,
+    id_view: wgpu::TextureView,
+}
+
+impl std::fmt::Debug for SelectionPreviewTargets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectionPreviewTargets")
+            .field("extent", &self.extent)
+            .field("msaa_samples", &self.msaa_samples)
+            .finish()
+    }
+}
+
+impl SelectionPreviewTargets {
+    pub(crate) fn ensure<'a>(
+        slot: &'a mut Option<Self>,
+        device: &wgpu::Device,
+        allocated_px: [u32; 2],
+        msaa_samples: u32,
+    ) -> &'a Self {
+        let needs_alloc = slot
+            .as_ref()
+            .is_none_or(|t| t.extent != allocated_px || t.msaa_samples != msaa_samples);
+        if needs_alloc {
+            *slot = None;
+        }
+        slot.get_or_insert_with(|| {
+            let [width, height] = allocated_px;
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("iletki selection preview slot ids"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: msaa_samples,
+                dimension: wgpu::TextureDimension::D2,
+                format: SELECTION_ID_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let id_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            Self {
+                extent: allocated_px,
+                msaa_samples,
+                id_view,
+            }
+        })
+    }
+
+    pub(crate) fn id_view(&self) -> &wgpu::TextureView {
+        &self.id_view
     }
 }

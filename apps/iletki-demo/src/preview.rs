@@ -8,6 +8,7 @@ pub(crate) struct PreviewPacing {
     last_submit: Option<Instant>,
     burst: bool,
     redraw_deadline: Option<Instant>,
+    gpu_backlogged_until: Option<Instant>,
 }
 
 impl PreviewPacing {
@@ -21,6 +22,7 @@ impl PreviewPacing {
             last_submit: None,
             burst: false,
             redraw_deadline: None,
+            gpu_backlogged_until: None,
         }
     }
 
@@ -48,6 +50,25 @@ impl PreviewPacing {
 
     pub(crate) fn frame_started(&mut self) {
         self.redraw_deadline = None;
+    }
+
+    pub(crate) fn pick_ready(&mut self, submitted: Instant, now: Instant) {
+        if now.saturating_duration_since(submitted) >= self.pick_budget() {
+            // Keep room for picks while the render and readback queue drains.
+            self.gpu_backlogged_until = Some(now + self.period * 4);
+        }
+    }
+
+    pub(crate) fn gpu_backlogged(&self, now: Instant, pending_since: Option<Instant>) -> bool {
+        self.gpu_backlogged_until.is_some_and(|until| now < until)
+            || pending_since.is_some_and(|submitted| {
+                now.saturating_duration_since(submitted) >= self.pick_budget()
+            })
+    }
+
+    fn pick_budget(&self) -> Duration {
+        // Leave time to encode and submit the highlighted frame in the same interval.
+        self.period * 3 / 4
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -98,5 +119,20 @@ mod tests {
         );
         pacing.input(now + Duration::from_millis(22));
         assert_eq!(pacing.deadline(), None);
+    }
+
+    #[test]
+    fn caps_frame_overlap_during_a_pick_backlog_and_recovers() {
+        let now = Instant::now();
+        let mut pacing = PreviewPacing::new(Some(60_000));
+        let fast = now + Duration::from_millis(10);
+        let late = now + Duration::from_millis(20);
+        assert!(!pacing.gpu_backlogged(fast, Some(now)));
+        pacing.pick_ready(now, fast);
+        assert!(!pacing.gpu_backlogged(fast, None));
+        assert!(pacing.gpu_backlogged(late, Some(now)));
+        pacing.pick_ready(now, late);
+        assert!(pacing.gpu_backlogged(late, None));
+        assert!(!pacing.gpu_backlogged(now + Duration::from_millis(100), None));
     }
 }

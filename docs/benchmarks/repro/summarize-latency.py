@@ -74,6 +74,9 @@ def summary(directory, frames, kind, events):
     counts = [int(row["highlighted"]) for row in events if row.get("highlighted") and row["frame"]]
     if counts:
         print(f"  highlighted objects, min / p50 / max: {min(counts)} / {quantiles(counts)[0]} / {max(counts)}")
+    snapshot_flags = [row["preview_view_changed"] for row in events if row.get("preview_view_changed")]
+    if snapshot_flags:
+        print(f"  applied previews from an earlier view: {snapshot_flags.count('true')}/{len(snapshot_flags)}")
     if periods:
         print(f"  application intervals over 17.7 ms: {sum(x > 17.7 for x in periods)}/{len(periods)}")
     for label, values in metrics.items():

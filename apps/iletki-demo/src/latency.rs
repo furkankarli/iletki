@@ -41,6 +41,7 @@ impl Action {
 pub(crate) enum Scene {
     Demo,
     Wide,
+    Shuffled,
     Model(PathBuf),
 }
 
@@ -65,6 +66,7 @@ pub(crate) enum Motion {
     Orbit,
     Section,
     Edit,
+    Combined,
 }
 
 pub(crate) struct Options {
@@ -73,6 +75,8 @@ pub(crate) struct Options {
     pub(crate) action: Action,
     pub(crate) style: Style,
     pub(crate) dual: bool,
+    pub(crate) full_hd: bool,
+    pub(crate) monitor: Option<String>,
     pub(crate) notify: bool,
     pub(crate) present: Option<wgpu::PresentMode>,
     pub(crate) depth: Option<u32>,
@@ -98,6 +102,8 @@ impl Options {
             action: Action::Orbit,
             style: Style::Faces,
             dual: false,
+            full_hd: false,
+            monitor: None,
             notify: false,
             present: None,
             depth: None,
@@ -110,12 +116,14 @@ impl Options {
         while let Some(flag) = args.next() {
             match flag.to_str() {
                 Some("--dual") => config.dual = true,
+                Some("--1080p") => config.full_hd = true,
                 Some("--notify-present") => config.notify = true,
                 Some("--scene") => {
                     let value = args.next().ok_or("missing scene")?;
                     config.scene = match value.to_str() {
                         Some("demo") => Scene::Demo,
                         Some("wide") => Scene::Wide,
+                        Some("shuffled-100k") => Scene::Shuffled,
                         _ => Scene::Model(value.into()),
                     };
                 }
@@ -132,6 +140,7 @@ impl Options {
                         (Some("--action"), "marquee") => config.action = Action::Marquee,
                         (Some("--action"), "edit") => config.action = Action::Edit,
                         (Some("--action"), "live") => config.action = Action::Live,
+                        (Some("--monitor"), _) => config.monitor = Some(value),
                         (Some("--style"), "faces") => config.style = Style::Faces,
                         (Some("--style"), "edges") => config.style = Style::Edges,
                         (Some("--style"), "edges-section") => config.style = Style::Section,
@@ -151,6 +160,7 @@ impl Options {
                         (Some("--motion"), "orbit") => config.motion = Motion::Orbit,
                         (Some("--motion"), "section") => config.motion = Motion::Section,
                         (Some("--motion"), "edit") => config.motion = Motion::Edit,
+                        (Some("--motion"), "combined") => config.motion = Motion::Combined,
                         (Some("--rect-size"), "256") => config.rect_size = 256,
                         (Some("--rect-size"), "512") => config.rect_size = 512,
                         (Some("--input-hz"), _) => {
@@ -170,18 +180,20 @@ impl Options {
                 }
             }
         }
-        if config.dual && matches!(config.action, Action::Click | Action::Marquee) {
-            return Err("select a single viewport for the picking replay".into());
-        }
         if config.action == Action::Edit && matches!(config.scene, Scene::Demo) {
             return Err("edit replay requires the wide or model scene".into());
+        }
+        if config.monitor.is_some() && !config.full_hd {
+            return Err("--monitor requires --1080p".into());
         }
         if config.motion != Motion::Static
             && (config.action != Action::Marquee || matches!(config.scene, Scene::Demo))
         {
             return Err("marquee motion requires the wide or model scene".into());
         }
-        if config.motion == Motion::Section && config.style != Style::Section {
+        if matches!(config.motion, Motion::Section | Motion::Combined)
+            && config.style != Style::Section
+        {
             return Err("section motion requires --style edges-section".into());
         }
         if config.action == Action::Live && config.input_hz != DEFAULT_INPUT_HZ {
@@ -191,9 +203,12 @@ impl Options {
     }
 
     pub(crate) fn dimensions(&self) -> [u32; 2] {
+        if self.full_hd {
+            return [1920, 1080];
+        }
         match self.scene {
             Scene::Wide => [1024, 768],
-            Scene::Model(_) => [1920, 1080],
+            Scene::Model(_) | Scene::Shuffled => [1920, 1080],
             Scene::Demo => [1280, 800],
         }
     }
@@ -226,6 +241,7 @@ pub(crate) struct Event {
     submitted: Option<u128>,
     ready: Option<u128>,
     highlight_applied: Option<u128>,
+    preview_view_changed: Option<bool>,
     frame: Option<u32>,
     hits: Option<usize>,
     rect: Option<[u32; 4]>,
@@ -247,6 +263,7 @@ pub(crate) struct Frame {
     pub(crate) status: &'static str,
     pub(crate) streaming: bool,
     pub(crate) dynamic_drawn: bool,
+    pub(crate) preview_view_changed: bool,
 }
 
 pub(crate) struct Trace {
@@ -342,6 +359,10 @@ impl Trace {
         time.saturating_duration_since(self.epoch).as_nanos()
     }
 
+    pub(crate) fn start_replay(&mut self, now: Instant) {
+        self.next = now;
+    }
+
     pub(crate) fn tick(&mut self, now: Instant) -> Option<(u32, usize)> {
         if self.options.action == Action::Live || self.end.is_some() || now < self.next {
             return None;
@@ -369,6 +390,7 @@ impl Trace {
             submitted: None,
             ready: None,
             highlight_applied: None,
+            preview_view_changed: None,
             frame: None,
             hits: None,
             rect: None,
@@ -494,6 +516,9 @@ impl Trace {
                 if let Some(event) = self.events.get_mut(id) {
                     event.frame = Some(frame.id);
                     event.status = "applied";
+                    if event.kind == "marquee" {
+                        event.preview_view_changed = Some(frame.preview_view_changed);
+                    }
                 }
             }
         }
@@ -591,7 +616,7 @@ impl Trace {
         let mut events = BufWriter::new(File::create(self.options.directory.join("events.csv"))?);
         writeln!(
             events,
-            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest,highlight_applied_ns"
+            "event,kind,warmup,scheduled_ns,input_ns,redraw_ns,pick_submit_ns,pick_ready_ns,frame,hits,first_hit,status,pick_encode_ns,x,y,width,height,highlighted,release_digest,highlight_applied_ns,preview_view_changed"
         )?;
         for (id, event) in self.events.iter().enumerate() {
             fn field<T: ToString>(value: Option<T>) -> String {
@@ -603,7 +628,7 @@ impl Trace {
                 .unwrap_or_default();
             writeln!(
                 events,
-                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{},{}",
+                "{id},{},{},{},{},{},{},{},{},{},{},{},{},{x},{y},{width},{height},{},{},{},{}",
                 event.kind,
                 event.warmup,
                 event.scheduled,
@@ -619,6 +644,7 @@ impl Trace {
                 field(event.highlighted),
                 field(event.release_digest),
                 field(event.highlight_applied),
+                field(event.preview_view_changed),
             )?;
         }
         events.flush()?;

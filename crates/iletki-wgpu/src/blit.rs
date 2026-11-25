@@ -252,8 +252,8 @@ struct DepthCopyParams {
     _pad: [u32; 2],
 }
 
-/// Copies a sub-rectangle of a `Depth32Float` texture into a compact `R32Float` texture for
-/// WebGPU-compliant partial depth readback during picking.
+/// Copies a sub-rectangle of a `Depth32Float` texture into a compact `R32Uint` texture (bitcast
+/// IEEE-754 depth bits) for WebGPU/GL-compliant partial depth readback during picking.
 pub(crate) struct DepthCopyPipeline {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
@@ -261,12 +261,46 @@ pub(crate) struct DepthCopyPipeline {
     scratch: Option<([u32; 2], wgpu::Texture, wgpu::TextureView)>,
 }
 
+const DEPTH_COPY_GL_WGSL: &str = r#"
+struct DepthCopyParams {
+    origin: vec2<u32>,
+    _pad: vec2<u32>,
+};
+
+@group(0) @binding(0) var src_depth: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> params: DepthCopyParams;
+
+@vertex
+fn vs_depth_copy(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((idx & 1u) * 4u) - 1.0;
+    let y = f32(((idx >> 1u) & 1u) * 4u) - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_depth_copy(@builtin(position) pos: vec4<f32>) -> @location(0) u32 {
+    let coord = vec2<i32>(params.origin) + vec2<i32>(pos.xy);
+    return bitcast<u32>(textureLoad(src_depth, coord, 0).r);
+}
+"#;
+
 impl DepthCopyPipeline {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let gl_float = device.adapter_info().backend == wgpu::Backend::Gl;
+        let source = if gl_float {
+            DEPTH_COPY_GL_WGSL
+        } else {
+            include_str!("shaders/depth_copy.wgsl")
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("iletki depth copy shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/depth_copy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
+        let sample_type = if gl_float {
+            wgpu::TextureSampleType::Float { filterable: false }
+        } else {
+            wgpu::TextureSampleType::Depth
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iletki depth copy layout"),
             entries: &[
@@ -274,7 +308,7 @@ impl DepthCopyPipeline {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -311,7 +345,7 @@ impl DepthCopyPipeline {
                 entry_point: Some("fs_depth_copy"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
+                    format: wgpu::TextureFormat::R32Uint,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -353,7 +387,7 @@ impl DepthCopyPipeline {
 
         let make_scratch = || {
             let dst = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("iletki pick depth r32f"),
+                label: Some("iletki pick depth r32u"),
                 size: wgpu::Extent3d {
                     width: width.max(1),
                     height: height.max(1),
@@ -362,7 +396,7 @@ impl DepthCopyPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
+                format: wgpu::TextureFormat::R32Uint,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
@@ -411,7 +445,7 @@ impl DepthCopyPipeline {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

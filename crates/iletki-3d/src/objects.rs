@@ -1,13 +1,87 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
-use crate::{Vertex3D, face_batch::PackedDraws};
+use crate::gpu_cull::GpuCullView;
+use crate::{
+    Vertex3D,
+    face_batch::PackedDraws,
+    storage_batch::{StorageDraws, StorageViewBinding},
+};
 use crate::{outline_bounds::OutlineBounds, scene::ObjectUniforms};
 use iletki_core::{Bounds3, Camera, Frustum, MAX_CLIP_PLANES, Mat4, Vec3, Vec4, ViewportId};
 use iletki_wgpu::{PrepareCtx, ViewportLifetime, wgpu};
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 const OBJECT_BYTES: usize = std::mem::size_of::<ObjectUniforms>();
 const PAGE_BYTES: usize = 1024 * 1024;
+// Whole triangle lists, in submission order, so equal-depth color and pick ties are unchanged.
+const FACE_RANGE_VERTICES: usize = 1536;
+
+pub(crate) struct FaceRanges {
+    bounds: Box<[Bounds3]>,
+    vertex_count: u32,
+}
+
+impl FaceRanges {
+    pub(crate) fn new(vertices: &[Vertex3D]) -> Option<Self> {
+        if vertices.len() < 4 * FACE_RANGE_VERTICES {
+            return None;
+        }
+        let bounds = vertices.chunks(FACE_RANGE_VERTICES).map(|vertices| {
+            let mut bounds = Bounds3::EMPTY;
+            for vertex in vertices {
+                let [x, y, z] = vertex.position.map(f64::from);
+                let position = Vec3::new(x, y, z);
+                if !position.is_finite() {
+                    // An uncertain range must always go through the rasterizer.
+                    return Bounds3::EMPTY;
+                }
+                bounds.include(position);
+            }
+            bounds
+        });
+        Some(Self {
+            bounds: bounds.collect(),
+            vertex_count: u32::try_from(vertices.len()).ok()?,
+        })
+    }
+
+    /// Emits adjacent visible blocks in a single draw and returns the number of omitted vertices.
+    pub(crate) fn visit_visible(
+        &self,
+        mut visible: impl FnMut(Bounds3) -> bool,
+        mut emit: impl FnMut(Range<u32>),
+    ) -> u32 {
+        let mut start = 0;
+        let mut omitted = 0;
+        for (block, &bounds) in self.bounds.iter().enumerate() {
+            if !visible(bounds) {
+                let end = (block * FACE_RANGE_VERTICES) as u32;
+                if start < end {
+                    emit(start..end);
+                }
+                start = end
+                    .saturating_add(FACE_RANGE_VERTICES as u32)
+                    .min(self.vertex_count);
+                omitted += start - end;
+            }
+        }
+        if start < self.vertex_count {
+            emit(start..self.vertex_count);
+        }
+        omitted
+    }
+
+    pub(crate) fn iter_ranges(&self) -> impl Iterator<Item = (Range<u32>, Bounds3)> + '_ {
+        self.bounds.iter().enumerate().map(|(block, &bounds)| {
+            let start = (block * FACE_RANGE_VERTICES) as u32;
+            let end = start
+                .saturating_add(FACE_RANGE_VERTICES as u32)
+                .min(self.vertex_count);
+            (start..end, bounds)
+        })
+    }
+}
 
 pub(crate) struct PreparedObject {
     pub(crate) chunk: usize,
@@ -32,6 +106,14 @@ pub(crate) struct ViewObjects {
     pub(crate) faces: PackedDraws,
     pub(crate) edges: PackedDraws,
     pub(crate) mask: PackedDraws,
+    pub(crate) storage_binding: Option<StorageViewBinding>,
+    pub(crate) storage_faces: StorageDraws,
+    pub(crate) storage_edges: StorageDraws,
+    pub(crate) gpu_cull: Option<GpuCullView>,
+    pub(crate) gpu_cull_active: bool,
+    pub(crate) retained_geometry_rev: u64,
+    pub(crate) retained_full_scene: bool,
+    pub(crate) retained_has_edges: bool,
     pub(crate) outline_bounds: OutlineBounds,
     pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
@@ -61,6 +143,14 @@ impl ViewObjects {
             faces: PackedDraws::default(),
             edges: PackedDraws::default(),
             mask: PackedDraws::default(),
+            storage_binding: None,
+            storage_faces: StorageDraws::default(),
+            storage_edges: StorageDraws::default(),
+            gpu_cull: None,
+            gpu_cull_active: false,
+            retained_geometry_rev: 0,
+            retained_full_scene: false,
+            retained_has_edges: false,
             outline_bounds: OutlineBounds::default(),
             direct_uniforms: Vec::new(),
             pages: Vec::new(),
@@ -206,7 +296,7 @@ fn translated_corner(local: Vec3, [ox, oy, oz]: [f32; 3]) -> [f32; 3] {
     [x + ox, y + oy, z + oz]
 }
 
-/// Conservative rejection for the raster clip-distance path.
+/// Conservative rejection for the color and picking section passes.
 pub(crate) struct SectionVolume {
     planes: [[f64; 4]; MAX_CLIP_PLANES],
     count: usize,
@@ -224,7 +314,9 @@ pub(crate) enum SectionRelation {
 pub(crate) struct SectionGroup {
     origins: Bounds3,
     local: Bounds3,
+    world: Bounds3,
     invalid_origin: bool,
+    has_untrusted: bool,
 }
 
 impl SectionGroup {
@@ -238,12 +330,44 @@ impl SectionGroup {
         self.origins.max = self.origins.max.max(origin);
         self.local.min = self.local.min.min(local.min);
         self.local.max = self.local.max.max(local.max);
+        if !local.is_empty() {
+            let wmin = origin + local.min;
+            let wmax = origin + local.max;
+            if wmin.is_finite() && wmax.is_finite() {
+                self.world.include(wmin);
+                self.world.include(wmax);
+            } else {
+                self.invalid_origin = true;
+            }
+        }
     }
 
-    pub(crate) fn contains_origin(&self, origin: Vec3) -> bool {
-        !self.invalid_origin
-            && origin.min(self.origins.min) == self.origins.min
-            && origin.max(self.origins.max) == self.origins.max
+    pub(crate) fn mark_untrusted(&mut self) {
+        self.has_untrusted = true;
+    }
+
+    pub(crate) fn all_trusted(&self) -> bool {
+        !self.has_untrusted && !self.invalid_origin
+    }
+
+    pub(crate) fn contains_chunk(&self, origin: Vec3, local: Bounds3) -> bool {
+        if self.invalid_origin {
+            return false;
+        }
+        let origins_ok = origin.min(self.origins.min) == self.origins.min
+            && origin.max(self.origins.max) == self.origins.max;
+        if !origins_ok {
+            return false;
+        }
+        if local.is_empty() {
+            return true;
+        }
+        let wmin = origin + local.min;
+        let wmax = origin + local.max;
+        wmin.is_finite()
+            && wmax.is_finite()
+            && wmin.min(self.world.min) == self.world.min
+            && wmax.max(self.world.max) == self.world.max
     }
 
     pub(crate) fn section_relation(&self, volume: &SectionVolume, camera: Vec3) -> SectionRelation {
@@ -261,12 +385,19 @@ impl SectionGroup {
         }
     }
 
-    pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
-        if self.invalid_origin {
+    pub(crate) fn outside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
+        if self.has_untrusted || self.invalid_origin || self.world.is_empty() {
             return false;
         }
-        let lo = (self.origins.min + self.local.min) - camera;
-        let hi = (self.origins.max + self.local.max) - camera;
+        !frustum.intersects_bounds_world(self.world, camera)
+    }
+
+    pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
+        if self.invalid_origin || self.world.is_empty() {
+            return false;
+        }
+        let lo = self.world.min - camera;
+        let hi = self.world.max - camera;
         lo.is_finite()
             && hi.is_finite()
             && frustum.planes.iter().flatten().all(|plane| {
@@ -327,8 +458,8 @@ impl SectionVolume {
             let (near_y, far_y) = if y >= 0.0 { (ly, hy) } else { (hy, ly) };
             let (near_z, far_z) = if z >= 0.0 { (lz, hz) } else { (hz, lz) };
             let magnitude = x.abs() * mx + y.abs() * my + z.abs() * mz + d.abs();
-            // The raster shader adds the camera WGSL clip tolerance. Account for all f32
-            // arithmetic (including fused evaluation) before rejecting a whole primitive.
+            // The shader adds the camera WGSL clip tolerance. Allow for f32 interpolation
+            // and dot-product rounding before rejecting a whole primitive.
             let tolerance = f64::from(1e-4_f32);
             let error = (magnitude + tolerance) * (16.0 * f64::from(f32::EPSILON));
             if magnitude >= f64::from(f32::MAX) * 0.5 {
@@ -404,8 +535,13 @@ impl PickVolume {
         }
     }
 
-    pub(crate) fn intersects(&self, bounds: Bounds3, offset: [f32; 3]) -> bool {
-        let Some(([lx, ly, lz], [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
+    pub(crate) fn intersects(
+        &self,
+        bounds: Bounds3,
+        offset: [f32; 3],
+        section: Option<&SectionVolume>,
+    ) -> bool {
+        let Some((lo @ [lx, ly, lz], hi @ [hx, hy, hz])) = rounded_bounds(bounds, offset) else {
             return true;
         };
         let [mx, my, mz] = [
@@ -421,7 +557,8 @@ impl PickVolume {
                 magnitude * (16.0 * f64::from(f32::EPSILON)) + f64::from(f32::MIN_POSITIVE);
             // Uncertain precision or overflow always keeps the object in the candidate set.
             !distance.is_finite() || magnitude >= f64::from(f32::MAX) * 0.5 || distance >= -rounding
-        })
+        }) && section
+            .is_none_or(|volume| volume.classify(lo, hi, false) != SectionRelation::Outside)
     }
 }
 

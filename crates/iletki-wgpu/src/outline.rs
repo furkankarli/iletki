@@ -21,7 +21,9 @@ struct JfaParams {
     _pad: u32,
     color: [f32; 4],
     active_px: [f32; 2],
-    _pad2: [f32; 2],
+    rect_min: [i32; 2],
+    rect_max: [i32; 2],
+    _pad2: [i32; 2],
 }
 
 /// Lazily initialized GPU resources for the Jump-Flood selection outline pass.
@@ -29,6 +31,7 @@ pub(crate) struct OutlineEngine {
     seed_pipe: wgpu::RenderPipeline,
     step_pipe: wgpu::RenderPipeline,
     composite_pipe: wgpu::RenderPipeline,
+    composite_pipe_1x: wgpu::RenderPipeline,
     composite_format: wgpu::TextureFormat,
     composite_msaa: u32,
     // Separate uniform buffers for each pass so queue writes never clobber each other.
@@ -211,6 +214,31 @@ impl OutlineEngine {
             multiview_mask: None,
             cache: None,
         });
+        let composite_pipe_1x = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("iletki jfa composite 1x"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_full"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_composite"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: composite_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let [width, height] = allocated_px;
         let size = wgpu::Extent3d {
@@ -291,6 +319,7 @@ impl OutlineEngine {
             seed_pipe,
             step_pipe,
             composite_pipe,
+            composite_pipe_1x,
             composite_format,
             composite_msaa,
             step_buffers,
@@ -355,6 +384,16 @@ impl OutlineEngine {
             config.color
         };
 
+        let [rx, ry, rw, rh] = rect;
+        let rect_min = [rx as i32, ry as i32];
+        let rect_max = [
+            rx.saturating_add(rw)
+                .saturating_sub(1)
+                .min(aw.saturating_sub(1)) as i32,
+            ry.saturating_add(rh)
+                .saturating_sub(1)
+                .min(ah.saturating_sub(1)) as i32,
+        ];
         let params = |step_px| JfaParams {
             step_px,
             width_px: width,
@@ -362,7 +401,9 @@ impl OutlineEngine {
             _pad: 0,
             color: target_color,
             active_px: [aw as f32, ah as f32],
-            _pad2: [0.0, 0.0],
+            rect_min,
+            rect_max,
+            _pad2: [0, 0],
         };
         for (&step, buf) in steps.iter().zip(&self.step_buffers) {
             queue.write_buffer(buf, 0, bytemuck::bytes_of(&params(step)));
@@ -416,6 +457,18 @@ impl OutlineEngine {
         pass.draw(0..3, 0..1);
     }
 
+    /// Composites the smooth Jump-Flood outline halo directly into a 1x resolved color target
+    /// with no depth attachment, avoiding a 4x MSAA clear/blit/resolve when no 3D gizmos run.
+    pub(crate) fn composite_into_pass_1x(&self, pass: &mut wgpu::RenderPass<'_>, rect: [u32; 4]) {
+        let [x, y, w, h] = rect;
+        let [alloc_w, alloc_h] = self.extent;
+        pass.set_viewport(0.0, 0.0, alloc_w as f32, alloc_h as f32, 0.0, 1.0);
+        pass.set_scissor_rect(x, y, w, h);
+        pass.set_pipeline(&self.composite_pipe_1x);
+        pass.set_bind_group(0, &self.composite_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fullscreen_pass(
         &self,
@@ -435,17 +488,14 @@ impl OutlineEngine {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: -128.0,
-                        g: -128.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }),
+                    // Every texel inside `rect` is written by `fs_seed` and `fs_step` clamps all
+                    // neighborhood reads to `[rect_min, rect_max]`, avoiding full-target clears.
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: gpu_timer.as_ref().map(|timer| timer.writes()),
+            timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });

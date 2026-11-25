@@ -11,8 +11,20 @@ mod disabled {
     pub(crate) enum Pass {}
 
     impl Pass {
-        pub(crate) fn writes(&self) -> wgpu::RenderPassTimestampWrites<'_> {
+        pub(crate) fn writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
             // This method is never reached. The uninstrumented pass constructor returns None.
+            match *self {}
+        }
+
+        pub(crate) fn compute_writes(&self) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+            match *self {}
+        }
+
+        pub(crate) fn begin_stats(&self, _pass: &mut wgpu::RenderPass<'_>) {
+            match *self {}
+        }
+
+        pub(crate) fn end_stats(&self, _pass: &mut wgpu::RenderPass<'_>) {
             match *self {}
         }
     }

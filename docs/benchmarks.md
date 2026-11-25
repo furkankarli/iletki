@@ -89,6 +89,8 @@ plane inside the camera frustum.
 `scene.section_deferred_chunks` counts small packed chunks tested only by the rasterizer.
 The `scene.section_bridged_triangles` and
 `scene.section_bridged_edge_vertices` counters track clipped geometry retained to merge draws.
+`scene.range_culled_triangles` counts triangles omitted from large packed meshes when
+a whole consecutive range falls outside the viewport, selection rectangle, or section.
 Use `ILETKI_ASSEMBLY_NO_SECTION_GROUPS=1` to compare grouped bounds against
 per-chunk culling. The `scene.section_chunk_tests` and `scene.frustum_chunk_tests` counters
 track individual bounds tests, and `scene.opaque_triangles` counts triangles submitted
@@ -96,10 +98,23 @@ to the color pass. Use `ILETKI_ASSEMBLY_SHUFFLE=1` to permute the insertion orde
 synthetic assembly while preserving the geometry and input sequence.
 `ILETKI_ASSEMBLY_EDITS=1` moves every hundredth chunk on every sixth orbit tick.
 Orbit timing includes those edits and camera updates. `ILETKI_ASSEMBLY_DUAL=1`
-adds an orthographic view to a model run and records both reference image hashes.
+adds a full-size orthographic view to a model run. Use `ILETKI_ASSEMBLY_SPLIT=1` to
+divide the requested width between two views. For the synthetic grid, select
+`20000/split`, `100000/split`, or `100000/wide-dual` through `ILETKI_ASSEMBLY_CASE`.
+After 60 warm-up frames, each of these workloads records 360 orbit samples.
+Use `ILETKI_ASSEMBLY_ORBIT_ONLY=1` to skip the separate picking workloads during
+timing repetitions. `ILETKI_ASSEMBLY_SIGNATURES=1` records both views at each of the 30
+orbit angles after timing and profiling. The angle in degrees is the orbit frame
+number modulo 30, multiplied by 12.
 `ILETKI_ASSEMBLY_VISIBILITY_EDITS=1` toggles visibility for the same subset.
 With either edit control, `edit-frame` repeats the changing frames from the orbit
 series for separate percentile analysis.
+
+`ILETKI_ASSEMBLY_NO_REPEATED_PAGES=1` keeps color draws on the regular packed path
+when a page contains byte-identical small meshes. Selection and picking use the
+same geometry in both variants. Set `ILETKI_ASSEMBLY_OVERLAP=1` in a two-view run to
+submit the first viewport before encoding the second. The wall timer still ends
+at completion of both views.
 
 The offscreen workloads exclude window acquisition, compositing and presentation. The
 asynchronous pick workload polls continuously to measure request readiness independently
@@ -137,7 +152,29 @@ final release event. Set `--input-hz 240 --samples 1440` or
 `--input-hz 500 --samples 3000` to replay six seconds of input faster than the display.
 During a burst, the demo keeps the newest pending preview and schedules GPU work against
 the window's nominal refresh interval. A ready preview gets a redraw opportunity before
-the next preview is encoded. Release requests take priority.
+the next preview is encoded. When a readback exceeds three quarters of a refresh interval,
+the demo defers redraws while submitted frames finish so the render queue can drain.
+A moving marquee can show a preview from the same viewport sized at the same DPI for
+up to 50 ms from its input timestamp. The event CSV's `preview_view_changed` field
+identifies previews drawn after the camera or scene changed. Release requests take
+priority and resolve an exact pick for the current view.
+
+For simultaneous orbit, live section, scene edits, and marquee previews, use
+`--action marquee --style edges-section --motion combined`. Add `--dual` to split
+the window between an orthographic view on the left and the perspective view on
+the right. The replay picks in right-panel pixels and shows the selection in both
+views. Use `--1080p` to run borderless on a 1920×1080 display and
+`--scene shuffled-100k` for the 100,000-part permutation. Use `--monitor NAME` with
+`--1080p` to pin paired runs to the same output. Confirm the output, refresh rate,
+and drawable size in `monitor.txt`. The replay holds its final camera and scene
+while the release request finishes. Compare the applied preview rate, the input
+to present-return percentiles, and the release digest between builds.
+
+Run the combined replay three times per adapter at 60 Hz. The software gate is
+at least 57 applied preview frames per scheduled second, 16.67 ms p95 and
+33.3 ms p99 from input to present return. Compare the final release digest with
+the baseline for the same fixture, sequence, viewport layout, and GPU. Report
+an absent preview percentile when no previews reach a frame.
 
 ```sh
 cargo run --release -p iletki-demo -- --latency-bench out/marquee/radeon/filled/1 \
@@ -222,6 +259,15 @@ XDE document with `ReadStep`, take its shape with `XGetOneShape`, tessellate wit
 [Model license](https://github.com/openBIMstandards/Archive-DataSetSchependomlaan/blob/master/LICENSE.MD)
 [NIST CAD models](https://www.nist.gov/ctl/smart-connected-systems-division/smart-connected-manufacturing-systems-group/mbe-pmi-0)
 
+For an assembly-scale STEP run, use
+`OpenArm Cell/Integration with OpenArm/OpenArm_Cell+OpenArm_2.0.STEP` from the
+OpenArm Hardware 2.0.0 release archive, by Enactic, Inc., under CERN-OHL-S-2.0.
+The archive SHA-256 is
+`247ce0141a9be6ebbb5a6c206cf0557574929ea0b80e20dddbff7c0c0919db75`.
+With the same meshing and export settings, OCCT 7.9.3 and the fixture converter
+produced 538 chunks and 1,586,648 triangles. Record the generated fixture hash
+with the results. [OpenArm release](https://github.com/enactic/openarm_hardware/releases/tag/2.0.0)
+
 ```sh
 python3 docs/benchmarks/repro/convert-model.py ifc out/schependomlaan.iltmesh out/schependomlaan.ifc
 python3 docs/benchmarks/repro/convert-model.py step-gltf out/nist.iltmesh out/ctc02.gltf out/ctc04.gltf
@@ -266,8 +312,19 @@ Set `ILETKI_ASSEMBLY_CASE=100000/wide` and unset `ILETKI_ASSEMBLY_MESH` to run t
 mesh and inserting it. Match flags, fixture checksums, resolution, adapter and
 sample counts when comparing revisions.
 
+Set `ILETKI_ASSEMBLY_MODEL_CLOSE=1` to use a horizontal orbit radius of 0.85 times
+the model's bounding radius. The default uses 2.6 times the bounding radius. Set
+`ILETKI_ASSEMBLY_SPLIT=1` to include an orthographic second view. Record the
+camera distance and view count with each measurement.
+
 Keep the CSVs in frame order and run several repetitions. When comparing renderers, fix the GPU,
 driver, visible geometry, camera, lighting, MSAA and output format. Measure initial setup,
 steady-state rendering, cache hits and presentation as separate workloads. Use enough samples for
 any tail percentiles you publish. Large-world precision requires a measured coordinate or
 projection error over a camera path.
+
+Set `ILETKI_ASSEMBLY_SIGNATURES=1` to hash a full orbit outside the timed samples.
+A moving section can leave individual reference frames empty. The model still
+has to be visible in at least one validated reference frame. Set
+`ILETKI_ASSEMBLY_IMAGES=1` to save three row-major RGBA8 frames per viewport from
+that orbit. The filenames include the output size.

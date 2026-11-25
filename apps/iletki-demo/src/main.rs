@@ -29,8 +29,8 @@ use iletki::gpu::wgpu;
 use iletki::{
     Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DirtyFlags, DrawStyle2D,
     Grid3DConfig, GridStyle, InfiniteGrid3DLayer, Instance3D, InstancedMesh3DLayer, Mesh2D, Mesh3D,
-    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PickHit, PickId, Plane,
-    PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
+    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PendingSlotPreview, PickHit,
+    PickId, Plane, PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
     TransformGizmoLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
     ViewportMode, order_to_depth,
 };
@@ -38,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -45,9 +46,10 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
-const PICK_POLL_INTERVAL: Duration = Duration::from_micros(500);
+const PICK_POLL_INTERVAL: Duration = Duration::from_micros(150);
+const MAX_MOVING_PREVIEW_AGE: Duration = Duration::from_millis(50);
 const TITLE_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
 
 const MARQUEE_SHADER: &str = r#"
@@ -144,6 +146,14 @@ struct PickView {
     revision: iletki::gpu::LayerRevision,
 }
 
+impl PickView {
+    fn same_surface(&self, other: &Self) -> bool {
+        self.scene == other.scene
+            && self.size == other.size
+            && self.dpi.to_bits() == other.dpi.to_bits()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickKind {
     Click,
@@ -157,6 +167,18 @@ struct PickRequest {
     event: Option<usize>,
     kind: PickKind,
     epoch: u64,
+    input_at: Instant,
+}
+
+enum PendingSelection {
+    Exact(PendingPick),
+    ColorFrame(PendingSlotPreview),
+}
+
+struct SubmittedPick {
+    pick: PendingSelection,
+    request: PickRequest,
+    submitted_at: Instant,
 }
 
 struct GpuState {
@@ -185,7 +207,10 @@ struct GpuState {
     chunk_by_object: HashMap<u32, usize>,
     committed_selection: HashSet<Chunk3DId>,
     visible_selection: HashSet<Chunk3DId>,
-    preview_view: Option<PickView>,
+    slot_preview_active: bool,
+    visible_slot_preview: Vec<(u32, Chunk3DId)>,
+    next_slot_preview: Vec<(u32, Chunk3DId)>,
+    preview_view: Option<(PickView, Instant)>,
     grid_3d: InfiniteGrid3DLayer,
     gizmo_3d: TransformGizmoLayer,
     instanced_3d: InstancedMesh3DLayer,
@@ -203,15 +228,20 @@ struct GpuState {
     marquee_rect: Option<[u32; 4]>,
     marquee_border: wgpu::RenderPipeline,
     pick_epoch: u64,
-    pending_pick: Option<(PendingPick, PickRequest)>,
+    pending_pick: Option<SubmittedPick>,
     queued_pick: Option<PickRequest>,
+    queued_color_frame_preview: Option<PickRequest>,
     preview_pacing: preview::PreviewPacing,
+    frames_in_flight: Arc<AtomicUsize>,
+    deferred_redraw: bool,
     latency: Option<latency::Trace>,
     #[cfg(feature = "profiling")]
     pick_profile: bool,
+    no_mrt_preview: bool,
     bench_fit: Option<(Vec3, f64)>,
     bench_edits: Vec<(Chunk3DId, Vec3)>,
     bench_dual: bool,
+    initial_streaming_done: bool,
     last_pick_text: String,
     timing_samples: u8,
     title_updated_at: Instant,
@@ -241,9 +271,10 @@ impl GpuState {
         let info = adapter.get_info();
         println!("iletki-demo GPU: {} ({:?})", info.name, info.backend);
 
-        let features = wgpu::Features::CLIP_DISTANCES;
+        let features = wgpu::Features::CLIP_DISTANCES | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         #[cfg(feature = "profiling")]
         let pick_profile = std::env::var_os("ILETKI_PICK_PROFILE").is_some();
+        let no_mrt_preview = std::env::var_os("ILETKI_NO_MRT_PREVIEW").is_some();
         #[cfg(feature = "profiling")]
         let features = if pick_profile {
             features | wgpu::Features::TIMESTAMP_QUERY
@@ -332,6 +363,19 @@ impl GpuState {
                     &mut bench_edits,
                 )
             }
+            Some(latency::Scene::Shuffled) => {
+                let center = f64::from(100_000_u32.div_ceil(64));
+                bench_fit = Some((Vec3::new(63.0, center, 0.8), center * 2.0));
+                let style = bench.as_ref().map_or(latency::Style::Faces, |b| b.style);
+                let mut order: Vec<u32> = (0..100_000).collect();
+                order.sort_unstable_by_key(|index| index.wrapping_mul(0x9e37_79b9));
+                bench_scene(
+                    order
+                        .into_iter()
+                        .map(|index| latency::wide_mesh(index, style)),
+                    &mut bench_edits,
+                )
+            }
             Some(latency::Scene::Model(path)) => {
                 let fixture = assembly_fixture::load(path).map_err(|error| error.to_string())?;
                 let center = fixture.bounds.center().ok_or("model bounds are empty")?;
@@ -410,6 +454,9 @@ impl GpuState {
             chunk_by_object,
             committed_selection,
             visible_selection,
+            slot_preview_active: false,
+            visible_slot_preview: Vec::new(),
+            next_slot_preview: Vec::new(),
             preview_view: None,
             grid_3d,
             gizmo_3d,
@@ -428,13 +475,18 @@ impl GpuState {
             pick_epoch: 0,
             pending_pick: None,
             queued_pick: None,
+            queued_color_frame_preview: None,
             preview_pacing,
+            frames_in_flight: Arc::new(AtomicUsize::new(0)),
+            deferred_redraw: false,
             latency,
             #[cfg(feature = "profiling")]
             pick_profile,
+            no_mrt_preview,
             bench_fit,
             bench_edits,
             bench_dual,
+            initial_streaming_done: false,
             last_pick_text: String::from("Click any 3D object to pick"),
             timing_samples: 0,
             title_updated_at: Instant::now(),
@@ -643,6 +695,14 @@ impl GpuState {
         let now = Instant::now();
         let dpi = self.window.scale_factor();
         let px = (logical_pos.x * dpi).round().max(0.0) as u32;
+        let px = if self.bench_dual {
+            let Some(local) = px.checked_sub(self.surface_config.width / 2) else {
+                return;
+            };
+            local
+        } else {
+            px
+        };
         let py = (logical_pos.y * dpi).round().max(0.0) as u32;
         let event = self
             .latency
@@ -736,8 +796,13 @@ impl GpuState {
                 .and_then(|monitor| monitor.refresh_rate_millihertz()),
         );
         self.pick_epoch = self.pick_epoch.wrapping_add(1);
+        self.vp_main.set_color_frame_selection_rect(None);
         if let Some(queued) = self.queued_pick.take() {
             self.pick_status(queued.event, "cancelled", None);
+        }
+        if let Some(queued) = self.queued_color_frame_preview.take() {
+            self.pick_status(queued.event, "cancelled", None);
+            self.vp_main.record_selection_preview_superseded();
         }
         self.clear_preview("cancelled");
     }
@@ -752,22 +817,30 @@ impl GpuState {
         }
     }
 
+    fn uses_color_frame_preview(&self) -> bool {
+        !self.no_mrt_preview
+            && self.active_scene == DemoScene::Arch3D
+            && !self.quad_view
+            && self.vp_main.supports_color_frame_selection(&self.device)
+    }
+
     fn request_pick(&mut self, rect: [u32; 4], kind: PickKind, event: Option<usize>) {
-        if self.quad_view || self.bench_dual {
+        if self.quad_view {
             self.pick_status(event, "unsupported-view", None);
             return;
         }
         if let (Some(trace), Some(id)) = (&mut self.latency, event) {
             trace.selection_rect(id, rect);
         }
+        let now = Instant::now();
         let request = PickRequest {
             rect,
             view: self.pick_view(kind),
             event,
             kind,
             epoch: self.pick_epoch,
+            input_at: now,
         };
-        let now = Instant::now();
         if kind == PickKind::Preview {
             self.preview_pacing.input(now);
             if self
@@ -777,6 +850,21 @@ impl GpuState {
             {
                 self.pick_status(event, "coalesced-before-submit", None);
                 return;
+            }
+            if self.uses_color_frame_preview() {
+                if let Some(old) = self.queued_color_frame_preview.replace(request) {
+                    self.pick_status(old.event, "coalesced-before-submit", None);
+                    self.vp_main.record_selection_preview_superseded();
+                }
+                self.vp_main.set_color_frame_selection_rect(Some(rect));
+                self.window.request_redraw();
+                return;
+            }
+        } else {
+            self.vp_main.set_color_frame_selection_rect(None);
+            if let Some(old) = self.queued_color_frame_preview.take() {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
             }
         }
         if let Some(old) = self.queued_pick.replace(request) {
@@ -817,6 +905,22 @@ impl GpuState {
 
     fn begin_pick(&mut self, mut request: PickRequest) {
         let rect = request.rect;
+        if request.kind == PickKind::Preview && self.uses_color_frame_preview() {
+            if let Some(old) = self.queued_color_frame_preview.replace(request) {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
+            }
+            self.vp_main.set_color_frame_selection_rect(Some(rect));
+            self.window.request_redraw();
+            return;
+        }
+        if request.kind != PickKind::Preview {
+            self.vp_main.set_color_frame_selection_rect(None);
+            if let Some(old) = self.queued_color_frame_preview.take() {
+                self.pick_status(old.event, "coalesced-before-submit", None);
+                self.vp_main.record_selection_preview_superseded();
+            }
+        }
         #[cfg(feature = "profiling")]
         if self.pick_profile
             && self
@@ -857,7 +961,11 @@ impl GpuState {
             // Picking can itself finish progressive uploads during preparation.
             request.view = self.pick_view(request.kind);
             self.pick_status(request.event, "submitted", None);
-            self.pending_pick = Some((pick, request));
+            self.pending_pick = Some(SubmittedPick {
+                pick: PendingSelection::Exact(pick),
+                request,
+                submitted_at: Instant::now(),
+            });
         } else {
             self.pick_status(request.event, "error", None);
             if request.kind == PickKind::Commit {
@@ -866,67 +974,238 @@ impl GpuState {
         }
     }
 
-    fn clear_stale_preview(&mut self) {
+    fn preview_deadline(&self) -> Option<Instant> {
+        let (view, input_at) = self.preview_view.as_ref()?;
+        (*view != self.pick_view(PickKind::Preview)).then(|| *input_at + MAX_MOVING_PREVIEW_AGE)
+    }
+
+    fn clear_stale_preview(&mut self, now: Instant) {
         if self
-            .preview_view
-            .as_ref()
-            .is_some_and(|view| *view != self.pick_view(PickKind::Preview))
+            .preview_deadline()
+            .is_some_and(|deadline| now >= deadline)
         {
             self.clear_preview("stale-before-frame");
             self.window.request_redraw();
         }
     }
 
-    fn poll_pick(&mut self) {
-        self.clear_stale_preview();
-        let Some((pick, _)) = &mut self.pending_pick else {
+    fn poll_pick(&mut self, from_render: bool) {
+        let now = Instant::now();
+        self.clear_stale_preview(now);
+        let Some(pending) = &mut self.pending_pick else {
             return;
         };
-        let Poll::Ready(result) = pick.try_read() else {
-            return;
-        };
-        let Some((_, mut request)) = self.pending_pick.take() else {
-            return;
-        };
-        if let Ok(hits) = &result {
-            self.pick_status(request.event, "ready", Some(hits.len()));
+        enum ReadyResult {
+            Exact(Result<Vec<PickHit>, iletki::ViewportError>),
+            Slots(Result<Vec<u32>, iletki::ViewportError>, u64),
         }
-        if request.epoch != self.pick_epoch || self.quad_view || self.bench_dual {
+        let ready = match &mut pending.pick {
+            PendingSelection::Exact(pick) => match pick.try_read() {
+                Poll::Ready(res) => ReadyResult::Exact(res),
+                Poll::Pending => return,
+            },
+            PendingSelection::ColorFrame(preview) => {
+                let target_gen = preview.snapshot().target_generation;
+                match preview.try_read() {
+                    Poll::Ready(res) => ReadyResult::Slots(res, target_gen),
+                    Poll::Pending => return,
+                }
+            }
+        };
+        let Some(SubmittedPick {
+            mut request,
+            submitted_at,
+            ..
+        }) = self.pending_pick.take()
+        else {
+            return;
+        };
+        let is_color_frame = matches!(ready, ReadyResult::Slots(..));
+        let ready_len = match &ready {
+            ReadyResult::Exact(Ok(hits)) => Some(hits.len()),
+            ReadyResult::Slots(Ok(slots), _) => Some(slots.len()),
+            _ => None,
+        };
+        if let Some(len) = ready_len {
+            self.pick_status(request.event, "ready", Some(len));
+        }
+        let current = self.pick_view(request.kind);
+        let preview = request.kind == PickKind::Preview;
+        let commit_queued = self
+            .queued_pick
+            .as_ref()
+            .is_some_and(|queued| queued.kind == PickKind::Commit);
+        let target_ok = match &ready {
+            ReadyResult::Slots(_, target_gen) => *target_gen == self.vp_main.target_generation(),
+            ReadyResult::Exact(_) => true,
+        };
+        let recent_preview = preview
+            && target_ok
+            && !commit_queued
+            && request.view.same_surface(&current)
+            && now.saturating_duration_since(request.input_at) < MAX_MOVING_PREVIEW_AGE;
+        if request.epoch != self.pick_epoch || self.quad_view {
             self.pick_status(request.event, "cancelled", None);
-        } else if request.view != self.pick_view(request.kind) {
+            if is_color_frame {
+                self.vp_main.record_selection_preview_superseded();
+            }
+            return;
+        }
+        if preview {
+            self.preview_pacing.pick_ready(submitted_at, now);
+        }
+        if (request.view != current || !target_ok) && !recent_preview {
             if request.kind == PickKind::Commit {
-                request.view = self.pick_view(request.kind);
+                request.view = current;
                 self.begin_pick(request);
                 return;
             }
             self.pick_status(request.event, "stale", None);
-        } else if let Ok(hits) = result {
-            let event = request.event;
-            let preview = request.kind == PickKind::Preview;
-            if let Some(trace) = &mut self.latency
-                && let Some(id) = event
-            {
-                trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
+            if is_color_frame {
+                self.vp_main.record_selection_preview_stale();
             }
-            self.apply_pick(&hits, request);
-            if let Some(trace) = &mut self.latency
-                && let Some(id) = event
-            {
-                trace.selection_redraw(id);
-            }
-            if preview {
-                self.preview_pacing.request_frame(Instant::now());
-            }
-            self.window.request_redraw();
         } else {
-            self.pick_status(request.event, "error", None);
-            if request.kind == PickKind::Commit {
-                self.clear_preview("cancelled");
+            match ready {
+                ReadyResult::Exact(Ok(hits)) => {
+                    let event = request.event;
+                    if let Some(trace) = &mut self.latency
+                        && let Some(id) = event
+                    {
+                        trace.hit(id, hits.first().map(|hit| hit.id.to_u64()));
+                    }
+                    self.apply_pick(&hits, request);
+                    if let Some(trace) = &mut self.latency
+                        && let Some(id) = event
+                    {
+                        trace.selection_redraw(id);
+                    }
+                    if preview {
+                        self.preview_pacing.request_frame(Instant::now());
+                    }
+                    if !from_render {
+                        self.window.request_redraw();
+                    }
+                }
+                ReadyResult::Slots(Ok(slots), _) => {
+                    let event = request.event;
+                    self.preview_view = Some((request.view, request.input_at));
+                    self.sync_slot_preview(&slots);
+                    let count = self.visible_slot_preview.len();
+                    self.last_pick_text = format!("{count} selected");
+                    self.vp_main.record_selection_preview_displayed();
+                    if let (Some(trace), Some(id)) = (&mut self.latency, event) {
+                        trace.highlighted(id, count);
+                        trace.selection_redraw(id);
+                    }
+                    self.preview_pacing.request_frame(Instant::now());
+                    if !from_render {
+                        self.window.request_redraw();
+                    }
+                }
+                ReadyResult::Exact(Err(_)) | ReadyResult::Slots(Err(_), _) => {
+                    self.pick_status(request.event, "error", None);
+                    if request.kind == PickKind::Commit {
+                        self.clear_preview("cancelled");
+                    }
+                }
+            }
+        }
+        if !from_render
+            && self.pending_pick.is_none()
+            && (self.queued_color_frame_preview.is_some() || self.deferred_redraw)
+        {
+            self.deferred_redraw = false;
+            self.window.request_redraw();
+        }
+    }
+
+    fn sync_slot_preview(&mut self, slots: &[u32]) {
+        if !self.slot_preview_active {
+            let mut changed = !self.visible_selection.is_empty();
+            for id in self.visible_selection.drain() {
+                self.scene_3d.set_selected(id, false);
+            }
+            self.visible_slot_preview.clear();
+            for &slot in slots {
+                if let Some(id) = self.scene_3d.chunk_id_at_slot(slot as usize) {
+                    self.scene_3d.set_selected(id, true);
+                    self.visible_slot_preview.push((slot, id));
+                    changed = true;
+                }
+            }
+            self.slot_preview_active = true;
+            if changed {
+                self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+                if self.bench_dual {
+                    self.vp_top.mark_dirty(DirtyFlags::SELECTION);
+                }
+            }
+            return;
+        }
+        self.next_slot_preview.clear();
+        let mut old_iter = self.visible_slot_preview.iter().copied().peekable();
+        let mut new_iter = slots.iter().copied().peekable();
+        let mut changed = false;
+        while let (Some(&(old_slot, old_id)), Some(&new_slot)) = (old_iter.peek(), new_iter.peek())
+        {
+            match old_slot.cmp(&new_slot) {
+                std::cmp::Ordering::Less => {
+                    self.scene_3d.set_selected(old_id, false);
+                    changed = true;
+                    old_iter.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                        self.scene_3d.set_selected(new_id, true);
+                        self.next_slot_preview.push((new_slot, new_id));
+                        changed = true;
+                    }
+                    new_iter.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                        if new_id != old_id {
+                            self.scene_3d.set_selected(old_id, false);
+                            self.scene_3d.set_selected(new_id, true);
+                            changed = true;
+                        }
+                        self.next_slot_preview.push((new_slot, new_id));
+                    } else {
+                        self.scene_3d.set_selected(old_id, false);
+                        changed = true;
+                    }
+                    old_iter.next();
+                    new_iter.next();
+                }
+            }
+        }
+        for (_, old_id) in old_iter {
+            self.scene_3d.set_selected(old_id, false);
+            changed = true;
+        }
+        for new_slot in new_iter {
+            if let Some(new_id) = self.scene_3d.chunk_id_at_slot(new_slot as usize) {
+                self.scene_3d.set_selected(new_id, true);
+                self.next_slot_preview.push((new_slot, new_id));
+                changed = true;
+            }
+        }
+        std::mem::swap(&mut self.visible_slot_preview, &mut self.next_slot_preview);
+        if changed {
+            self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+            if self.bench_dual {
+                self.vp_top.mark_dirty(DirtyFlags::SELECTION);
             }
         }
     }
 
     fn sync_highlights(&mut self, preview: Option<HashSet<Chunk3DId>>) {
+        if self.slot_preview_active {
+            self.visible_selection.clear();
+            self.visible_selection
+                .extend(self.visible_slot_preview.drain(..).map(|(_, id)| id));
+            self.slot_preview_active = false;
+        }
         let desired = preview.as_ref().unwrap_or(&self.committed_selection);
         for &id in self.visible_selection.difference(desired) {
             self.scene_3d.set_selected(id, false);
@@ -937,6 +1216,9 @@ impl GpuState {
         if self.visible_selection != *desired {
             self.visible_selection = preview.unwrap_or_else(|| self.committed_selection.clone());
             self.vp_main.mark_dirty(DirtyFlags::SELECTION);
+            if self.bench_dual {
+                self.vp_top.mark_dirty(DirtyFlags::SELECTION);
+            }
         }
     }
 
@@ -954,7 +1236,7 @@ impl GpuState {
                 self.committed_selection = selected;
                 self.sync_highlights(None);
             } else {
-                self.preview_view = Some(request.view);
+                self.preview_view = Some((request.view, request.input_at));
                 self.sync_highlights(Some(selected));
             }
             if request.kind == PickKind::Commit {
@@ -1079,6 +1361,9 @@ impl GpuState {
     }
 
     fn replay_latency(&mut self, now: Instant) {
+        if !self.initial_streaming_done {
+            return;
+        }
         let Some(trace) = &mut self.latency else {
             return;
         };
@@ -1126,13 +1411,33 @@ impl GpuState {
                         modifiers,
                     });
                 }
-                if motion == latency::Motion::Edit && tick % 6 == 0 {
-                    let offset = if tick % 12 == 0 { 0.2 } else { 0.0 };
+                if motion == latency::Motion::Combined
+                    && let Some((focus, radius)) = self.bench_fit
+                {
+                    let angle = f64::from(tick % 60) * std::f64::consts::TAU / 60.0;
+                    let eye = focus
+                        + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius * 0.65);
+                    *self.vp_main.camera_mut() = Camera::perspective_3d(
+                        eye,
+                        focus,
+                        Vec3::Z,
+                        55_f64.to_radians(),
+                        radius / 1500.0,
+                    );
+                }
+                if matches!(motion, latency::Motion::Edit | latency::Motion::Combined)
+                    && tick.is_multiple_of(6)
+                {
+                    let edited = tick.is_multiple_of(12);
+                    let offset = if edited { 0.2 } else { 0.0 };
                     for &(id, origin) in &self.bench_edits {
                         self.scene_3d.set_origin(id, origin + Vec3::X * offset);
+                        if motion == latency::Motion::Combined {
+                            self.scene_3d.set_visible(id, !edited);
+                        }
                     }
                 }
-                if motion == latency::Motion::Section {
+                if matches!(motion, latency::Motion::Section | latency::Motion::Combined) {
                     self.rotate_bench_section(tick);
                 }
                 let (x, y) = match region {
@@ -1150,11 +1455,12 @@ impl GpuState {
                         )
                     }
                 };
+                let [width, height] = [width.min(w), width.min(h)];
                 let rect = [
-                    x.saturating_sub(width / 2),
-                    y.saturating_sub(width / 2),
-                    width.min(w),
-                    width.min(h),
+                    x.saturating_sub(width / 2).min(w - width),
+                    y.saturating_sub(height / 2).min(h - height),
+                    width,
+                    height,
                 ];
                 if motion != latency::Motion::Static {
                     self.window.request_redraw();
@@ -1231,12 +1537,58 @@ impl GpuState {
                 status,
                 streaming: false,
                 dynamic_drawn: false,
+                preview_view_changed: false,
             });
         }
     }
 
+    fn pending_preview(&self) -> Option<&SubmittedPick> {
+        self.pending_pick
+            .as_ref()
+            .filter(|pending| pending.request.kind == PickKind::Preview)
+    }
+
+    fn preview_active(&self) -> bool {
+        self.marquee_origin.is_some()
+            || self.preview_view.is_some()
+            || self.pending_preview().is_some()
+            || self.queued_color_frame_preview.is_some()
+            || self
+                .queued_pick
+                .as_ref()
+                .is_some_and(|request| request.kind == PickKind::Preview)
+    }
+
+    fn render_backlogged(&self, now: Instant) -> bool {
+        if self.uses_color_frame_preview() && self.pending_preview().is_some() {
+            // While an MRT color-frame selection capture is already executing on the GPU, defer
+            // any intermediate redraw so poll_pick observes completion immediately and coalesces
+            // the highlight display with the next tick's capture into a single frame.
+            return true;
+        }
+        let in_flight = self.frames_in_flight.load(Ordering::Relaxed);
+        if in_flight == 0 || !self.preview_active() {
+            return false;
+        }
+        if in_flight >= 2 {
+            return true;
+        }
+        // Only cap overlap to 1 frame while a pick readback is actively pending so a second heavy
+        // scene cannot stall it; allow encoding the next tick while a light highlight frame finishes.
+        self.pending_preview().is_some()
+            && self
+                .preview_pacing
+                .gpu_backlogged(now, self.pending_preview().map(|pick| pick.submitted_at))
+    }
+
     fn render(&mut self) -> Result<(), iletki::ViewportError> {
         let frame_start = Instant::now();
+        self.poll_pick(true);
+        if self.render_backlogged(frame_start) {
+            self.deferred_redraw = true;
+            return Ok(());
+        }
+        self.deferred_redraw = false;
         self.preview_pacing.frame_started();
         #[cfg(feature = "profiling")]
         if self.pick_profile
@@ -1289,7 +1641,22 @@ impl GpuState {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
 
-        self.clear_stale_preview();
+        self.clear_stale_preview(Instant::now());
+        let mut color_frame_preview_req =
+            if self.uses_color_frame_preview() && self.pending_pick.is_none() {
+                self.queued_color_frame_preview
+                    .take()
+                    .filter(|req| req.epoch == self.pick_epoch)
+            } else {
+                None
+            };
+        if let Some(req) = &color_frame_preview_req {
+            self.preview_pacing.submitted(frame_start);
+            self.pick_status(req.event, "encoding", None);
+            self.vp_main.set_color_frame_selection_rect(Some(req.rect));
+        } else if !self.preview_active() {
+            self.vp_main.set_color_frame_selection_rect(None);
+        }
         let mut streaming = false;
         let mut dynamic_drawn = false;
         if (self.quad_view || self.bench_dual) && self.active_scene == DemoScene::Arch3D {
@@ -1429,6 +1796,29 @@ impl GpuState {
         let commands = enc.finish();
         let encoded = Instant::now();
         self.queue.submit([commands]);
+        if let Some(mut req) = color_frame_preview_req.take() {
+            if let Some(preview) = self
+                .vp_main
+                .take_color_frame_selection_preview(&self.device)
+            {
+                req.view = self.pick_view(req.kind);
+                self.pick_status(req.event, "submitted", None);
+                self.pending_pick = Some(SubmittedPick {
+                    pick: PendingSelection::ColorFrame(preview),
+                    request: req,
+                    submitted_at: Instant::now(),
+                });
+            } else {
+                self.pick_status(req.event, "error", None);
+            }
+        }
+        if self.preview_active() {
+            self.frames_in_flight.fetch_add(1, Ordering::Relaxed);
+            let in_flight = self.frames_in_flight.clone();
+            self.queue.on_submitted_work_done(move || {
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         let submitted = self.latency.as_ref().map(|_| Instant::now());
         if let Some(trace) = &self.latency {
             trace.track_gpu(&self.queue, trace.frame_id());
@@ -1440,6 +1830,7 @@ impl GpuState {
         }
         self.queue.present(output);
         let presented = Instant::now();
+        let preview_view_changed = self.latency.is_some() && self.preview_deadline().is_some();
         if let (Some(trace), Some(viewport_encoded), Some(submitted)) =
             (&mut self.latency, viewport_encoded, submitted)
         {
@@ -1454,6 +1845,7 @@ impl GpuState {
                 status: "present-called",
                 streaming,
                 dynamic_drawn,
+                preview_view_changed,
             });
         }
 
@@ -1496,6 +1888,12 @@ impl GpuState {
             self.update_title();
             self.title_updated_at = Instant::now();
         }
+        if !streaming && !self.initial_streaming_done {
+            self.initial_streaming_done = true;
+            if let Some(trace) = &mut self.latency {
+                trace.start_replay(presented);
+            }
+        }
         if streaming
             || self.vp_main.mode() == ViewportMode::Continuous
             || self.transition.is_active()
@@ -1520,9 +1918,25 @@ impl ApplicationHandler for DemoApp {
             .bench
             .as_ref()
             .map_or([1280, 800], latency::Options::dimensions);
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("iletki-demo")
             .with_inner_size(PhysicalSize::new(width, height));
+        if let Some(bench) = self.bench.as_ref().filter(|bench| bench.full_hd) {
+            let monitor = if let Some(name) = &bench.monitor {
+                let Some(monitor) = event_loop
+                    .available_monitors()
+                    .find(|monitor| monitor.name().as_ref() == Some(name))
+                else {
+                    eprintln!("latency benchmark monitor not found: {name}");
+                    event_loop.exit();
+                    return;
+                };
+                Some(monitor)
+            } else {
+                event_loop.primary_monitor()
+            };
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor)));
+        }
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
             return;
@@ -1541,7 +1955,7 @@ impl ApplicationHandler for DemoApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
-            state.poll_pick();
+            state.poll_pick(false);
             let now = Instant::now();
             state.replay_latency(now);
             state.submit_queued_pick(Instant::now());
@@ -1550,13 +1964,27 @@ impl ApplicationHandler for DemoApp {
                 .as_ref()
                 .map(|_| Instant::now() + PICK_POLL_INTERVAL)
                 .or_else(|| state.queued_pick_deadline());
+            if state.deferred_redraw {
+                let _ = state.device.poll(wgpu::PollType::Poll);
+                if state.render_backlogged(Instant::now()) {
+                    let poll = Instant::now() + PICK_POLL_INTERVAL;
+                    deadline = Some(deadline.map_or(poll, |existing| existing.min(poll)));
+                } else {
+                    state.window.request_redraw();
+                }
+            }
+            if let Some(expiry) = state.preview_deadline() {
+                deadline = Some(deadline.map_or(expiry, |existing| existing.min(expiry)));
+            }
             if let Some(trace) = &state.latency {
                 if trace.pending_gpu() {
                     let _ = state.device.poll(wgpu::PollType::Poll);
                 }
                 if trace.finished(
                     now,
-                    state.pending_pick.is_some() || state.queued_pick.is_some(),
+                    state.pending_pick.is_some()
+                        || state.queued_pick.is_some()
+                        || state.queued_color_frame_preview.is_some(),
                 ) {
                     if let Err(error) = trace.write(&state.window, state.vp_main.camera()) {
                         eprintln!("latency trace write failed: {error}");
@@ -1629,8 +2057,8 @@ impl ApplicationHandler for DemoApp {
                                 || s.queued_pick
                                     .as_ref()
                                     .is_some_and(|request| request.kind == PickKind::Commit)
-                                || s.pending_pick.as_ref().is_some_and(|(_, request)| {
-                                    request.kind == PickKind::Commit
+                                || s.pending_pick.as_ref().is_some_and(|pending| {
+                                    pending.request.kind == PickKind::Commit
                                 }) =>
                         {
                             s.cancel_selection()

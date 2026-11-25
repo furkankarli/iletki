@@ -79,12 +79,16 @@ fn vs_edge(v: VertIn) -> ColorOut {
     return edge_vertex(v);
 }
 
-fn mask_vertex(v: VertIn, placement: ObjectUniforms) -> MaskOut {
-    let pos_rel = v.position * placement.scale + placement.offset_rel;
+fn mask_vertex_pos(position: vec3<f32>, placement: ObjectUniforms) -> MaskOut {
+    let pos_rel = position * placement.scale + placement.offset_rel;
     var out: MaskOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
     return out;
+}
+
+fn mask_vertex(v: VertIn, placement: ObjectUniforms) -> MaskOut {
+    return mask_vertex_pos(v.position, placement);
 }
 
 @vertex
@@ -92,8 +96,8 @@ fn vs_mask(v: VertIn) -> MaskOut {
     return mask_vertex(v, object);
 }
 
-fn pick_vertex(v: VertIn, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {
-    let pos_rel = v.position * placement.scale + placement.offset_rel;
+fn pick_vertex(position: vec3<f32>, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {
+    let pos_rel = position * placement.scale + placement.offset_rel;
     var out: PickOut;
     out.clip_pos = iletki_project_3d(pos_rel);
     out.pos_rel = pos_rel;
@@ -102,8 +106,8 @@ fn pick_vertex(v: VertIn, placement: ObjectUniforms, id: vec2<u32>) -> PickOut {
 }
 
 @vertex
-fn vs_mesh_pick(v: VertIn, p: PickIn) -> PickOut {
-    return pick_vertex(v, object, p.pick_id);
+fn vs_mesh_pick(@location(0) position: vec3<f32>, p: PickIn) -> PickOut {
+    return pick_vertex(position, object, p.pick_id);
 }
 
 fn shade_mesh(pos_rel: vec3<f32>, normal: vec3<f32>, color: vec4<f32>, is_front: bool) -> vec4<f32> {
@@ -134,6 +138,11 @@ fn fs_lit(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) v
     if (iletki_is_clipped(in.pos_rel)) {
         discard;
     }
+    return shade_mesh(in.pos_rel, in.normal, in.color, is_front);
+}
+
+@fragment
+fn fs_lit_unclipped(in: ColorOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     return shade_mesh(in.pos_rel, in.normal, in.color, is_front);
 }
 

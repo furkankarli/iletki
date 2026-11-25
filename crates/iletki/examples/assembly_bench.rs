@@ -20,7 +20,7 @@ mod assembly_fixture;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use iletki::gpu::{profiling, wgpu};
+    use iletki::gpu::{RgbaImage, profiling, wgpu};
     use iletki::{
         Camera, Chunk3DId, Mesh3D, PickHit, PickId, Plane, Scene3DLayer, Vec3, ViewportConfig,
         ViewportHost,
@@ -28,7 +28,7 @@ mod native {
     use std::fs::{self, File};
     use std::future::Future;
     use std::io::{BufWriter, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
@@ -36,6 +36,7 @@ mod native {
     type Error = Box<dyn std::error::Error>;
     const SIZE: [u32; 2] = [1024, 768];
     const ORBIT_PERIOD: u32 = 30;
+    const WARMUP: u32 = 60;
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -80,7 +81,8 @@ mod native {
         }
 
         fn acceptance_wide(self) -> bool {
-            matches!(self.chunks, 20_000 | 100_000) && self.view == "wide"
+            matches!(self.chunks, 20_000 | 100_000)
+                && matches!(self.view, "wide" | "split" | "wide-dual")
         }
 
         fn camera(self, frame: u32, secondary: bool) -> Camera {
@@ -126,10 +128,20 @@ mod native {
                 );
             }
             let focus = Vec3::new(30.0, 4.0, 0.8);
-            if self.view == "wide" {
+            if matches!(self.view, "wide" | "split" | "wide-dual") {
                 let half_y = f64::from(self.chunks.div_ceil(64));
                 let focus = Vec3::new(63.0, half_y, 0.8);
                 let radius = half_y.max(64.0) * 2.0;
+                if secondary {
+                    return Camera::ortho_3d(
+                        focus + Vec3::Z * radius,
+                        focus,
+                        Vec3::Y,
+                        radius,
+                        0.05,
+                        radius * 3.0,
+                    );
+                }
                 let eye = focus + Vec3::new(radius * angle.sin(), -radius * angle.cos(), radius);
                 return Camera::perspective_3d(eye, focus, Vec3::Z, 55_f64.to_radians(), 0.05);
             }
@@ -190,7 +202,10 @@ mod native {
                 wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
             );
             let adapter = block_on(instance.request_adapter(&Default::default()))?;
-            let mut required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+            let mut required_features = adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::PIPELINE_STATISTICS_QUERY
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
             if std::env::var_os("ILETKI_ASSEMBLY_SAMPLED_SECTION").is_none() {
                 required_features |= adapter.features() & wgpu::Features::CLIP_DISTANCES;
             }
@@ -199,9 +214,9 @@ mod native {
                 ..Default::default()
             }))?;
             eprintln!(
-                "{:?}; timestamp queries: {}",
+                "{:?}; features: {:?}",
                 adapter.get_info(),
-                required_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+                required_features
             );
             Ok(Self {
                 adapter,
@@ -227,11 +242,14 @@ mod native {
 
     fn hit_hash(hits: &[PickHit]) -> u64 {
         hash_bytes(hits.iter().flat_map(|hit| {
+            let position = hit.world_pos.map(|pos| [pos.x, pos.y, pos.z]);
             hit.id
                 .to_u64()
                 .to_le_bytes()
                 .into_iter()
                 .chain(hit.depth.to_le_bytes())
+                .chain([u8::from(position.is_some())])
+                .chain(position.into_iter().flatten().flat_map(f64::to_le_bytes))
         }))
     }
 
@@ -258,6 +276,7 @@ mod native {
         samples: BufWriter<File>,
         profile: BufWriter<File>,
         memory: Option<BufWriter<File>>,
+        images: Option<PathBuf>,
         run: u32,
         variant: String,
         size: [u32; 2],
@@ -279,19 +298,40 @@ mod native {
             if std::env::var_os("ILETKI_ASSEMBLY_NO_SECTION_BRIDGING").is_some() {
                 scene.set_profile_section_bridging(false);
             }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_REPEATED_PAGES").is_some() {
+                scene.set_profile_repeated_pages(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_INDEXED").is_some() {
+                scene.set_profile_indexed_geometry(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_STORAGE").is_some() {
+                scene.set_profile_storage_transforms(false);
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_NO_GPU_CULL").is_some() {
+                scene.set_profile_gpu_culling(false);
+            }
             self.record_memory(case, "before-targets")?;
-            let host = || {
+            let host = |initial_px| {
                 ViewportHost::new_with_adapter(
                     &self.gpu.device,
                     &self.gpu.adapter,
                     ViewportConfig {
-                        initial_px: self.size,
+                        initial_px,
                         ..Default::default()
                     },
                 )
             };
-            let mut main = host()?;
-            let mut second = (case.view == "dual").then(host).transpose()?;
+            let [width, height] = self.size;
+            let split = case.view == "split";
+            if split && width < 2 {
+                return Err("split benchmark requires at least two pixels of width".into());
+            }
+            let left = if split { width / 2 } else { width };
+            let right = if split { width - left } else { width };
+            let mut main = host([right, height])?;
+            let mut second = matches!(case.view, "dual" | "split" | "wide-dual")
+                .then(|| host([left, height]))
+                .transpose()?;
             *main.camera_mut() = case.camera(0, false);
             if let Some(second) = second.as_mut() {
                 *second.camera_mut() = case.camera(0, true);
@@ -300,6 +340,7 @@ mod native {
             self.record_memory(case, "after-orbit")?;
             if (case.primary() || case.model.is_some() || case.chunks == 100_000)
                 && self.variant != "visibility-only"
+                && std::env::var_os("ILETKI_ASSEMBLY_ORBIT_ONLY").is_none()
             {
                 self.picking(case, &mut scene, &mut main)?;
             }
@@ -391,9 +432,14 @@ mod native {
                 (true, _) => 8,
                 (false, _) => 0,
             };
+            let signatures =
+                self.images.is_some() || std::env::var_os("ILETKI_ASSEMBLY_SIGNATURES").is_some();
             let edit_scene = std::env::var_os("ILETKI_ASSEMBLY_EDITS").is_some();
             let edit_visibility = std::env::var_os("ILETKI_ASSEMBLY_VISIBILITY_EDITS").is_some();
-            for frame in 0..12 + samples + traces {
+            let overlap = std::env::var_os("ILETKI_ASSEMBLY_OVERLAP").is_some();
+            let trace_end = WARMUP + samples + traces;
+            let mut model_seen = false;
+            for frame in 0..trace_end + if signatures { ORBIT_PERIOD } else { 0 } {
                 let start = Instant::now();
                 let edited = (edit_scene || edit_visibility) && frame % 6 == 0;
                 if edited {
@@ -412,13 +458,17 @@ mod native {
                 if let Some(second) = second.as_mut() {
                     *second.camera_mut() = case.camera(frame, true);
                 }
-                let trace = frame >= 12 + samples;
+                let trace = (WARMUP + samples..trace_end).contains(&frame);
                 if trace {
                     profiling::begin(&gpu.device);
                 }
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
                 main.render_to_texture(&gpu.device, &gpu.queue, &mut encoder, &(), &mut [scene]);
                 if let Some(second) = second.as_mut() {
+                    if overlap {
+                        gpu.queue.submit([encoder.finish()]);
+                        encoder = gpu.device.create_command_encoder(&Default::default());
+                    }
                     second.render_to_texture(
                         &gpu.device,
                         &gpu.queue,
@@ -439,23 +489,30 @@ mod native {
                         "orbit"
                     };
                     record_capture(&mut self.profile, label, frame, capture)?;
-                } else if frame >= 12 {
-                    let signature = if frame == 12 {
+                } else if frame >= WARMUP {
+                    let reference_frame = if signatures {
+                        frame >= trace_end
+                    } else {
+                        frame == WARMUP
+                    };
+                    let signature = if reference_frame {
                         let image = main.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
-                        if case.model.is_some()
-                            && let Some(background) = image.pixels.get(..4)
-                            && image
-                                .pixels
-                                .as_chunks::<4>()
-                                .0
-                                .iter()
-                                .all(|pixel| pixel == background)
-                        {
-                            return Err("the model produced a uniform reference image".into());
+                        if case.model.is_some() && !model_seen {
+                            model_seen = image.pixels.get(..4).is_some_and(|background| {
+                                image
+                                    .pixels
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .any(|pixel| pixel != background)
+                            });
                         }
+                        let phase = frame.saturating_sub(trace_end);
+                        self.record_image(case, phase, "main", &image)?;
                         let hash = hash_bytes(image.pixels);
                         if let Some(second) = second.as_ref() {
                             let image = second.readback_rgba_blocking(&gpu.device, &gpu.queue)?;
+                            self.record_image(case, phase, "second", &image)?;
                             format!("{hash:016x}/{:016x}", hash_bytes(image.pixels))
                         } else {
                             format!("{hash:016x}")
@@ -463,11 +520,45 @@ mod native {
                     } else {
                         String::new()
                     };
-                    self.record(case, "orbit", frame - 12, encode, wall, &signature)?;
-                    if edited {
-                        self.record(case, "edit-frame", frame - 12, encode, wall, "")?;
+                    if frame >= trace_end {
+                        self.record(
+                            case,
+                            "image-signature",
+                            frame - WARMUP,
+                            0.0,
+                            0.0,
+                            &signature,
+                        )?;
+                    } else {
+                        self.record(case, "orbit", frame - WARMUP, encode, wall, &signature)?;
+                        if edited {
+                            self.record(case, "edit-frame", frame - WARMUP, encode, wall, "")?;
+                        }
                     }
                 }
+            }
+            if case.model.is_some() && !model_seen {
+                return Err("the model produced only uniform reference images".into());
+            }
+            Ok(())
+        }
+
+        fn record_image(
+            &self,
+            case: Case,
+            phase: u32,
+            view: &str,
+            image: &RgbaImage,
+        ) -> Result<(), Error> {
+            let save_all = std::env::var_os("ILETKI_ASSEMBLY_ALL_IMAGES").is_some();
+            if let Some(directory) = &self.images
+                && (save_all || phase.is_multiple_of(10))
+            {
+                let filename = format!(
+                    "{}-{}-{phase:02}-{view}-{}x{}.rgba",
+                    case.chunks, case.view, image.width, image.height,
+                );
+                fs::write(directory.join(filename), &image.pixels)?;
             }
             Ok(())
         }
@@ -482,12 +573,12 @@ mod native {
             *main.camera_mut() = case.camera(35, false);
             let samples = 360;
             let profile = std::env::var_os("ILETKI_PROFILE").is_some();
-            let [x, y] = self.size.map(|dimension| dimension / 2);
+            let [x, y] = main.size().active_px.map(|dimension| dimension / 2);
             let click = [x.saturating_sub(2), y.saturating_sub(2), 5, 5];
             let marquee = [x.saturating_sub(128), y.saturating_sub(128), 256, 256];
             for (label, rect) in [("click", click), ("marquee", marquee), ("hover", click)] {
-                for frame in 0..12 + samples + if profile { 8 } else { 0 } {
-                    let trace = frame >= 12 + samples;
+                for frame in 0..WARMUP + samples + if profile { 8 } else { 0 } {
+                    let trace = frame >= WARMUP + samples;
                     if trace {
                         profiling::begin(&gpu.device);
                     }
@@ -527,16 +618,78 @@ mod native {
                     if trace {
                         let capture = profiling::finish(&gpu.device, &gpu.queue)?;
                         record_capture(&mut self.profile, label, frame, capture)?;
-                    } else if frame >= 12 {
+                    } else if frame >= WARMUP {
                         self.record(
                             case,
                             label,
-                            frame - 12,
+                            frame - WARMUP,
                             submit,
                             wall,
                             &format!("{:016x}", hit_hash(&hits)),
                         )?;
                     }
+                }
+            }
+            if main.supports_color_frame_selection(&gpu.device) {
+                let preview_samples = 120u32;
+                let [mx, my, mw, mh] = marquee;
+                for (label, moving) in [
+                    ("marquee-preview-static", false),
+                    ("marquee-preview-moving", true),
+                ] {
+                    *main.camera_mut() = case.camera(35, false);
+                    for frame in 0..WARMUP + preview_samples + if profile { 8 } else { 0 } {
+                        let trace = frame >= WARMUP + preview_samples;
+                        if trace {
+                            profiling::begin(&gpu.device);
+                        }
+                        if moving {
+                            *main.camera_mut() = case.camera(35 + frame, false);
+                        }
+                        let shift = frame % 17;
+                        let rect = [mx.saturating_add(shift), my, mw, mh];
+                        let start = Instant::now();
+                        main.set_color_frame_selection_rect(Some(rect));
+                        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                        main.render_to_texture(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            &(),
+                            &mut [scene],
+                        );
+                        let commands = encoder.finish();
+                        let encode = elapsed_ms(start);
+                        gpu.queue.submit([commands]);
+                        let slots = if let Some(mut pending) =
+                            main.take_color_frame_selection_preview(&gpu.device)
+                        {
+                            loop {
+                                match pending.try_read() {
+                                    Poll::Ready(res) => break res?,
+                                    Poll::Pending => std::thread::yield_now(),
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let wall = elapsed_ms(start);
+                        if trace {
+                            let capture = profiling::finish(&gpu.device, &gpu.queue)?;
+                            record_capture(&mut self.profile, label, frame, capture)?;
+                        } else if frame >= WARMUP {
+                            let sig = hash_bytes(slots.iter().flat_map(|s| s.to_le_bytes()));
+                            self.record(
+                                case,
+                                label,
+                                frame - WARMUP,
+                                encode,
+                                wall,
+                                &format!("{sig:016x}"),
+                            )?;
+                        }
+                    }
+                    main.set_color_frame_selection_rect(None);
                 }
             }
             Ok(())
@@ -557,6 +710,99 @@ mod native {
                 self.variant, self.run, case.chunks, case.view, workload, frame
             )
         }
+    }
+
+    fn make_smooth_scene(pack: bool) -> (Scene3DLayer, Vec<(Chunk3DId, Vec3)>, Vec3, f64, usize) {
+        use iletki::{Bounds3, Vertex3D};
+
+        let mut scene = Scene3DLayer::new(1);
+        scene.set_profile_batch_geometry(pack);
+        let mut edits = Vec::new();
+        let mut bounds = Bounds3::EMPTY;
+        let mut triangles = 0usize;
+
+        let build_sphere = |stacks: usize, slices: usize, r: f32, color: [u8; 4]| {
+            let mut verts = Vec::with_capacity(stacks * slices * 6);
+            for st in 0..stacks {
+                let phi0 = std::f32::consts::PI * (st as f32) / (stacks as f32);
+                let phi1 = std::f32::consts::PI * ((st + 1) as f32) / (stacks as f32);
+                for sl in 0..slices {
+                    let th0 = std::f32::consts::TAU * (sl as f32) / (slices as f32);
+                    let th1 = std::f32::consts::TAU * ((sl + 1) as f32) / (slices as f32);
+                    let pt = |phi: f32, th: f32| {
+                        let nx = phi.sin() * th.cos();
+                        let ny = phi.sin() * th.sin();
+                        let nz = phi.cos();
+                        Vertex3D::new([nx * r, ny * r, nz * r], [nx, ny, nz], color)
+                    };
+                    let v00 = pt(phi0, th0);
+                    let v10 = pt(phi1, th0);
+                    let v11 = pt(phi1, th1);
+                    let v01 = pt(phi0, th1);
+                    if st > 0 {
+                        verts.extend_from_slice(&[v00, v10, v11]);
+                    }
+                    if st + 1 < stacks {
+                        verts.extend_from_slice(&[v00, v11, v01]);
+                    }
+                }
+            }
+            verts
+        };
+
+        let build_cylinder = |segs: usize, rings: usize, r: f32, h: f32, color: [u8; 4]| {
+            let mut verts = Vec::with_capacity(segs * rings * 6);
+            for rg in 0..rings {
+                let z0 = -0.5 * h + h * (rg as f32) / (rings as f32);
+                let z1 = -0.5 * h + h * ((rg + 1) as f32) / (rings as f32);
+                for sg in 0..segs {
+                    let a0 = std::f32::consts::TAU * (sg as f32) / (segs as f32);
+                    let a1 = std::f32::consts::TAU * ((sg + 1) as f32) / (segs as f32);
+                    let n0 = [a0.cos(), a0.sin(), 0.0];
+                    let n1 = [a1.cos(), a1.sin(), 0.0];
+                    let v00 = Vertex3D::new([n0[0] * r, n0[1] * r, z0], n0, color);
+                    let v10 = Vertex3D::new([n1[0] * r, n1[1] * r, z0], n1, color);
+                    let v11 = Vertex3D::new([n1[0] * r, n1[1] * r, z1], n1, color);
+                    let v01 = Vertex3D::new([n0[0] * r, n0[1] * r, z1], n0, color);
+                    verts.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+                }
+            }
+            verts
+        };
+
+        for i in 0..500u32 {
+            let gx = f64::from(i % 25) * 3.0;
+            let gy = f64::from(i / 25) * 3.0;
+            let origin = Vec3::new(gx, gy, 0.0);
+            let color = [
+                ((i * 53 + 80) % 200 + 40) as u8,
+                ((i * 97 + 110) % 200 + 40) as u8,
+                ((i * 131 + 140) % 200 + 40) as u8,
+                255,
+            ];
+            let mut mesh = Mesh3D::at_origin(origin);
+            let verts = if i % 2 == 0 {
+                build_sphere(32, 48, 1.1, color)
+            } else {
+                build_cylinder(64, 24, 0.9, 2.2, color)
+            };
+            let pick = PickId::new(1, i + 1, 0).to_rg32u();
+            mesh.pick_ids.resize(verts.len(), pick);
+            mesh.local_bounds =
+                Bounds3::from_corners(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1));
+            triangles += verts.len() / 3;
+            mesh.vertices = verts;
+            let wb = mesh.world_bounds();
+            bounds.include(wb.min);
+            bounds.include(wb.max);
+            let id = scene.insert(mesh);
+            if i % 100 == 0 {
+                edits.push((id, origin));
+            }
+        }
+        let focus = bounds.center().unwrap_or(Vec3::ZERO);
+        let radius = bounds.radius() * 2.2;
+        (scene, edits, focus, radius, triangles)
     }
 
     fn elapsed_ms(start: Instant) -> f64 {
@@ -600,11 +846,19 @@ mod native {
         } else {
             None
         };
+        let images = if std::env::var_os("ILETKI_ASSEMBLY_IMAGES").is_some() {
+            let directory = output.join("images");
+            fs::create_dir_all(&directory)?;
+            Some(directory)
+        } else {
+            None
+        };
         let mut bench = Benchmark {
             gpu: &gpu,
             samples: BufWriter::new(File::create(output.join("frames.csv"))?),
             profile: BufWriter::new(File::create(output.join("profile.csv"))?),
             memory,
+            images,
             run,
             variant,
             size: viewport_size()?,
@@ -619,19 +873,42 @@ mod native {
             bench.variant.as_str(),
             "geometry-direct" | "visibility-only"
         );
+        if std::env::var_os("ILETKI_ASSEMBLY_SMOOTH").is_some() {
+            let started = Instant::now();
+            let (scene, edits, focus, radius, triangles) = make_smooth_scene(pack);
+            let case = Case {
+                chunks: 500,
+                view: "model",
+                model: Some((focus, radius)),
+                style,
+            };
+            eprintln!(
+                "smooth synthetic: 500 chunks, {triangles} triangles, {:?} pixels",
+                bench.size
+            );
+            bench.record(case, "scene-build", 0, 0.0, elapsed_ms(started), "")?;
+            return bench.run_case(case, scene, &edits);
+        }
         if let Some(path) = std::env::var_os("ILETKI_ASSEMBLY_MESH") {
             let started = Instant::now();
             let fixture = crate::assembly_fixture::load(Path::new(&path))?;
             let decoded_ms = elapsed_ms(started);
             let chunks = u32::try_from(fixture.meshes.len())?;
             let focus = fixture.bounds.center().ok_or("model has no bounds")?;
-            let radius = fixture.bounds.radius() * 2.6;
+            let orbit_scale = if std::env::var_os("ILETKI_ASSEMBLY_MODEL_CLOSE").is_some() {
+                0.85
+            } else {
+                2.6
+            };
+            let radius = fixture.bounds.radius() * orbit_scale;
             if !focus.is_finite() || !radius.is_finite() || radius <= 0.0 {
                 return Err("invalid model camera bounds".into());
             }
             let case = Case {
                 chunks,
-                view: if std::env::var_os("ILETKI_ASSEMBLY_DUAL").is_some() {
+                view: if std::env::var_os("ILETKI_ASSEMBLY_SPLIT").is_some() {
+                    "split"
+                } else if std::env::var_os("ILETKI_ASSEMBLY_DUAL").is_some() {
                     "dual"
                 } else {
                     "model"
@@ -664,14 +941,16 @@ mod native {
         let filter = std::env::var("ILETKI_ASSEMBLY_CASE").ok();
         let mut ran_case = false;
         for chunks in [1000, 4000, 20000, 100_000] {
-            for view in ["near", "wide", "dual"] {
+            for view in ["near", "wide", "dual", "split", "wide-dual"] {
                 let case = Case {
                     chunks,
                     view,
                     model: None,
                     style,
                 };
-                if (chunks == 100_000 && filter.as_deref() != Some("100000/wide"))
+                if (chunks == 100_000 && !case.acceptance_wide())
+                    || (filter.is_none()
+                        && (chunks == 100_000 || matches!(view, "split" | "wide-dual")))
                     || (primary_only && !case.primary())
                     || filter
                         .as_ref()
