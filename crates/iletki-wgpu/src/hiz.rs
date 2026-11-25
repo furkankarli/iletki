@@ -5,7 +5,6 @@
 //! `16x16` workgroup (one screen pixel per thread, unrolled 4x MSAA loads) reducing three pyramid
 //! levels (`4x4`, `2x2`, `1x1`) in LDS in one pass.
 
-use crate::target::DEPTH_FORMAT;
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,8 +160,12 @@ struct HizParams {
 }
 
 /// Returns whether `device` supports building a compute Reversed-Z Hi-Z pyramid from the viewport
-/// depth target at `msaa_samples`.
-pub(crate) fn supports_hiz(device: &wgpu::Device, msaa_samples: u32) -> bool {
+/// depth target at `depth_format` and `msaa_samples`.
+pub(crate) fn supports_hiz(
+    device: &wgpu::Device,
+    depth_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> bool {
     if device.adapter_info().backend == wgpu::Backend::Gl {
         return false;
     }
@@ -176,8 +179,11 @@ pub(crate) fn supports_hiz(device: &wgpu::Device, msaa_samples: u32) -> bool {
         return false;
     }
     let enabled = device.features();
+    if !enabled.contains(depth_format.required_features()) {
+        return false;
+    }
     let r32 = wgpu::TextureFormat::R32Float.guaranteed_format_features(enabled);
-    let depth = DEPTH_FORMAT.guaranteed_format_features(enabled);
+    let depth = depth_format.guaranteed_format_features(enabled);
     r32.allowed_usages
         .contains(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING)
         && depth

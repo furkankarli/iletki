@@ -758,6 +758,12 @@ mod tests {
             include_str!("shaders/mesh3d_select.wgsl"),
             include_str!("shaders/mesh3d_select_sampled.wgsl"),
             include_str!("shaders/mesh3d_select_raster.wgsl"),
+            include_str!("shaders/mesh3d_material_storage.wgsl"),
+            include_str!("shaders/mesh3d_material_storage_raster.wgsl"),
+            include_str!("shaders/mesh3d_material_storage_sampled.wgsl"),
+            include_str!("shaders/mesh3d_material_storage_select.wgsl"),
+            include_str!("shaders/mesh3d_material_storage_select_raster.wgsl"),
+            include_str!("shaders/mesh3d_material_storage_select_sampled.wgsl"),
         ];
         for src in shaders {
             let crlf = src.replace("\r\n", "\n").replace('\n', "\r\n");

@@ -162,7 +162,8 @@ pub struct PrepareCtx<'a, W = ()> {
     pub uploads: UploadTracker,
     /// Target color texture format.
     pub color_format: wgpu::TextureFormat,
-    /// Target depth texture format (`Depth32Float`).
+    /// Target depth texture format (`Depth32Float`, or `Depth32FloatStencil8` when a layer
+    /// requests stencil and the device supports it).
     pub depth_format: wgpu::TextureFormat,
     /// MSAA sample count for main scene/gizmo/overlay passes (`1` or `4`).
     pub msaa_samples: u32,
@@ -238,6 +239,121 @@ impl<W> std::fmt::Debug for GpuCullCtx<'_, W> {
         f.debug_struct("GpuCullCtx")
             .field("viewport_id", &self.viewport_id)
             .field("active_px", &self.active_px)
+            .finish()
+    }
+}
+
+/// Optional render-graph pass hook stage executed inside [`crate::ViewportHost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PassHookStage {
+    /// Runs before the primary scene color pass (e.g. shadow maps or custom compute preparation).
+    PreScene = 0,
+    /// Runs immediately after all opaque geometry has been drawn into the scene color/depth
+    /// attachments (and before transparent draws or MSAA resolve), with full access to the scene
+    /// depth/stencil target (e.g. GPU stencil section caps).
+    PostOpaque = 1,
+    /// Runs after scene color has been resolved to a single-sample texture while the scene depth
+    /// buffer is still preserved (e.g. half-resolution GTAO or custom screen-space post passes).
+    PostSceneResolved = 2,
+}
+
+impl PassHookStage {
+    /// Returns the single-bit [`PassHookMask`] corresponding to this stage.
+    #[must_use]
+    pub const fn mask(self) -> PassHookMask {
+        PassHookMask(1 << (self as u8))
+    }
+}
+
+/// Bitmask of optional [`PassHookStage`]s requested by a [`ViewportLayer`] on a frame.
+///
+/// Unused stages are pruned from the viewport pass graph with zero GPU or CPU overhead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PassHookMask(u8);
+
+impl PassHookMask {
+    /// Requests no optional pass hooks (zero overhead).
+    pub const NONE: Self = Self(0);
+    /// Requests [`PassHookStage::PreScene`].
+    pub const PRE_SCENE: Self = PassHookStage::PreScene.mask();
+    /// Requests [`PassHookStage::PostOpaque`].
+    pub const POST_OPAQUE: Self = PassHookStage::PostOpaque.mask();
+    /// Requests [`PassHookStage::PostSceneResolved`].
+    pub const POST_SCENE_RESOLVED: Self = PassHookStage::PostSceneResolved.mask();
+    /// Requests every optional pass hook stage.
+    pub const ALL: Self = Self(0x07);
+
+    /// Returns `true` if no hook bits are set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Combines two hook masks.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns `true` if `stage` is enabled in this mask.
+    #[must_use]
+    pub const fn contains(self, stage: PassHookStage) -> bool {
+        (self.0 & stage.mask().0) != 0
+    }
+}
+
+/// Typed context handed to [`ViewportLayer::encode_pass_hook`] during optional frame stages.
+pub struct PassHookCtx<'a, W = ()> {
+    /// Unique identifier of the viewport being rendered.
+    pub viewport_id: ViewportId,
+    /// Shared GPU device.
+    pub device: &'a wgpu::Device,
+    /// Shared GPU command queue.
+    pub queue: &'a wgpu::Queue,
+    /// Current viewport camera.
+    pub camera: &'a Camera,
+    /// Shared `@group(0)` bind group for [`crate::CAMERA_WGSL`].
+    pub camera_bind_group: &'a wgpu::BindGroup,
+    /// Shared application world/scene reference.
+    pub world: &'a W,
+    /// Active viewport size in physical pixels.
+    pub active_px: [u32; 2],
+    /// Allocated block-aligned backing target size in physical pixels.
+    pub allocated_px: [u32; 2],
+    /// Active viewport size in logical points.
+    pub logical_size: Vec2,
+    /// Logical-to-physical DPI scale.
+    pub dpi_scale: f32,
+    /// Target color texture format.
+    pub color_format: wgpu::TextureFormat,
+    /// Target depth (or depth-stencil) texture format.
+    pub depth_format: wgpu::TextureFormat,
+    /// MSAA sample count of the primary scene attachments (`1` or `4`).
+    pub msaa_samples: u32,
+    /// Monotonic generation of the viewport's backing targets (use to invalidate cached bind groups).
+    pub target_generation: u64,
+    /// Scene color attachment view (MSAA when `msaa_samples > 1`, otherwise 1×).
+    pub color_attachment_view: &'a wgpu::TextureView,
+    /// Resolved 1× scene color view when available (always `Some` in [`PassHookStage::PostSceneResolved`]).
+    pub resolved_color_view: Option<&'a wgpu::TextureView>,
+    /// Scene depth (or depth-stencil) attachment view (`TextureAspect::All`).
+    pub depth_stencil_view: &'a wgpu::TextureView,
+    /// Depth-only sampleable view (`TextureAspect::DepthOnly`), or `None` when depth sampling is
+    /// unavailable on the active backend (e.g. MSAA depth on OpenGL).
+    pub depth_sample_view: Option<&'a wgpu::TextureView>,
+    /// Active MRT selection slot-ID attachment view when color-frame selection is enabled.
+    pub selection_id_view: Option<&'a wgpu::TextureView>,
+}
+
+impl<W> std::fmt::Debug for PassHookCtx<'_, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassHookCtx")
+            .field("viewport_id", &self.viewport_id)
+            .field("active_px", &self.active_px)
+            .field("color_format", &self.color_format)
+            .field("depth_format", &self.depth_format)
+            .field("msaa_samples", &self.msaa_samples)
             .finish()
     }
 }
@@ -381,6 +497,30 @@ pub trait ViewportLayer<W = ()>: wgpu::WasmNotSendSync {
         _phase: DrawPhase,
         _pass: &mut wgpu::RenderPass<'_>,
         _ctx: &PaintCtx<'_, W>,
+    ) {
+    }
+
+    /// Returns whether this layer requires a stencil aspect (`Depth32FloatStencil8`) on the scene
+    /// depth attachment for `viewport_id` (for example, GPU stencil section caps).
+    ///
+    /// When no participating layer returns `true`, the viewport keeps plain `Depth32Float` with
+    /// zero extra memory overhead.
+    fn requires_stencil(&self, _viewport_id: ViewportId) -> bool {
+        false
+    }
+
+    /// Declares which optional [`PassHookStage`]s this layer wants executed on `viewport_id` for
+    /// the current frame. Unrequested stages are pruned from the pass graph before encoding.
+    fn pass_hooks(&self, _viewport_id: ViewportId) -> PassHookMask {
+        PassHookMask::NONE
+    }
+
+    /// Records custom compute or render work for an opt-in [`PassHookStage`].
+    fn encode_pass_hook(
+        &mut self,
+        _stage: PassHookStage,
+        _encoder: &mut wgpu::CommandEncoder,
+        _ctx: &PassHookCtx<'_, W>,
     ) {
     }
 

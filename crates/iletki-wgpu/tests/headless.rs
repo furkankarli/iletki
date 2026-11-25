@@ -6,10 +6,11 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use iletki_core::{DirtyFlags, DrawPhase, DrawPhaseMask, PickId, ViewportMode};
+use iletki_core::{DirtyFlags, DrawPhase, DrawPhaseMask, PickId, ViewportId, ViewportMode};
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PrepareCtx,
-    ViewportConfig, ViewportError, ViewportHost, ViewportLayer, wgpu,
+    CAMERA_WGSL, DEPTH_FORMAT, DEPTH_STENCIL_FORMAT, PICK_ID_FORMAT, PaintCtx, PassHookCtx,
+    PassHookMask, PassHookStage, PassTargetDesc, PrepareCtx, ViewportConfig, ViewportError,
+    ViewportHost, ViewportLayer, wgpu,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -493,4 +494,365 @@ fn pick_can_start_before_render_and_outlive_the_viewport() {
         request.try_read(),
         Poll::Ready(Err(ViewportError::PickAlreadyRead))
     );
+}
+
+struct HookProbeLayer {
+    hooks: PassHookMask,
+    want_stencil: bool,
+    draw_overlay: bool,
+    seen_depth_format: Option<wgpu::TextureFormat>,
+    stages_seen: Vec<PassHookStage>,
+    post_resolved_saw_depth_sample: bool,
+    post_opaque_pipe: Option<(wgpu::TextureFormat, u32, wgpu::RenderPipeline)>,
+    post_resolved_pipe: Option<wgpu::RenderPipeline>,
+}
+
+impl HookProbeLayer {
+    fn new() -> Self {
+        Self {
+            hooks: PassHookMask::NONE,
+            want_stencil: false,
+            draw_overlay: false,
+            seen_depth_format: None,
+            stages_seen: Vec::new(),
+            post_resolved_saw_depth_sample: false,
+            post_opaque_pipe: None,
+            post_resolved_pipe: None,
+        }
+    }
+}
+
+impl ViewportLayer<()> for HookProbeLayer {
+    fn id(&self) -> u16 {
+        9
+    }
+
+    fn phases(&self) -> DrawPhaseMask {
+        if self.draw_overlay {
+            DrawPhaseMask::OVERLAY
+        } else {
+            DrawPhaseMask::NONE
+        }
+    }
+
+    fn requires_stencil(&self, _viewport_id: ViewportId) -> bool {
+        self.want_stencil
+    }
+
+    fn pass_hooks(&self, _viewport_id: ViewportId) -> PassHookMask {
+        self.hooks
+    }
+
+    fn prepare(&mut self, ctx: &mut PrepareCtx<'_, ()>) -> bool {
+        self.seen_depth_format = Some(ctx.depth_format);
+        let needs_post_opaque = self
+            .post_opaque_pipe
+            .as_ref()
+            .is_none_or(|(df, msaa, _)| *df != ctx.depth_format || *msaa != ctx.msaa_samples);
+        if needs_post_opaque && self.hooks.contains(PassHookStage::PostOpaque) {
+            let shader = ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("hook post opaque shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        r#"
+                        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                            var p = array<vec2<f32>, 3>(
+                                vec2<f32>(-1.0, -1.0),
+                                vec2<f32>( 3.0, -1.0),
+                                vec2<f32>(-1.0,  3.0)
+                            );
+                            return vec4<f32>(p[i], 0.5, 1.0);
+                        }
+                        @fragment fn fs() -> @location(0) vec4<f32> {
+                            return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+                        }
+                        "#
+                        .into(),
+                    ),
+                });
+            let pipe = ctx
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("hook post opaque pipe"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: ctx.depth_format,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::Always),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: ctx.msaa_samples,
+                        ..Default::default()
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                });
+            self.post_opaque_pipe = Some((ctx.depth_format, ctx.msaa_samples, pipe));
+        }
+        if self.post_resolved_pipe.is_none()
+            && self.hooks.contains(PassHookStage::PostSceneResolved)
+        {
+            let shader = ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("hook post resolved shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        r#"
+                        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                            var p = array<vec2<f32>, 3>(
+                                vec2<f32>(-1.0, -1.0),
+                                vec2<f32>( 3.0, -1.0),
+                                vec2<f32>(-1.0,  3.0)
+                            );
+                            return vec4<f32>(p[i], 0.5, 1.0);
+                        }
+                        @fragment fn fs() -> @location(0) vec4<f32> {
+                            return vec4<f32>(1.0, 1.0, 0.0, 1.0);
+                        }
+                        "#
+                        .into(),
+                    ),
+                });
+            self.post_resolved_pipe = Some(ctx.device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("hook post resolved pipe"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.color_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            ));
+        }
+        false
+    }
+
+    fn encode_pass_hook(
+        &mut self,
+        stage: PassHookStage,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &PassHookCtx<'_, ()>,
+    ) {
+        self.stages_seen.push(stage);
+        match stage {
+            PassHookStage::PreScene => {}
+            PassHookStage::PostOpaque => {
+                if let Some((_, _, pipe)) = &self.post_opaque_pipe {
+                    let stencil_ops =
+                        ctx.depth_format
+                            .has_stencil_aspect()
+                            .then_some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            });
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("probe post opaque"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ctx.color_attachment_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: ctx.depth_stencil_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Paint a blue square in the top-left [0..16, 0..16] corner.
+                    pass.set_viewport(0.0, 0.0, 16.0, 16.0, 0.0, 1.0);
+                    pass.set_scissor_rect(0, 0, 16, 16);
+                    pass.set_pipeline(pipe);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+            PassHookStage::PostSceneResolved => {
+                self.post_resolved_saw_depth_sample = ctx.depth_sample_view.is_some();
+                if let (Some(resolved), Some(pipe)) =
+                    (ctx.resolved_color_view, &self.post_resolved_pipe)
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("probe post resolved"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: resolved,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Paint a yellow square in the bottom-right [112..128, 112..128] corner.
+                    pass.set_viewport(112.0, 112.0, 16.0, 16.0, 0.0, 1.0);
+                    pass.set_scissor_rect(112, 112, 16, 16);
+                    pass.set_pipeline(pipe);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+    }
+
+    fn paint(&self, _phase: DrawPhase, _pass: &mut wgpu::RenderPass<'_>, _ctx: &PaintCtx<'_, ()>) {}
+}
+
+#[test]
+fn pass_hooks_and_lazy_stencil_execute_and_toggle_cleanly() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            mode: ViewportMode::OnDemand,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    let mut probe = HookProbeLayer::new();
+
+    // Default state: plain Depth32Float, zero hooks invoked.
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut probe];
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers);
+    }
+    queue.submit([enc.finish()]);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+    assert!(probe.stages_seen.is_empty());
+
+    // Enable lazy stencil + all three pass hooks.
+    probe.want_stencil = true;
+    probe.hooks = PassHookMask::ALL;
+    host.mark_dirty(DirtyFlags::STATIC_SCENE);
+    let mut enc = device.create_command_encoder(&Default::default());
+    let stats = {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut probe];
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers)
+            .stats
+    };
+    queue.submit([enc.finish()]);
+    if host.supports_stencil(&device) {
+        assert_eq!(host.depth_format(), DEPTH_STENCIL_FORMAT);
+        assert_eq!(probe.seen_depth_format, Some(DEPTH_STENCIL_FORMAT));
+        assert!(stats.target_reallocated);
+    }
+    assert_eq!(
+        probe.stages_seen,
+        vec![
+            PassHookStage::PreScene,
+            PassHookStage::PostOpaque,
+            PassHookStage::PostSceneResolved,
+        ]
+    );
+    if device.adapter_info().backend != wgpu::Backend::Gl {
+        assert!(probe.post_resolved_saw_depth_sample);
+    }
+    let img = host.readback_rgba_blocking(&device, &queue).unwrap();
+    assert_eq!(img.pixel(8, 8), Some([0, 0, 255, 255]));
+    assert_eq!(img.pixel(120, 120), Some([255, 255, 0, 255]));
+    assert_eq!(img.pixel(64, 64), Some([0, 0, 0, 255]));
+
+    // Idle OnDemand frame: static scene & hooks remain cached (zero re-runs).
+    probe.stages_seen.clear();
+    let mut enc = device.create_command_encoder(&Default::default());
+    let idle_stats = {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut probe];
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers)
+            .stats
+    };
+    queue.submit([enc.finish()]);
+    assert!(!idle_stats.static_rebuilt);
+    assert!(probe.stages_seen.is_empty());
+
+    // Continuous mode with overlay + post-scene resolved hook routes cleanly and keeps both corners.
+    host.set_mode(ViewportMode::Continuous);
+    probe.draw_overlay = true;
+    probe.stages_seen.clear();
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut probe];
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers);
+    }
+    queue.submit([enc.finish()]);
+    assert_eq!(
+        probe.stages_seen,
+        vec![
+            PassHookStage::PreScene,
+            PassHookStage::PostOpaque,
+            PassHookStage::PostSceneResolved,
+        ]
+    );
+    let cont_img = host.readback_rgba_blocking(&device, &queue).unwrap();
+    assert_eq!(cont_img.pixel(8, 8), Some([0, 0, 255, 255]));
+    assert_eq!(cont_img.pixel(120, 120), Some([255, 255, 0, 255]));
+
+    // Disable stencil and hooks: depth target drops back to plain Depth32Float.
+    probe.want_stencil = false;
+    probe.hooks = PassHookMask::NONE;
+    probe.draw_overlay = false;
+    probe.stages_seen.clear();
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut layers: [&mut dyn ViewportLayer<()>; 1] = [&mut probe];
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers);
+    }
+    queue.submit([enc.finish()]);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+    assert!(probe.stages_seen.is_empty());
 }

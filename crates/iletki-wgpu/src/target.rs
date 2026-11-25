@@ -6,6 +6,9 @@ use iletki_core::{BlockSizing, OutlineConfig, TargetSize, UploadBudget, Viewport
 
 /// Standard depth format used across all `iletki-wgpu` viewports (32-bit Reversed-Z float).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Optional depth-stencil format lazily allocated only when a layer requests stencil support
+/// (for example, GPU stencil section caps).
+pub const DEPTH_STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
 /// Standard GPU picking ID texture format (64-bit packed [`iletki_core::PickId`]).
 pub const PICK_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Compact 1-based 32-bit slot ID attachment format (`Rg16Uint`, guaranteed 4× MSAA in WebGPU core)
@@ -167,11 +170,13 @@ pub(crate) fn validate_depth_attachment(
 pub(crate) struct TargetSet {
     sizing: BlockSizing,
     format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
     msaa_samples: u32,
     depth_sampleable: bool,
     can_copy_output: bool,
     msaa_view: Option<wgpu::TextureView>,
     depth_view: wgpu::TextureView,
+    depth_sample_view: Option<wgpu::TextureView>,
     static_texture: wgpu::Texture,
     static_view: wgpu::TextureView,
     static_identity_bg: wgpu::BindGroup,
@@ -186,9 +191,53 @@ impl std::fmt::Debug for TargetSet {
         f.debug_struct("TargetSet")
             .field("sizing", &self.sizing.current())
             .field("format", &self.format)
+            .field("depth_format", &self.depth_format)
             .field("msaa_samples", &self.msaa_samples)
             .finish()
     }
+}
+
+fn allocate_depth(
+    device: &wgpu::Device,
+    size: wgpu::Extent3d,
+    depth_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> (wgpu::TextureView, Option<wgpu::TextureView>, bool) {
+    let depth_features = depth_format.guaranteed_format_features(device.features());
+    let depth_sampleable = device.adapter_info().backend != wgpu::Backend::Gl
+        && depth_features
+            .allowed_usages
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        && depth_features.flags.sample_count_supported(msaa_samples);
+    let depth_usage = if depth_sampleable {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+    };
+    let label = if depth_format.has_stencil_aspect() {
+        "iletki depth32 stencil8"
+    } else {
+        "iletki depth32"
+    };
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: msaa_samples,
+        dimension: wgpu::TextureDimension::D2,
+        format: depth_format,
+        usage: depth_usage,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_sample_view = depth_format.has_stencil_aspect().then(|| {
+        depth_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iletki depth32 sample view"),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..wgpu::TextureViewDescriptor::default()
+        })
+    });
+    (depth_view, depth_sample_view, depth_sampleable)
 }
 
 impl TargetSet {
@@ -201,7 +250,7 @@ impl TargetSet {
     ) -> Self {
         let sizing =
             BlockSizing::with_max_dimension(initial_px, device.limits().max_texture_dimension_2d);
-        Self::allocate(device, blit, sizing, format, msaa_samples)
+        Self::allocate(device, blit, sizing, format, DEPTH_FORMAT, msaa_samples)
     }
 
     /// Updates active size and reallocates backing textures only when crossing a 256 px block or
@@ -215,7 +264,39 @@ impl TargetSet {
         if !self.sizing.request(requested_px) {
             return false;
         }
-        *self = Self::allocate(device, blit, self.sizing, self.format, self.msaa_samples);
+        *self = Self::allocate(
+            device,
+            blit,
+            self.sizing,
+            self.format,
+            self.depth_format,
+            self.msaa_samples,
+        );
+        true
+    }
+
+    /// Lazily switches the depth attachment format (for example `Depth32Float` ↔
+    /// `Depth32FloatStencil8`), reallocating only the depth texture when the format changes.
+    pub(crate) fn set_depth_format(
+        &mut self,
+        device: &wgpu::Device,
+        depth_format: wgpu::TextureFormat,
+    ) -> bool {
+        if self.depth_format == depth_format {
+            return false;
+        }
+        let [width, height] = self.sizing.current().allocated_px;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let (depth_view, depth_sample_view, depth_sampleable) =
+            allocate_depth(device, size, depth_format, self.msaa_samples);
+        self.depth_format = depth_format;
+        self.depth_view = depth_view;
+        self.depth_sample_view = depth_sample_view;
+        self.depth_sampleable = depth_sampleable;
         true
     }
 
@@ -224,6 +305,7 @@ impl TargetSet {
         blit: &BlitResources,
         sizing: BlockSizing,
         format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) -> Self {
         let [width, height] = sizing.current().allocated_px;
@@ -247,28 +329,8 @@ impl TargetSet {
             tex.create_view(&wgpu::TextureViewDescriptor::default())
         });
 
-        let depth_features = DEPTH_FORMAT.guaranteed_format_features(device.features());
-        let depth_sampleable = device.adapter_info().backend != wgpu::Backend::Gl
-            && depth_features
-                .allowed_usages
-                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
-            && depth_features.flags.sample_count_supported(msaa_samples);
-        let depth_usage = if depth_sampleable {
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
-        } else {
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-        };
-        let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("iletki depth32"),
-            size,
-            mip_level_count: 1,
-            sample_count: msaa_samples,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: depth_usage,
-            view_formats: &[],
-        });
-        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let (depth_view, depth_sample_view, depth_sampleable) =
+            allocate_depth(device, size, depth_format, msaa_samples);
 
         let single_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
@@ -313,11 +375,13 @@ impl TargetSet {
         Self {
             sizing,
             format,
+            depth_format,
             msaa_samples,
             depth_sampleable,
             can_copy_output,
             msaa_view,
             depth_view,
+            depth_sample_view,
             static_texture,
             static_view,
             static_identity_bg,
@@ -336,12 +400,20 @@ impl TargetSet {
         self.format
     }
 
+    pub(crate) fn depth_format(&self) -> wgpu::TextureFormat {
+        self.depth_format
+    }
+
     pub(crate) fn msaa_samples(&self) -> u32 {
         self.msaa_samples
     }
 
     pub(crate) fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
+    }
+
+    pub(crate) fn depth_sample_view(&self) -> &wgpu::TextureView {
+        self.depth_sample_view.as_ref().unwrap_or(&self.depth_view)
     }
 
     pub(crate) const fn depth_sampleable(&self) -> bool {

@@ -3,29 +3,27 @@
 //! 64-bit sub-object GPU picking and simultaneous multi-viewport sharing.
 
 use crate::face_batch::{
-    self, GeometryPage, PageBuilder, PageKind, PaintPipelines, VertexBuffers, VertexLayout,
-    VertexRange,
+    self, GeometryPage, PageBuilder, PageKind, PaintPipelines, VertexBuffers, VertexRange,
 };
 use crate::gpu_cull::{
     self, CullChunkInput, CullViewUniforms, GpuCullPipelines, GpuCullScene, GpuCullView,
 };
+use crate::material::{Material3D, MaterialId, MaterialTable};
 use crate::objects::{
     FaceRanges, PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume,
     ViewObjects, bounds_cover_vertices,
 };
 use crate::outline_bounds::OutlineUpdate;
-use crate::provoking::{self, DedupScratch, FlatSupport};
+use crate::provoking::{self, DedupScratch};
 use crate::section::SectionAa;
+use crate::shading::ScenePipelines;
 use crate::storage_batch::{self, ChunkTransformTable, StorageDraws, StorageViewBinding};
 use crate::vertex::Mesh3D;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, GpuCullCtx, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT,
-    PaintCtx, PrepareCtx, SELECTION_ID_FORMAT, ViewportLayer,
-};
+use iletki_wgpu::{GpuCullCtx, LayerRevision, PaintCtx, PrepareCtx, ViewportLayer};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{
@@ -206,680 +204,7 @@ struct ChunkEntry {
     section_bounds_trusted: bool,
     small_packed: bool,
     has_translucent: bool,
-}
-
-struct Pipelines {
-    format: wgpu::TextureFormat,
-    msaa: u32,
-    vertex_layout: VertexLayout,
-    flat_support: Option<FlatSupport>,
-    object_layout: wgpu::BindGroupLayout,
-    pipeline_layout: wgpu::PipelineLayout,
-    dynamic_uniforms: bool,
-    lit: wgpu::RenderPipeline,
-    lit_unclipped: wgpu::RenderPipeline,
-    lit_flat: Option<wgpu::RenderPipeline>,
-    lit_flat_unclipped: Option<wgpu::RenderPipeline>,
-    packed: Option<PackedPipelines>,
-    storage: Option<PackedPipelines>,
-    select: Option<SelectPipelines>,
-    section: Option<SectionPipelines>,
-    edge: wgpu::RenderPipeline,
-    edge_unclipped: wgpu::RenderPipeline,
-    mask: wgpu::RenderPipeline,
-    multisampled_mask: Option<wgpu::RenderPipeline>,
-    pick: wgpu::RenderPipeline,
-    pick_unclipped: wgpu::RenderPipeline,
-}
-
-struct ColorPipelines {
-    faces: wgpu::RenderPipeline,
-    edges: wgpu::RenderPipeline,
-}
-
-struct SectionSelectPipelines {
-    lit: wgpu::RenderPipeline,
-    lit_flat: Option<wgpu::RenderPipeline>,
-    edge: wgpu::RenderPipeline,
-}
-
-struct RepeatedSelectPipelines {
-    base: ColorPipelines,
-    unclipped: ColorPipelines,
-    flat_base: Option<wgpu::RenderPipeline>,
-    flat_unclipped: Option<wgpu::RenderPipeline>,
-    section: Option<ColorPipelines>,
-    flat_section: Option<wgpu::RenderPipeline>,
-}
-
-struct StorageSelectPipelines {
-    base: ColorPipelines,
-    unclipped: ColorPipelines,
-    flat_base: Option<wgpu::RenderPipeline>,
-    flat_unclipped: Option<wgpu::RenderPipeline>,
-    section: Option<ColorPipelines>,
-    flat_section: Option<wgpu::RenderPipeline>,
-    shader: wgpu::ShaderModule,
-    flat_shader: Option<wgpu::ShaderModule>,
-    section_shader: Option<(SectionAa, wgpu::ShaderModule)>,
-    flat_section_shader: Option<(SectionAa, wgpu::ShaderModule)>,
-    repeated: Option<RepeatedSelectPipelines>,
-}
-
-impl StorageSelectPipelines {
-    fn color<W>(
-        ctx: &PrepareCtx<'_, W>,
-        shader: &wgpu::ShaderModule,
-        layout: &wgpu::PipelineLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-        section: Option<SectionAa>,
-        unclipped: bool,
-    ) -> ColorPipelines {
-        let (face, face_fragment, edge, edge_fragment) = match section {
-            None if unclipped => (
-                "vs_mesh_storage_select",
-                "fs_lit_select_unclipped",
-                "vs_edge_storage_select",
-                "fs_unlit_select",
-            ),
-            None => (
-                "vs_mesh_storage_select",
-                "fs_lit_select",
-                "vs_edge_storage_select",
-                "fs_edge_select",
-            ),
-            Some(SectionAa::Sampled) => (
-                "vs_mesh_storage_select_sampled",
-                "fs_lit_select_sampled",
-                "vs_edge_storage_select_sampled",
-                "fs_edge_select_sampled",
-            ),
-            Some(SectionAa::Raster) => (
-                "vs_mesh_storage_select_raster",
-                "fs_lit_select_raster",
-                "vs_edge_storage_select_raster",
-                "fs_unlit_select_raster",
-            ),
-        };
-        ColorPipelines {
-            faces: color_select_pipeline(ctx, shader, face, face_fragment, layout, buffers, false),
-            edges: color_select_pipeline(ctx, shader, edge, edge_fragment, layout, buffers, true),
-        }
-    }
-
-    fn face_only<W>(
-        ctx: &PrepareCtx<'_, W>,
-        shader: &wgpu::ShaderModule,
-        layout: &wgpu::PipelineLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-        section: Option<SectionAa>,
-        unclipped: bool,
-    ) -> wgpu::RenderPipeline {
-        let (face, face_fragment) = match section {
-            None if unclipped => ("vs_mesh_storage_select", "fs_lit_select_unclipped"),
-            None => ("vs_mesh_storage_select", "fs_lit_select"),
-            Some(SectionAa::Sampled) => ("vs_mesh_storage_select_sampled", "fs_lit_select_sampled"),
-            Some(SectionAa::Raster) => ("vs_mesh_storage_select_raster", "fs_lit_select_raster"),
-        };
-        color_select_pipeline(ctx, shader, face, face_fragment, layout, buffers, false)
-    }
-
-    fn ensure_repeated<W>(
-        &mut self,
-        ctx: &PrepareCtx<'_, W>,
-        vertex_layout: VertexLayout,
-        pipeline_layout: &wgpu::PipelineLayout,
-    ) {
-        if self.repeated.is_some() {
-            return;
-        }
-        let mut buffers = vertex_layout.buffers();
-        buffers.push(Some(wgpu::VertexBufferLayout {
-            array_stride: size_of::<u32>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![3 => Uint32],
-        }));
-        let color = |shader, section, unclipped| {
-            Self::color(ctx, shader, pipeline_layout, &buffers, section, unclipped)
-        };
-        let face_only = |shader, section, unclipped| {
-            Self::face_only(ctx, shader, pipeline_layout, &buffers, section, unclipped)
-        };
-        self.repeated = Some(RepeatedSelectPipelines {
-            base: color(&self.shader, None, false),
-            unclipped: color(&self.shader, None, true),
-            flat_base: self
-                .flat_shader
-                .as_ref()
-                .map(|shader| face_only(shader, None, false)),
-            flat_unclipped: self
-                .flat_shader
-                .as_ref()
-                .map(|shader| face_only(shader, None, true)),
-            section: self
-                .section_shader
-                .as_ref()
-                .map(|(aa, shader)| color(shader, Some(*aa), false)),
-            flat_section: self
-                .flat_section_shader
-                .as_ref()
-                .map(|(aa, shader)| face_only(shader, Some(*aa), false)),
-        });
-    }
-
-    fn select_color(
-        &self,
-        has_clip_planes: bool,
-        antialiased_section: bool,
-    ) -> (&ColorPipelines, Option<&wgpu::RenderPipeline>) {
-        if !has_clip_planes {
-            (&self.unclipped, self.flat_unclipped.as_ref())
-        } else {
-            let color = self
-                .section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .unwrap_or(&self.base);
-            let flat = self
-                .flat_section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .or(self.flat_base.as_ref());
-            (color, flat)
-        }
-    }
-
-    fn select_repeated(
-        &self,
-        has_clip_planes: bool,
-        antialiased_section: bool,
-    ) -> Option<(&ColorPipelines, Option<&wgpu::RenderPipeline>)> {
-        let repeated = self.repeated.as_ref()?;
-        if !has_clip_planes {
-            Some((&repeated.unclipped, repeated.flat_unclipped.as_ref()))
-        } else {
-            let color = repeated
-                .section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .unwrap_or(&repeated.base);
-            let flat = repeated
-                .flat_section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .or(repeated.flat_base.as_ref());
-            Some((color, flat))
-        }
-    }
-}
-
-struct SelectPipelines {
-    lit: wgpu::RenderPipeline,
-    lit_unclipped: wgpu::RenderPipeline,
-    lit_flat: Option<wgpu::RenderPipeline>,
-    lit_flat_unclipped: Option<wgpu::RenderPipeline>,
-    edge: wgpu::RenderPipeline,
-    edge_unclipped: wgpu::RenderPipeline,
-    section: Option<SectionSelectPipelines>,
-    storage: Option<StorageSelectPipelines>,
-}
-
-fn color_select_pipeline<W>(
-    ctx: &PrepareCtx<'_, W>,
-    shader: &wgpu::ShaderModule,
-    vertex: &str,
-    fragment: &str,
-    layout: &wgpu::PipelineLayout,
-    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-    edges: bool,
-) -> wgpu::RenderPipeline {
-    ctx.device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(if edges {
-                "iletki-3d shaded edges (selection MRT)"
-            } else {
-                "iletki-3d lit mesh (selection MRT)"
-            }),
-            layout: Some(layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(vertex),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(fragment),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: ctx.color_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: SELECTION_ID_FORMAT,
-                        blend: None,
-                        write_mask: if edges {
-                            wgpu::ColorWrites::empty()
-                        } else {
-                            wgpu::ColorWrites::ALL
-                        },
-                    }),
-                ],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: if edges {
-                    wgpu::PrimitiveTopology::LineList
-                } else {
-                    wgpu::PrimitiveTopology::TriangleList
-                },
-                cull_mode: None,
-                ..wgpu::PrimitiveState::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(!edges),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: ctx.msaa_samples,
-                ..wgpu::MultisampleState::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        })
-}
-
-fn color_pipeline<W>(
-    ctx: &PrepareCtx<'_, W>,
-    shader: &wgpu::ShaderModule,
-    vertex: &str,
-    fragment: &str,
-    layout: &wgpu::PipelineLayout,
-    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-    edges: bool,
-) -> wgpu::RenderPipeline {
-    ctx.device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(if edges {
-                "iletki-3d shaded edges"
-            } else {
-                "iletki-3d lit mesh"
-            }),
-            layout: Some(layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(vertex),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(fragment),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.color_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: if edges {
-                    wgpu::PrimitiveTopology::LineList
-                } else {
-                    wgpu::PrimitiveTopology::TriangleList
-                },
-                // Keep back faces visible so section clip planes reveal solid interiors.
-                cull_mode: None,
-                ..wgpu::PrimitiveState::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(!edges),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: ctx.msaa_samples,
-                ..wgpu::MultisampleState::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        })
-}
-
-fn mask_pipeline(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    vertex: &str,
-    fragment: &str,
-    count: u32,
-    layout: &wgpu::PipelineLayout,
-    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("iletki-3d outline mask"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some(vertex),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers,
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some(fragment),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: OUTLINE_MASK_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..wgpu::PrimitiveState::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count,
-            ..Default::default()
-        },
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-struct PackedPipelines {
-    layout: wgpu::BindGroupLayout,
-    storage: bool,
-    base: ColorPipelines,
-    unclipped: ColorPipelines,
-    flat_base: Option<wgpu::RenderPipeline>,
-    flat_unclipped: Option<wgpu::RenderPipeline>,
-    section: Option<ColorPipelines>,
-    flat_section: Option<wgpu::RenderPipeline>,
-    pipeline_layout: wgpu::PipelineLayout,
-    shader: wgpu::ShaderModule,
-    flat_shader: Option<wgpu::ShaderModule>,
-    section_shader: Option<(SectionAa, wgpu::ShaderModule)>,
-    flat_section_shader: Option<(SectionAa, wgpu::ShaderModule)>,
-    repeated: Option<RepeatedPipelines>,
-    pick: Option<wgpu::RenderPipeline>,
-    pick_unclipped: Option<wgpu::RenderPipeline>,
-    mask: wgpu::RenderPipeline,
-    multisampled_mask: Option<wgpu::RenderPipeline>,
-    section_mask: Option<wgpu::RenderPipeline>,
-}
-
-struct RepeatedPipelines {
-    base: ColorPipelines,
-    unclipped: ColorPipelines,
-    flat_base: Option<wgpu::RenderPipeline>,
-    flat_unclipped: Option<wgpu::RenderPipeline>,
-    section: Option<ColorPipelines>,
-    flat_section: Option<wgpu::RenderPipeline>,
-    slots: wgpu::Buffer,
-    mask: Option<wgpu::RenderPipeline>,
-    multisampled_mask: Option<wgpu::RenderPipeline>,
-    section_mask: Option<wgpu::RenderPipeline>,
-}
-
-impl PackedPipelines {
-    fn color<W>(
-        ctx: &PrepareCtx<'_, W>,
-        shader: &wgpu::ShaderModule,
-        layout: &wgpu::PipelineLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-        section: Option<SectionAa>,
-        unclipped: bool,
-        storage: bool,
-    ) -> ColorPipelines {
-        let (face, face_fragment, edge, edge_fragment) = match (storage, section) {
-            (false, None) if unclipped => (
-                "vs_mesh_batched",
-                "fs_lit_unclipped",
-                "vs_edge_batched",
-                "fs_unlit",
-            ),
-            (false, None) => ("vs_mesh_batched", "fs_lit", "vs_edge_batched", "fs_edge"),
-            (false, Some(SectionAa::Sampled)) => (
-                "vs_mesh_batched_sampled",
-                "fs_lit_sampled",
-                "vs_edge_batched_sampled",
-                "fs_edge_sampled",
-            ),
-            (false, Some(SectionAa::Raster)) => (
-                "vs_mesh_batched_raster",
-                "fs_lit_raster",
-                "vs_edge_batched_raster",
-                "fs_unlit",
-            ),
-            (true, None) if unclipped => (
-                "vs_mesh_storage",
-                "fs_lit_unclipped",
-                "vs_edge_storage",
-                "fs_unlit",
-            ),
-            (true, None) => ("vs_mesh_storage", "fs_lit", "vs_edge_storage", "fs_edge"),
-            (true, Some(SectionAa::Sampled)) => (
-                "vs_mesh_storage_sampled",
-                "fs_lit_sampled",
-                "vs_edge_storage_sampled",
-                "fs_edge_sampled",
-            ),
-            (true, Some(SectionAa::Raster)) => (
-                "vs_mesh_storage_raster",
-                "fs_lit_raster",
-                "vs_edge_storage_raster",
-                "fs_unlit",
-            ),
-        };
-        ColorPipelines {
-            faces: color_pipeline(ctx, shader, face, face_fragment, layout, buffers, false),
-            edges: color_pipeline(ctx, shader, edge, edge_fragment, layout, buffers, true),
-        }
-    }
-
-    fn face_only<W>(
-        ctx: &PrepareCtx<'_, W>,
-        shader: &wgpu::ShaderModule,
-        layout: &wgpu::PipelineLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-        section: Option<SectionAa>,
-        unclipped: bool,
-        storage: bool,
-    ) -> wgpu::RenderPipeline {
-        let (face, face_fragment) = match (storage, section) {
-            (false, None) if unclipped => ("vs_mesh_batched", "fs_lit_unclipped"),
-            (false, None) => ("vs_mesh_batched", "fs_lit"),
-            (false, Some(SectionAa::Sampled)) => ("vs_mesh_batched_sampled", "fs_lit_sampled"),
-            (false, Some(SectionAa::Raster)) => ("vs_mesh_batched_raster", "fs_lit_raster"),
-            (true, None) if unclipped => ("vs_mesh_storage", "fs_lit_unclipped"),
-            (true, None) => ("vs_mesh_storage", "fs_lit"),
-            (true, Some(SectionAa::Sampled)) => ("vs_mesh_storage_sampled", "fs_lit_sampled"),
-            (true, Some(SectionAa::Raster)) => ("vs_mesh_storage_raster", "fs_lit_raster"),
-        };
-        color_pipeline(ctx, shader, face, face_fragment, layout, buffers, false)
-    }
-
-    fn ensure_repeated<W>(&mut self, ctx: &PrepareCtx<'_, W>, vertex_layout: VertexLayout) {
-        if self.repeated.is_some() {
-            return;
-        }
-        let mut buffers = vertex_layout.buffers();
-        buffers.push(Some(wgpu::VertexBufferLayout {
-            array_stride: size_of::<u32>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![3 => Uint32],
-        }));
-        let storage = self.storage;
-        let color = |shader, section, unclipped| {
-            Self::color(
-                ctx,
-                shader,
-                &self.pipeline_layout,
-                &buffers,
-                section,
-                unclipped,
-                storage,
-            )
-        };
-        let face_only = |shader, section, unclipped| {
-            Self::face_only(
-                ctx,
-                shader,
-                &self.pipeline_layout,
-                &buffers,
-                section,
-                unclipped,
-                storage,
-            )
-        };
-        let slots = (0..face_batch::OBJECTS as u32).collect::<Vec<_>>();
-        let (mask, multisampled_mask, section_mask) = if storage {
-            let mask_buffers = [
-                Some(vertex_layout.position()),
-                Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<u32>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![3 => Uint32],
-                }),
-            ];
-            let m1 = mask_pipeline(
-                ctx.device,
-                &self.shader,
-                "vs_mask_storage",
-                "fs_mask",
-                1,
-                &self.pipeline_layout,
-                &mask_buffers,
-            );
-            let m4 = (ctx.msaa_samples == 4).then(|| {
-                mask_pipeline(
-                    ctx.device,
-                    &self.shader,
-                    "vs_mask_storage",
-                    "fs_mask",
-                    4,
-                    &self.pipeline_layout,
-                    &mask_buffers,
-                )
-            });
-            let ms = self.section_shader.as_ref().map(|(aa, shader)| {
-                let (vertex, fragment) = match aa {
-                    SectionAa::Sampled => ("vs_mask_storage_sampled", "fs_mask_sampled_pos"),
-                    SectionAa::Raster => ("vs_mask_storage_raster", "fs_mask_unclipped"),
-                };
-                mask_pipeline(
-                    ctx.device,
-                    shader,
-                    vertex,
-                    fragment,
-                    4,
-                    &self.pipeline_layout,
-                    &mask_buffers,
-                )
-            });
-            (Some(m1), m4, ms)
-        } else {
-            (None, None, None)
-        };
-        self.repeated = Some(RepeatedPipelines {
-            base: color(&self.shader, None, false),
-            unclipped: color(&self.shader, None, true),
-            flat_base: self
-                .flat_shader
-                .as_ref()
-                .map(|shader| face_only(shader, None, false)),
-            flat_unclipped: self
-                .flat_shader
-                .as_ref()
-                .map(|shader| face_only(shader, None, true)),
-            section: self
-                .section_shader
-                .as_ref()
-                .map(|(aa, shader)| color(shader, Some(*aa), false)),
-            flat_section: self
-                .flat_section_shader
-                .as_ref()
-                .map(|(aa, shader)| face_only(shader, Some(*aa), false)),
-            slots: ctx
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("iletki-3d repeated geometry slots"),
-                    contents: bytemuck::cast_slice(&slots),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-            mask,
-            multisampled_mask,
-            section_mask,
-        });
-    }
-    fn select_color(
-        &self,
-        has_clip_planes: bool,
-        antialiased_section: bool,
-    ) -> (&ColorPipelines, Option<&wgpu::RenderPipeline>) {
-        if !has_clip_planes {
-            (&self.unclipped, self.flat_unclipped.as_ref())
-        } else {
-            let color = self
-                .section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .unwrap_or(&self.base);
-            let flat = self
-                .flat_section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .or(self.flat_base.as_ref());
-            (color, flat)
-        }
-    }
-
-    fn select_repeated(
-        &self,
-        has_clip_planes: bool,
-        antialiased_section: bool,
-    ) -> Option<(
-        &ColorPipelines,
-        Option<&wgpu::RenderPipeline>,
-        &wgpu::Buffer,
-    )> {
-        let repeated = self.repeated.as_ref()?;
-        if !has_clip_planes {
-            Some((
-                &repeated.unclipped,
-                repeated.flat_unclipped.as_ref(),
-                &repeated.slots,
-            ))
-        } else {
-            let color = repeated
-                .section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .unwrap_or(&repeated.base);
-            let flat = repeated
-                .flat_section
-                .as_ref()
-                .filter(|_| antialiased_section)
-                .or(repeated.flat_base.as_ref());
-            Some((color, flat, &repeated.slots))
-        }
-    }
-}
-
-struct SectionPipelines {
-    lit: wgpu::RenderPipeline,
-    lit_flat: Option<wgpu::RenderPipeline>,
-    edge: wgpu::RenderPipeline,
-    multisampled_mask: wgpu::RenderPipeline,
+    material_id: MaterialId,
 }
 
 struct SceneEnvelope {
@@ -900,7 +225,8 @@ pub struct Scene3DLayer {
     layer_id: u16,
     revision: LayerRevision,
     geometry_revision: u64,
-    pipelines: Option<Pipelines>,
+    pipelines: Option<ScenePipelines>,
+    materials: MaterialTable,
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
     /// Compact per-slot generation (`0` = vacant) for cache-hot `chunk_id_at_slot` / `set_selected`.
@@ -982,6 +308,7 @@ impl Scene3DLayer {
             revision: LayerRevision::new(),
             geometry_revision: 1,
             pipelines: None,
+            materials: MaterialTable::new(),
             use_antialiased_section: false,
             chunks: Vec::new(),
             chunk_generations: Vec::new(),
@@ -1160,6 +487,7 @@ impl Scene3DLayer {
             section_bounds_trusted: false,
             small_packed: false,
             has_translucent: false,
+            material_id: MaterialId::DEFAULT,
         };
         // Reuse the lowest vacant slot to preserve draw order, including equal-depth picks.
         let index = if let Some(Reverse(index)) = self.free_chunks.pop()
@@ -1173,7 +501,7 @@ impl Scene3DLayer {
             index
         };
         self.transform_table
-            .mark_chunk(index, origin, true, has_picks);
+            .mark_chunk(index, origin, true, has_picks, MaterialId::DEFAULT);
         if index >= self.chunk_generations.len() {
             self.chunk_generations.resize(index.saturating_add(1), 0);
             self.chunk_select_meta
@@ -1217,6 +545,7 @@ impl Scene3DLayer {
         {
             let visible = entry.visible;
             let has_picks = entry.has_picks;
+            let material_id = entry.material_id;
             let local_bounds = entry.local_bounds;
             let trusted = entry.section_bounds_trusted;
             entry.origin = origin;
@@ -1224,7 +553,7 @@ impl Scene3DLayer {
                 self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
             }
             self.transform_table
-                .mark_chunk(id.index, origin, visible, has_picks);
+                .mark_chunk(id.index, origin, visible, has_picks, material_id);
             if let Some(meta) = self.chunk_select_meta.get_mut(id.index) {
                 match pack_select_bounds(origin, local_bounds, self.transform_table.anchor()) {
                     Some(bounds) => {
@@ -1260,6 +589,7 @@ impl Scene3DLayer {
             let changed = entry.visible != visible;
             let origin = entry.origin;
             let has_picks = entry.has_picks;
+            let material_id = entry.material_id;
             let is_direct = entry
                 .vertex_buf
                 .as_ref()
@@ -1284,7 +614,7 @@ impl Scene3DLayer {
                     self.selected_bounds_revision = self.selected_bounds_revision.wrapping_add(1);
                 }
                 self.transform_table
-                    .mark_chunk(id.index, origin, visible, has_picks);
+                    .mark_chunk(id.index, origin, visible, has_picks, material_id);
                 if is_direct {
                     self.geometry_revision = self.geometry_revision.wrapping_add(1);
                 }
@@ -1394,6 +724,116 @@ impl Scene3DLayer {
             .filter(|entry| entry.generation == id.generation)
     }
 
+    /// Inserts a persistent [`Material3D`] into the scene's GPU material table and returns its
+    /// [`MaterialId`].
+    ///
+    /// Material parameters live in a persistent GPU storage buffer (with a uniform mirror on
+    /// direct/OpenGL paths) and are referenced by chunks via [`Self::set_chunk_material`] with
+    /// zero extra vertex bytes.
+    pub fn insert_material(&mut self, material: Material3D) -> MaterialId {
+        let id = self.materials.insert(material);
+        self.revision.mark_static();
+        id
+    }
+
+    /// Updates an existing non-default material in place without rebuilding scene geometry.
+    ///
+    /// Returns `false` if `id` is [`MaterialId::DEFAULT`] or no longer exists.
+    pub fn update_material(&mut self, id: MaterialId, material: Material3D) -> bool {
+        let Some(translucency_changed) = self.materials.update(id, material) else {
+            return false;
+        };
+        if translucency_changed {
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        }
+        self.revision.mark_static();
+        true
+    }
+
+    /// Returns the [`Material3D`] descriptor stored at `id`, if valid.
+    #[must_use]
+    pub fn material(&self, id: MaterialId) -> Option<Material3D> {
+        self.materials.get(id)
+    }
+
+    /// Removes a non-default material and resets any chunks referencing it back to
+    /// [`MaterialId::DEFAULT`].
+    pub fn remove_material(&mut self, id: MaterialId) -> bool {
+        let Some(was_translucent) = self.materials.remove(id) else {
+            return false;
+        };
+        let mut any_reset = false;
+        for (index, entry) in self.chunks.iter_mut().enumerate() {
+            if let Some(chunk) = entry.as_mut()
+                && chunk.material_id == id
+            {
+                chunk.material_id = MaterialId::DEFAULT;
+                self.transform_table.mark_chunk(
+                    index,
+                    chunk.origin,
+                    chunk.visible,
+                    chunk.has_picks,
+                    MaterialId::DEFAULT,
+                );
+                any_reset = true;
+            }
+        }
+        if any_reset && was_translucent {
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        }
+        self.revision.mark_static();
+        true
+    }
+
+    /// Assigns a [`MaterialId`] from this scene to chunk `id` in O(1) without touching vertex
+    /// buffers. Invalid chunk or material handles are ignored.
+    pub fn set_chunk_material(&mut self, id: Chunk3DId, material: MaterialId) {
+        if !self.materials.contains(material) {
+            return;
+        }
+        let next_translucent = self.materials.is_translucent(material);
+        let prev_translucent = self
+            .chunks
+            .get(id.index)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.generation == id.generation)
+            .map(|entry| {
+                (
+                    entry.material_id,
+                    entry.has_translucent || self.materials.is_translucent(entry.material_id),
+                    entry.has_translucent || next_translucent,
+                )
+            });
+        let Some((prev_mat, was_translucent, now_translucent)) = prev_translucent else {
+            return;
+        };
+        if prev_mat == material {
+            return;
+        }
+        if let Some(entry) = self.chunk_mut(id) {
+            entry.material_id = material;
+            let origin = entry.origin;
+            let visible = entry.visible;
+            let has_picks = entry.has_picks;
+            self.transform_table
+                .mark_chunk(id.index, origin, visible, has_picks, material);
+            if was_translucent != now_translucent {
+                self.geometry_revision = self.geometry_revision.wrapping_add(1);
+            }
+            self.revision.mark_static();
+        }
+    }
+
+    /// Returns the [`MaterialId`] assigned to chunk `id`, if `id` is live.
+    #[must_use]
+    pub fn chunk_material(&self, id: Chunk3DId) -> Option<MaterialId> {
+        self.chunks
+            .get(id.index)?
+            .as_ref()
+            .filter(|entry| entry.generation == id.generation)
+            .map(|entry| entry.material_id)
+    }
+
     /// Releases per-viewport binding sets for closed viewports and returns the number released.
     ///
     /// The layer also prunes closed bindings before preparing a viewport.
@@ -1408,967 +848,21 @@ impl Scene3DLayer {
         let want_storage = storage_batch::supports(ctx.device);
         #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
         let want_storage = want_storage && self.profile_storage_transforms;
-        if self.pipelines.as_ref().is_some_and(|p| {
-            p.format == ctx.color_format
-                && p.msaa == ctx.msaa_samples
-                && (section_aa.is_none() || p.section.is_some())
-                && p.storage.is_some() == want_storage
-        }) {
-            return;
-        }
-        let flat_support = provoking::detect_flat_support(ctx.device, ctx.queue);
-        let use_either = flat_support.is_some_and(|s| s.use_either)
-            || ctx.device.adapter_info().backend == wgpu::Backend::Gl;
-        let wgsl = provoking::adapt_flat_sampling(
-            &format!("{CAMERA_WGSL}\n{}", include_str!("shaders/mesh3d.wgsl")),
-            use_either,
-        );
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("iletki-3d mesh shader"),
-                source: wgpu::ShaderSource::Wgsl(wgsl.as_str().into()),
-            });
-        let flat_wgsl = flat_support
+        if self
+            .pipelines
             .as_ref()
-            .map(|_| provoking::make_flat_color_wgsl(&wgsl, use_either));
-        let flat_shader = flat_wgsl.as_ref().map(|source| {
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("iletki-3d flat mesh shader"),
-                    source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
-                })
-        });
-        let dynamic_uniforms = ctx
-            .device
-            .limits()
-            .max_dynamic_uniform_buffers_per_pipeline_layout
-            > 0;
-        let object_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("iletki-3d object layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: dynamic_uniforms,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
-                            ObjectUniforms,
-                        >()
-                            as u64),
-                    },
-                    count: None,
-                }],
-            });
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("iletki-3d mesh pipeline layout"),
-                bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&object_layout)],
-                immediate_size: 0,
-            });
-        let vertex_layout = VertexLayout::for_device(ctx.device);
-        let pick_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<[u32; 2]>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![3 => Uint32x2],
-        };
-
-        let make_color = |shader: &wgpu::ShaderModule,
-                          vertex,
-                          fragment,
-                          layout: &wgpu::PipelineLayout,
-                          buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-                          edges| {
-            color_pipeline(ctx, shader, vertex, fragment, layout, buffers, edges)
-        };
-        let face_layout = vertex_layout.buffers();
-        let lit = make_color(
-            &shader,
-            "vs_mesh",
-            "fs_lit",
-            &pipeline_layout,
-            &face_layout,
-            false,
-        );
-        let lit_unclipped = make_color(
-            &shader,
-            "vs_mesh",
-            "fs_lit_unclipped",
-            &pipeline_layout,
-            &face_layout,
-            false,
-        );
-        let lit_flat = flat_shader.as_ref().map(|shader| {
-            make_color(
-                shader,
-                "vs_mesh",
-                "fs_lit",
-                &pipeline_layout,
-                &face_layout,
-                false,
-            )
-        });
-        let lit_flat_unclipped = flat_shader.as_ref().map(|shader| {
-            make_color(
-                shader,
-                "vs_mesh",
-                "fs_lit_unclipped",
-                &pipeline_layout,
-                &face_layout,
-                false,
-            )
-        });
-        let edge = make_color(
-            &shader,
-            "vs_edge",
-            "fs_edge",
-            &pipeline_layout,
-            &face_layout,
-            true,
-        );
-        let edge_unclipped = make_color(
-            &shader,
-            "vs_edge",
-            "fs_unlit",
-            &pipeline_layout,
-            &face_layout,
-            true,
-        );
-        let make_pick = |shader: &wgpu::ShaderModule,
-                         vertex,
-                         fragment,
-                         layout: &wgpu::PipelineLayout,
-                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("iletki-3d pick mesh"),
-                    layout: Some(layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some(vertex),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some(fragment),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: PICK_ID_FORMAT,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-        };
-        let pick_buffers = [Some(vertex_layout.position()), Some(pick_layout)];
-        let pick = make_pick(
-            &shader,
-            "vs_mesh_pick",
-            "fs_pick",
-            &pipeline_layout,
-            &pick_buffers,
-        );
-        let pick_unclipped = make_pick(
-            &shader,
-            "vs_mesh_pick",
-            "fs_pick_unclipped",
-            &pipeline_layout,
-            &pick_buffers,
-        );
-        let make_mask = |shader: &wgpu::ShaderModule,
-                         vertex,
-                         fragment,
-                         count,
-                         layout: &wgpu::PipelineLayout,
-                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("iletki-3d outline mask"),
-                    layout: Some(layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some(vertex),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some(fragment),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: OUTLINE_MASK_FORMAT,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count,
-                        ..Default::default()
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-        };
-        let build_packed = |is_storage: bool| -> PackedPipelines {
-            let layout = if is_storage {
-                storage_batch::bind_layout(ctx.device)
-            } else {
-                face_batch::bind_layout(ctx.device)
-            };
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some(if is_storage {
-                            "iletki-3d storage geometry layout"
-                        } else {
-                            "iletki-3d packed geometry layout"
-                        }),
-                        bind_group_layouts: &[Some(ctx.camera_bind_group_layout), Some(&layout)],
-                        immediate_size: 0,
-                    });
-            let extra_wgsl = if is_storage {
-                include_str!("shaders/mesh3d_storage.wgsl")
-            } else {
-                include_str!("shaders/mesh3d_batched.wgsl")
-            };
-            let source = format!("{wgsl}\n{extra_wgsl}");
-            let shader = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(if is_storage {
-                        "iletki-3d storage geometry shader"
-                    } else {
-                        "iletki-3d packed geometry shader"
-                    }),
-                    source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
-                });
-            let packed_flat_source = flat_wgsl.as_ref().map(|fw| format!("{fw}\n{extra_wgsl}"));
-            let packed_flat_shader = packed_flat_source.as_ref().map(|src| {
-                ctx.device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(if is_storage {
-                            "iletki-3d storage flat geometry shader"
-                        } else {
-                            "iletki-3d packed flat geometry shader"
-                        }),
-                        source: wgpu::ShaderSource::Wgsl(src.as_str().into()),
-                    })
-            });
-            let slot_layout = wgpu::VertexBufferLayout {
-                array_stride: size_of::<u32>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![3 => Uint32],
-            };
-            let mut buffers = face_layout.clone();
-            buffers.push(Some(slot_layout.clone()));
-            let base = PackedPipelines::color(
-                ctx,
-                &shader,
-                &pipeline_layout,
-                &buffers,
-                None,
-                false,
-                is_storage,
-            );
-            let unclipped = PackedPipelines::color(
-                ctx,
-                &shader,
-                &pipeline_layout,
-                &buffers,
-                None,
-                true,
-                is_storage,
-            );
-            let flat_base = packed_flat_shader.as_ref().map(|sh| {
-                PackedPipelines::face_only(
-                    ctx,
-                    sh,
-                    &pipeline_layout,
-                    &buffers,
-                    None,
-                    false,
-                    is_storage,
-                )
-            });
-            let flat_unclipped = packed_flat_shader.as_ref().map(|sh| {
-                PackedPipelines::face_only(
-                    ctx,
-                    sh,
-                    &pipeline_layout,
-                    &buffers,
-                    None,
-                    true,
-                    is_storage,
-                )
-            });
-            let mask_vs = if is_storage {
-                "vs_mask_storage"
-            } else {
-                "vs_mask_batched"
-            };
-            let mask_buffers = if is_storage {
-                vec![Some(vertex_layout.position()), Some(slot_layout.clone())]
-            } else {
-                buffers.clone()
-            };
-            let mask = make_mask(
-                &shader,
-                mask_vs,
-                "fs_mask",
-                1,
-                &pipeline_layout,
-                &mask_buffers,
-            );
-            let multisampled_mask = (ctx.msaa_samples == 4).then(|| {
-                make_mask(
-                    &shader,
-                    mask_vs,
-                    "fs_mask",
-                    4,
-                    &pipeline_layout,
-                    &mask_buffers,
-                )
-            });
-            let sampled_extra = if is_storage {
-                concat!(
-                    include_str!("shaders/mesh3d_sampled.wgsl"),
-                    "\n",
-                    include_str!("shaders/mesh3d_storage_sampled.wgsl")
-                )
-            } else {
-                concat!(
-                    include_str!("shaders/mesh3d_sampled.wgsl"),
-                    "\n",
-                    include_str!("shaders/mesh3d_batched_sampled.wgsl")
-                )
-            };
-            let raster_extra = if is_storage {
-                concat!(
-                    include_str!("shaders/mesh3d_raster.wgsl"),
-                    "\n",
-                    include_str!("shaders/mesh3d_storage_raster.wgsl")
-                )
-            } else {
-                concat!(
-                    include_str!("shaders/mesh3d_raster.wgsl"),
-                    "\n",
-                    include_str!("shaders/mesh3d_batched_raster.wgsl")
-                )
-            };
-            let section_shader = section_aa.map(|aa| {
-                (
-                    aa,
-                    aa.shader(ctx.device, &source, sampled_extra, raster_extra),
-                )
-            });
-            let flat_section_shader = section_aa.and_then(|aa| {
-                let base_src = packed_flat_source.as_ref()?;
-                let raw = aa.shader_source(base_src, sampled_extra, raster_extra);
-                let flat_src = provoking::make_flat_color_wgsl(&raw, use_either);
-                let module = ctx
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(if is_storage {
-                            "iletki-3d storage flat section shader"
-                        } else {
-                            "iletki-3d packed flat section shader"
-                        }),
-                        source: wgpu::ShaderSource::Wgsl(flat_src.into()),
-                    });
-                Some((aa, module))
-            });
-            let section = section_shader.as_ref().map(|(aa, shader)| {
-                PackedPipelines::color(
-                    ctx,
-                    shader,
-                    &pipeline_layout,
-                    &buffers,
-                    Some(*aa),
-                    false,
-                    is_storage,
-                )
-            });
-            let flat_section = flat_section_shader.as_ref().map(|(aa, shader)| {
-                PackedPipelines::face_only(
-                    ctx,
-                    shader,
-                    &pipeline_layout,
-                    &buffers,
-                    Some(*aa),
-                    false,
-                    is_storage,
-                )
-            });
-            let section_mask = section_shader.as_ref().map(|(aa, shader)| {
-                let (vertex, fragment) = match (is_storage, aa) {
-                    (false, SectionAa::Sampled) => ("vs_mesh_batched_sampled", "fs_mask_sampled"),
-                    (false, SectionAa::Raster) => ("vs_mesh_batched_raster", "fs_mask_unclipped"),
-                    (true, SectionAa::Sampled) => {
-                        ("vs_mask_storage_sampled", "fs_mask_sampled_pos")
-                    }
-                    (true, SectionAa::Raster) => ("vs_mask_storage_raster", "fs_mask_unclipped"),
-                };
-                make_mask(shader, vertex, fragment, 4, &pipeline_layout, &mask_buffers)
-            });
-            let limits = ctx.device.limits();
-            let pick_vs = if is_storage {
-                "vs_pick_storage"
-            } else {
-                "vs_pick_batched"
-            };
-            let (pick, pick_unclipped) =
-                if limits.max_vertex_buffers >= 3 && limits.max_vertex_attributes >= 5 {
-                    let id_layout = wgpu::VertexBufferLayout {
-                        array_stride: size_of::<[u32; 2]>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![4 => Uint32x2],
-                    };
-                    let pick_buffers = [
-                        Some(vertex_layout.position()),
-                        Some(slot_layout),
-                        Some(id_layout),
-                    ];
-                    (
-                        Some(make_pick(
-                            &shader,
-                            pick_vs,
-                            "fs_pick",
-                            &pipeline_layout,
-                            &pick_buffers,
-                        )),
-                        Some(make_pick(
-                            &shader,
-                            pick_vs,
-                            "fs_pick_unclipped",
-                            &pipeline_layout,
-                            &pick_buffers,
-                        )),
-                    )
-                } else {
-                    (None, None)
-                };
-            PackedPipelines {
-                pick,
-                pick_unclipped,
-                layout,
-                storage: is_storage,
-                base,
-                unclipped,
-                flat_base,
-                flat_unclipped,
-                section,
-                flat_section,
-                pipeline_layout,
-                shader,
-                flat_shader: packed_flat_shader,
-                section_shader,
-                flat_section_shader,
-                repeated: None,
-                mask,
-                multisampled_mask,
-                section_mask,
-            }
-        };
-        let storage = want_storage.then(|| build_packed(true));
-        let packed =
-            (!want_storage && PageBuilder::supports(ctx.device)).then(|| build_packed(false));
-
-        let mask = make_mask(
-            &shader,
-            "vs_mask",
-            "fs_mask",
-            1,
-            &pipeline_layout,
-            &face_layout,
-        );
-        let multisampled_mask = (ctx.msaa_samples == 4).then(|| {
-            make_mask(
-                &shader,
-                "vs_mask",
-                "fs_mask",
-                4,
-                &pipeline_layout,
-                &face_layout,
-            )
-        });
-
-        let section = section_aa.map(|aa| {
-            let shader = aa.shader(
-                ctx.device,
-                &wgsl,
-                include_str!("shaders/mesh3d_sampled.wgsl"),
-                include_str!("shaders/mesh3d_raster.wgsl"),
-            );
-            let flat_sec_shader = flat_wgsl.as_ref().map(|fw| {
-                let raw = aa.shader_source(
-                    fw,
-                    include_str!("shaders/mesh3d_sampled.wgsl"),
-                    include_str!("shaders/mesh3d_raster.wgsl"),
-                );
-                let flat_src = provoking::make_flat_color_wgsl(&raw, use_either);
-                ctx.device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("iletki-3d flat section shader"),
-                        source: wgpu::ShaderSource::Wgsl(flat_src.into()),
-                    })
-            });
-            match aa {
-                SectionAa::Sampled => SectionPipelines {
-                    lit: make_color(
-                        &shader,
-                        "vs_mesh_sampled",
-                        "fs_lit_sampled",
-                        &pipeline_layout,
-                        &face_layout,
-                        false,
-                    ),
-                    lit_flat: flat_sec_shader.as_ref().map(|sh| {
-                        make_color(
-                            sh,
-                            "vs_mesh_sampled",
-                            "fs_lit_sampled",
-                            &pipeline_layout,
-                            &face_layout,
-                            false,
-                        )
-                    }),
-                    edge: make_color(
-                        &shader,
-                        "vs_edge_sampled",
-                        "fs_edge_sampled",
-                        &pipeline_layout,
-                        &face_layout,
-                        true,
-                    ),
-                    multisampled_mask: make_mask(
-                        &shader,
-                        "vs_mesh_sampled",
-                        "fs_mask_sampled",
-                        4,
-                        &pipeline_layout,
-                        &face_layout,
-                    ),
-                },
-                SectionAa::Raster => SectionPipelines {
-                    lit: make_color(
-                        &shader,
-                        "vs_mesh_raster",
-                        "fs_lit_raster",
-                        &pipeline_layout,
-                        &face_layout,
-                        false,
-                    ),
-                    lit_flat: flat_sec_shader.as_ref().map(|sh| {
-                        make_color(
-                            sh,
-                            "vs_mesh_raster",
-                            "fs_lit_raster",
-                            &pipeline_layout,
-                            &face_layout,
-                            false,
-                        )
-                    }),
-                    edge: make_color(
-                        &shader,
-                        "vs_edge_raster",
-                        "fs_unlit",
-                        &pipeline_layout,
-                        &face_layout,
-                        true,
-                    ),
-                    multisampled_mask: make_mask(
-                        &shader,
-                        "vs_mesh_raster",
-                        "fs_mask_unclipped",
-                        4,
-                        &pipeline_layout,
-                        &face_layout,
-                    ),
-                },
-            }
-        });
-
-        self.views.clear();
-        self.pipelines = Some(Pipelines {
-            format: ctx.color_format,
-            msaa: ctx.msaa_samples,
-            vertex_layout,
-            flat_support,
-            object_layout,
-            pipeline_layout,
-            dynamic_uniforms,
-            lit,
-            lit_unclipped,
-            lit_flat,
-            lit_flat_unclipped,
-            packed,
-            storage,
-            select: None,
-            section,
-            edge,
-            edge_unclipped,
-            mask,
-            multisampled_mask,
-            pick,
-            pick_unclipped,
-        });
-    }
-
-    fn ensure_select_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        let section_aa = SectionAa::for_viewport(ctx);
-        let Some(p) = &mut self.pipelines else {
-            return;
-        };
-        if p.select
-            .as_ref()
-            .is_some_and(|sel| section_aa.is_none() || sel.section.is_some())
+            .is_some_and(|p| p.matches(ctx, section_aa, want_storage))
         {
             return;
         }
-        let use_either = p.flat_support.is_some_and(|s| s.use_either)
-            || ctx.device.adapter_info().backend == wgpu::Backend::Gl;
-        let base_wgsl = provoking::adapt_flat_sampling(
-            &format!(
-                "{CAMERA_WGSL}\n{}\n{}",
-                include_str!("shaders/mesh3d.wgsl"),
-                include_str!("shaders/mesh3d_select.wgsl")
-            ),
-            use_either,
-        );
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("iletki-3d selection MRT shader"),
-                source: wgpu::ShaderSource::Wgsl(base_wgsl.as_str().into()),
-            });
-        let flat_wgsl = p
-            .flat_support
-            .as_ref()
-            .map(|_| provoking::make_flat_color_wgsl(&base_wgsl, use_either));
-        let flat_shader = flat_wgsl.as_ref().map(|source| {
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("iletki-3d flat selection MRT shader"),
-                    source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
-                })
-        });
-        let face_layout = p.vertex_layout.buffers();
-        let lit = color_select_pipeline(
-            ctx,
-            &shader,
-            "vs_mesh_select",
-            "fs_lit_select",
-            &p.pipeline_layout,
-            &face_layout,
-            false,
-        );
-        let lit_unclipped = color_select_pipeline(
-            ctx,
-            &shader,
-            "vs_mesh_select",
-            "fs_lit_select_unclipped",
-            &p.pipeline_layout,
-            &face_layout,
-            false,
-        );
-        let lit_flat = flat_shader.as_ref().map(|sh| {
-            color_select_pipeline(
-                ctx,
-                sh,
-                "vs_mesh_select",
-                "fs_lit_select",
-                &p.pipeline_layout,
-                &face_layout,
-                false,
-            )
-        });
-        let lit_flat_unclipped = flat_shader.as_ref().map(|sh| {
-            color_select_pipeline(
-                ctx,
-                sh,
-                "vs_mesh_select",
-                "fs_lit_select_unclipped",
-                &p.pipeline_layout,
-                &face_layout,
-                false,
-            )
-        });
-        let edge = color_select_pipeline(
-            ctx,
-            &shader,
-            "vs_edge_select",
-            "fs_edge_select",
-            &p.pipeline_layout,
-            &face_layout,
-            true,
-        );
-        let edge_unclipped = color_select_pipeline(
-            ctx,
-            &shader,
-            "vs_edge_select",
-            "fs_unlit_select",
-            &p.pipeline_layout,
-            &face_layout,
-            true,
-        );
+        self.views.clear();
+        self.pipelines = Some(ScenePipelines::build(ctx, want_storage));
+    }
 
-        let sampled_direct = concat!(
-            include_str!("shaders/mesh3d_sampled.wgsl"),
-            "\n",
-            include_str!("shaders/mesh3d_select_sampled.wgsl")
-        );
-        let raster_direct = concat!(
-            include_str!("shaders/mesh3d_raster.wgsl"),
-            "\n",
-            include_str!("shaders/mesh3d_select_raster.wgsl")
-        );
-        let section = section_aa.map(|aa| {
-            let sec_shader = aa.shader(ctx.device, &base_wgsl, sampled_direct, raster_direct);
-            let flat_sec_shader = flat_wgsl.as_ref().map(|fw| {
-                let raw = aa.shader_source(fw, sampled_direct, raster_direct);
-                let flat_src = provoking::make_flat_color_wgsl(&raw, use_either);
-                ctx.device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("iletki-3d flat section selection MRT shader"),
-                        source: wgpu::ShaderSource::Wgsl(flat_src.into()),
-                    })
-            });
-            match aa {
-                SectionAa::Sampled => SectionSelectPipelines {
-                    lit: color_select_pipeline(
-                        ctx,
-                        &sec_shader,
-                        "vs_mesh_select_sampled",
-                        "fs_lit_select_sampled",
-                        &p.pipeline_layout,
-                        &face_layout,
-                        false,
-                    ),
-                    lit_flat: flat_sec_shader.as_ref().map(|sh| {
-                        color_select_pipeline(
-                            ctx,
-                            sh,
-                            "vs_mesh_select_sampled",
-                            "fs_lit_select_sampled",
-                            &p.pipeline_layout,
-                            &face_layout,
-                            false,
-                        )
-                    }),
-                    edge: color_select_pipeline(
-                        ctx,
-                        &sec_shader,
-                        "vs_edge_select_sampled",
-                        "fs_edge_select_sampled",
-                        &p.pipeline_layout,
-                        &face_layout,
-                        true,
-                    ),
-                },
-                SectionAa::Raster => SectionSelectPipelines {
-                    lit: color_select_pipeline(
-                        ctx,
-                        &sec_shader,
-                        "vs_mesh_select_raster",
-                        "fs_lit_select_raster",
-                        &p.pipeline_layout,
-                        &face_layout,
-                        false,
-                    ),
-                    lit_flat: flat_sec_shader.as_ref().map(|sh| {
-                        color_select_pipeline(
-                            ctx,
-                            sh,
-                            "vs_mesh_select_raster",
-                            "fs_lit_select_raster",
-                            &p.pipeline_layout,
-                            &face_layout,
-                            false,
-                        )
-                    }),
-                    edge: color_select_pipeline(
-                        ctx,
-                        &sec_shader,
-                        "vs_edge_select_raster",
-                        "fs_unlit_select_raster",
-                        &p.pipeline_layout,
-                        &face_layout,
-                        true,
-                    ),
-                },
-            }
-        });
-
-        let storage = p.storage.as_ref().map(|storage_pl| {
-            let storage_src = format!(
-                "{base_wgsl}\n{}\n{}",
-                include_str!("shaders/mesh3d_storage.wgsl"),
-                include_str!("shaders/mesh3d_storage_select.wgsl")
-            );
-            let shader = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("iletki-3d storage selection MRT shader"),
-                    source: wgpu::ShaderSource::Wgsl(storage_src.as_str().into()),
-                });
-            let flat_storage_src = flat_wgsl.as_ref().map(|fw| {
-                format!(
-                    "{fw}\n{}\n{}",
-                    include_str!("shaders/mesh3d_storage.wgsl"),
-                    include_str!("shaders/mesh3d_storage_select.wgsl")
-                )
-            });
-            let flat_shader = flat_storage_src.as_ref().map(|src| {
-                ctx.device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("iletki-3d storage flat selection MRT shader"),
-                        source: wgpu::ShaderSource::Wgsl(src.as_str().into()),
-                    })
-            });
-            let mut buffers = face_layout.clone();
-            buffers.push(Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<u32>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![3 => Uint32],
-            }));
-            let base = StorageSelectPipelines::color(
-                ctx,
-                &shader,
-                &storage_pl.pipeline_layout,
-                &buffers,
-                None,
-                false,
-            );
-            let unclipped = StorageSelectPipelines::color(
-                ctx,
-                &shader,
-                &storage_pl.pipeline_layout,
-                &buffers,
-                None,
-                true,
-            );
-            let flat_base = flat_shader.as_ref().map(|sh| {
-                StorageSelectPipelines::face_only(
-                    ctx,
-                    sh,
-                    &storage_pl.pipeline_layout,
-                    &buffers,
-                    None,
-                    false,
-                )
-            });
-            let flat_unclipped = flat_shader.as_ref().map(|sh| {
-                StorageSelectPipelines::face_only(
-                    ctx,
-                    sh,
-                    &storage_pl.pipeline_layout,
-                    &buffers,
-                    None,
-                    true,
-                )
-            });
-            let sampled_extra = concat!(
-                include_str!("shaders/mesh3d_sampled.wgsl"),
-                "\n",
-                include_str!("shaders/mesh3d_select_sampled.wgsl"),
-                "\n",
-                include_str!("shaders/mesh3d_storage_select_sampled.wgsl")
-            );
-            let raster_extra = concat!(
-                include_str!("shaders/mesh3d_raster.wgsl"),
-                "\n",
-                include_str!("shaders/mesh3d_select_raster.wgsl"),
-                "\n",
-                include_str!("shaders/mesh3d_storage_select_raster.wgsl")
-            );
-            let section_shader = section_aa.map(|aa| {
-                (
-                    aa,
-                    aa.shader(ctx.device, &storage_src, sampled_extra, raster_extra),
-                )
-            });
-            let flat_section_shader = section_aa.and_then(|aa| {
-                let base_src = flat_storage_src.as_ref()?;
-                let raw = aa.shader_source(base_src, sampled_extra, raster_extra);
-                let flat_src = provoking::make_flat_color_wgsl(&raw, use_either);
-                let module = ctx
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("iletki-3d storage flat section selection MRT shader"),
-                        source: wgpu::ShaderSource::Wgsl(flat_src.into()),
-                    });
-                Some((aa, module))
-            });
-            let section = section_shader.as_ref().map(|(aa, sh)| {
-                StorageSelectPipelines::color(
-                    ctx,
-                    sh,
-                    &storage_pl.pipeline_layout,
-                    &buffers,
-                    Some(*aa),
-                    false,
-                )
-            });
-            let flat_section = flat_section_shader.as_ref().map(|(aa, sh)| {
-                StorageSelectPipelines::face_only(
-                    ctx,
-                    sh,
-                    &storage_pl.pipeline_layout,
-                    &buffers,
-                    Some(*aa),
-                    false,
-                )
-            });
-            StorageSelectPipelines {
-                base,
-                unclipped,
-                flat_base,
-                flat_unclipped,
-                section,
-                flat_section,
-                shader,
-                flat_shader,
-                section_shader,
-                flat_section_shader,
-                repeated: None,
-            }
-        });
-
-        p.select = Some(SelectPipelines {
-            lit,
-            lit_unclipped,
-            lit_flat,
-            lit_flat_unclipped,
-            edge,
-            edge_unclipped,
-            section,
-            storage,
-        });
+    fn ensure_select_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
+        if let Some(p) = &mut self.pipelines {
+            p.ensure_select(ctx);
+        }
     }
 
     fn sync_shared_selection(
@@ -2954,6 +1448,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     chunk.origin,
                     chunk.visible,
                     chunk.has_picks,
+                    chunk.material_id,
                 );
                 if let Some(meta) = self.chunk_select_meta.get_mut(chunk_index) {
                     meta.repeated_face_page = u32::MAX;
@@ -3029,8 +1524,15 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             }
         }
 
+        let has_custom_materials = self.materials.has_custom_materials();
         if ctx.selection_id_attachment() {
             self.ensure_select_pipelines(ctx);
+        }
+        if has_custom_materials
+            && ctx.picking_rect_px().is_none()
+            && let Some(pipelines) = self.pipelines.as_mut()
+        {
+            pipelines.ensure_materials(ctx, ctx.selection_id_attachment());
         }
         if self.has_repeated_pages
             && let Some(pipelines) = self.pipelines.as_mut()
@@ -3048,9 +1550,31 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     sel_storage.ensure_repeated(ctx, vertex_layout, &storage.pipeline_layout);
                 }
             }
+            if let Some(mat_storage) = pipelines
+                .materials
+                .as_mut()
+                .and_then(|mats| mats.storage.as_mut())
+            {
+                mat_storage.ensure_repeated(ctx, vertex_layout);
+            }
         }
         if use_storage {
             self.transform_table.sync(ctx.device, ctx.queue);
+            if has_custom_materials && ctx.picking_rect_px().is_none() {
+                self.materials.sync_ssbo(ctx.device, ctx.queue);
+            }
+        }
+        if has_custom_materials
+            && ctx.picking_rect_px().is_none()
+            && let Some(p) = self.pipelines.as_ref()
+            && let Some(mats) = p.materials.as_ref()
+        {
+            self.materials.sync_direct(
+                ctx.device,
+                ctx.queue,
+                &mats.direct_material_layout,
+                p.dynamic_uniforms,
+            );
         }
         let want_gpu_cull = use_storage
             && ctx.picking_rect_px().is_none()
@@ -3063,6 +1587,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 self.gpu_cull_pipelines = Some(GpuCullPipelines::new(ctx.device));
             }
             if self.gpu_cull_built_rev != self.geometry_revision {
+                let materials = &self.materials;
                 self.gpu_cull_scene = GpuCullScene::build(
                     ctx.device,
                     self.geometry_revision,
@@ -3079,7 +1604,8 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 origin: chunk.origin,
                                 local_bounds: chunk.local_bounds,
                                 trusted: chunk.section_bounds_trusted,
-                                translucent: chunk.has_translucent,
+                                translucent: chunk.has_translucent
+                                    || materials.is_translucent(chunk.material_id),
                                 vertex_buf: chunk.vertex_buf.as_ref(),
                                 face_ranges: chunk.face_ranges.as_deref(),
                                 edge_buf: chunk.edge_buf.as_ref(),
@@ -3123,6 +1649,14 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 &self.transform_table,
                 cam_pos,
             );
+            if let Some(mat_storage) = p.materials.as_ref().and_then(|m| m.storage.as_ref()) {
+                binding.update_materials(
+                    ctx.device,
+                    &mat_storage.layout,
+                    &self.transform_table,
+                    &self.materials,
+                );
+            }
         }
         if picking.is_none() {
             let update = {
@@ -4192,9 +2726,15 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         && !packed_mask);
                 if packed_layout.is_some() {
                     if let Some(geometry) = &chunk.vertex_buf {
+                        let custom_mat =
+                            picking.is_none() && chunk.material_id != MaterialId::DEFAULT;
                         // A direct face can still be selected even when its opaque draw is culled.
-                        direct |= geometry.is_direct();
-                        if !object.section_culled
+                        direct |= geometry.is_direct() || custom_mat;
+                        if custom_mat {
+                            if !object.section_culled {
+                                view.faces.push_direct(index);
+                            }
+                        } else if !object.section_culled
                             && let Some(ranges) = &chunk.face_ranges
                         {
                             let (relation, inside_frustum, _) = self
@@ -4489,31 +3029,65 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         let has_clip_planes = !ctx.camera.clip_planes().is_empty();
         let aa = self.use_antialiased_section;
         let use_select = ctx.selection_id_attachment();
-        let storage_bg = view
-            .storage_binding
-            .as_ref()
-            .and_then(StorageViewBinding::bind_group);
-        let storage_set = if use_select {
-            p.select
+        let use_materials = self.materials.has_custom_materials();
+        let storage_set = if use_materials {
+            let mat_bg = view
+                .storage_binding
                 .as_ref()
-                .and_then(|sel| sel.storage.as_ref())
-                .zip(storage_bg)
-                .map(|(pl, bg)| {
+                .and_then(StorageViewBinding::material_bind_group);
+            if use_select {
+                p.materials
+                    .as_ref()
+                    .and_then(|m| m.storage.as_ref())
+                    .and_then(|st| st.select.as_ref())
+                    .zip(mat_bg)
+                    .map(|(pl, bg)| {
+                        (
+                            pl.select_color(has_clip_planes, aa),
+                            pl.select_repeated(has_clip_planes, aa),
+                            bg,
+                        )
+                    })
+            } else {
+                p.materials
+                    .as_ref()
+                    .and_then(|m| m.storage.as_ref())
+                    .zip(mat_bg)
+                    .map(|(pl, bg)| {
+                        (
+                            pl.select_color(has_clip_planes, aa),
+                            pl.select_repeated(has_clip_planes, aa),
+                            bg,
+                        )
+                    })
+            }
+        } else {
+            let storage_bg = view
+                .storage_binding
+                .as_ref()
+                .and_then(StorageViewBinding::bind_group);
+            if use_select {
+                p.select
+                    .as_ref()
+                    .and_then(|sel| sel.storage.as_ref())
+                    .zip(storage_bg)
+                    .map(|(pl, bg)| {
+                        (
+                            pl.select_color(has_clip_planes, aa),
+                            pl.select_repeated(has_clip_planes, aa),
+                            bg,
+                        )
+                    })
+            } else {
+                p.storage.as_ref().zip(storage_bg).map(|(pl, bg)| {
                     (
                         pl.select_color(has_clip_planes, aa),
-                        pl.select_repeated(has_clip_planes, aa),
+                        pl.select_repeated(has_clip_planes, aa)
+                            .map(|(c, f, _)| (c, f)),
                         bg,
                     )
                 })
-        } else {
-            p.storage.as_ref().zip(storage_bg).map(|(pl, bg)| {
-                (
-                    pl.select_color(has_clip_planes, aa),
-                    pl.select_repeated(has_clip_planes, aa)
-                        .map(|(c, f, _)| (c, f)),
-                    bg,
-                )
-            })
+            }
         };
         let Some(((color, flat), rep, storage_bg)) = storage_set else {
             return;
@@ -4638,31 +3212,76 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         match phase {
             DrawPhase::Opaque => {
                 let aa = self.use_antialiased_section;
-                let storage_bg = view
-                    .storage_binding
-                    .as_ref()
-                    .and_then(StorageViewBinding::bind_group);
-                let storage_set = if use_select {
-                    p.select
+                let use_materials = self.materials.has_custom_materials();
+                let direct_mat = use_materials
+                    .then(|| {
+                        let mats = p.materials.as_ref()?;
+                        let set = if use_select {
+                            mats.direct_select.as_ref()?
+                        } else {
+                            &mats.direct
+                        };
+                        Some(set.select(has_clip_planes, aa))
+                    })
+                    .flatten();
+                let storage_set = if use_materials {
+                    let mat_bg = view
+                        .storage_binding
                         .as_ref()
-                        .and_then(|sel| sel.storage.as_ref())
-                        .zip(storage_bg)
-                        .map(|(pl, bg)| {
+                        .and_then(StorageViewBinding::material_bind_group);
+                    if use_select {
+                        p.materials
+                            .as_ref()
+                            .and_then(|m| m.storage.as_ref())
+                            .and_then(|st| st.select.as_ref())
+                            .zip(mat_bg)
+                            .map(|(pl, bg)| {
+                                (
+                                    pl.select_color(has_clip_planes, aa),
+                                    pl.select_repeated(has_clip_planes, aa),
+                                    bg,
+                                )
+                            })
+                    } else {
+                        p.materials
+                            .as_ref()
+                            .and_then(|m| m.storage.as_ref())
+                            .zip(mat_bg)
+                            .map(|(pl, bg)| {
+                                (
+                                    pl.select_color(has_clip_planes, aa),
+                                    pl.select_repeated(has_clip_planes, aa),
+                                    bg,
+                                )
+                            })
+                    }
+                } else {
+                    let storage_bg = view
+                        .storage_binding
+                        .as_ref()
+                        .and_then(StorageViewBinding::bind_group);
+                    if use_select {
+                        p.select
+                            .as_ref()
+                            .and_then(|sel| sel.storage.as_ref())
+                            .zip(storage_bg)
+                            .map(|(pl, bg)| {
+                                (
+                                    pl.select_color(has_clip_planes, aa),
+                                    pl.select_repeated(has_clip_planes, aa),
+                                    bg,
+                                )
+                            })
+                    } else {
+                        p.storage.as_ref().zip(storage_bg).map(|(pl, bg)| {
                             (
                                 pl.select_color(has_clip_planes, aa),
-                                pl.select_repeated(has_clip_planes, aa),
+                                pl.select_repeated(has_clip_planes, aa)
+                                    .map(|(c, f, _)| (c, f)),
                                 bg,
                             )
                         })
-                } else {
-                    p.storage.as_ref().zip(storage_bg).map(|(pl, bg)| {
-                        (
-                            pl.select_color(has_clip_planes, aa),
-                            pl.select_repeated(has_clip_planes, aa)
-                                .map(|(c, f, _)| (c, f)),
-                            bg,
-                        )
-                    })
+                    }
                 };
                 if view.gpu_cull_active
                     && let (Some(gpu_scene), Some(gpu_view), Some(((color, flat), rep, storage_bg))) =
@@ -4686,11 +3305,20 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 && buffer.is_direct()
                                 && view.bind(pass, index, p.dynamic_uniforms)
                             {
-                                let use_flat = buffer.is_flat() && lit_flat.is_some();
-                                let pl = if use_flat {
-                                    lit_flat.unwrap_or(lit)
+                                let custom_mat = chunk.material_id != MaterialId::DEFAULT;
+                                let (smooth_pl, flat_pl) = if custom_mat
+                                    && let Some((ms, mf)) = direct_mat
+                                    && self.materials.bind_direct(pass, chunk.material_id)
+                                {
+                                    (ms, mf)
                                 } else {
-                                    lit
+                                    (lit, lit_flat)
+                                };
+                                let use_flat = buffer.is_flat() && flat_pl.is_some();
+                                let pl = if use_flat {
+                                    flat_pl.unwrap_or(smooth_pl)
+                                } else {
+                                    smooth_pl
                                 };
                                 pass.set_pipeline(pl);
                                 if use_select {
@@ -4773,7 +3401,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     let draw_direct =
                         |pass: &mut wgpu::RenderPass<'_>,
                          index: usize,
-                         active_direct: &mut Option<bool>| {
+                         active_direct: &mut Option<(bool, bool)>| {
                             let Some(object) = view.draws.get(index) else {
                                 return;
                             };
@@ -4794,15 +3422,25 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                             if let Some(buffer) = geometry
                                 && view.bind(pass, index, p.dynamic_uniforms)
                             {
-                                let use_flat = !edges && buffer.is_flat() && direct_flat.is_some();
-                                if *active_direct != Some(use_flat) {
-                                    let pl = if use_flat {
-                                        direct_flat.unwrap_or(direct_pipeline)
+                                let use_mat = !edges
+                                    && chunk.material_id != MaterialId::DEFAULT
+                                    && direct_mat.is_some()
+                                    && self.materials.bind_direct(pass, chunk.material_id);
+                                let (base_pl, flat_pl) =
+                                    if use_mat && let Some((ms, mf)) = direct_mat {
+                                        (ms, mf)
                                     } else {
-                                        direct_pipeline
+                                        (direct_pipeline, direct_flat)
+                                    };
+                                let use_flat = !edges && buffer.is_flat() && flat_pl.is_some();
+                                if *active_direct != Some((use_flat, use_mat)) {
+                                    let pl = if use_flat {
+                                        flat_pl.unwrap_or(base_pl)
+                                    } else {
+                                        base_pl
                                     };
                                     pass.set_pipeline(pl);
-                                    *active_direct = Some(use_flat);
+                                    *active_direct = Some((use_flat, use_mat));
                                 }
                                 if use_select && !edges {
                                     let slot_id = if chunk.has_picks {

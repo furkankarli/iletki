@@ -5,6 +5,7 @@
 //! [`crate::face_batch`].
 
 use crate::face_batch::{GeometryPage, PageKind, PaintPipelines, VertexRange};
+use crate::material::{MAX_MATERIAL_ID, MaterialGpu, MaterialId, MaterialTable};
 use bytemuck::{Pod, Zeroable};
 use iletki_core::Vec3;
 use iletki_wgpu::wgpu;
@@ -57,20 +58,27 @@ pub(crate) struct ChunkTransformGpu {
     pub(crate) whole: [i32; 3],
     pub(crate) scale: f32,
     pub(crate) frac: [u32; 3],
-    /// Bit 0 = visible (`1` = drawn, `0` = clipped by vertex shader); bit 1 = pickable.
+    /// Bit 0 = visible (`1` = drawn, `0` = clipped by vertex shader); bit 1 = pickable;
+    /// bits 2..7 = reserved per-chunk render flags; bits 8..31 = 24-bit [`MaterialId`] index.
     pub(crate) flags: u32,
 }
 
 impl ChunkTransformGpu {
-    pub(crate) fn new(origin_rel: Vec3, visible: bool, pickable: bool) -> Self {
+    pub(crate) fn new(
+        origin_rel: Vec3,
+        visible: bool,
+        pickable: bool,
+        material_id: MaterialId,
+    ) -> Self {
         let (wx, fx) = to_q32_32(origin_rel.x);
         let (wy, fy) = to_q32_32(origin_rel.y);
         let (wz, fz) = to_q32_32(origin_rel.z);
+        let mat_bits = (material_id.index().min(MAX_MATERIAL_ID)) << 8;
         Self {
             whole: [wx, wy, wz],
             scale: 1.0,
             frac: [fx, fy, fz],
-            flags: u32::from(visible) | (u32::from(pickable) << 1),
+            flags: u32::from(visible) | (u32::from(pickable) << 1) | mat_bits,
         }
     }
 }
@@ -137,6 +145,46 @@ pub(crate) fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Bind group layout adding persistent read-only [`MaterialGpu`] storage at `@binding(3)` for
+/// scenes with custom materials (zero extra bind-group switches in the hot draw loop).
+pub(crate) fn bind_layout_with_materials(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iletki-3d storage transforms + materials layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(size_of::<ViewCameraOrigin>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(size_of::<ChunkTransformGpu>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(size_of::<MaterialGpu>() as u64),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 /// Persistent GPU storage buffer holding every chunk's Q32.32 fixed-point origin and visibility.
 #[derive(Default)]
 pub(crate) struct ChunkTransformTable {
@@ -159,7 +207,14 @@ impl ChunkTransformTable {
         !self.out_of_range && in_q32_range(camera_pos - self.anchor())
     }
 
-    pub(crate) fn mark_chunk(&mut self, index: usize, origin: Vec3, visible: bool, pickable: bool) {
+    pub(crate) fn mark_chunk(
+        &mut self,
+        index: usize,
+        origin: Vec3,
+        visible: bool,
+        pickable: bool,
+        material_id: MaterialId,
+    ) {
         if self.anchor.is_none() && origin.is_finite() {
             self.anchor = Some(origin);
         }
@@ -167,7 +222,10 @@ impl ChunkTransformTable {
         if !in_q32_range(rel) {
             self.out_of_range = true;
         }
-        self.set_raw(index, ChunkTransformGpu::new(rel, visible, pickable));
+        self.set_raw(
+            index,
+            ChunkTransformGpu::new(rel, visible, pickable, material_id),
+        );
     }
 
     pub(crate) fn clear_chunk(&mut self, index: usize) {
@@ -275,11 +333,15 @@ impl ChunkTransformTable {
     }
 }
 
-/// Per-viewport uniform + bind group referencing the shared [`ChunkTransformTable`].
+/// Per-viewport uniform + bind group referencing the shared [`ChunkTransformTable`] and optional
+/// persistent [`MaterialTable`].
 pub(crate) struct StorageViewBinding {
     origin_buf: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
     bound_generation: u64,
+    material_bind_group: Option<wgpu::BindGroup>,
+    bound_material_transform_gen: u64,
+    bound_material_gen: u64,
     last_origin: Option<ViewCameraOrigin>,
 }
 
@@ -295,6 +357,9 @@ impl StorageViewBinding {
             origin_buf,
             bind_group: None,
             bound_generation: 0,
+            material_bind_group: None,
+            bound_material_transform_gen: 0,
+            bound_material_gen: 0,
             last_origin: None,
         }
     }
@@ -336,8 +401,51 @@ impl StorageViewBinding {
         }
     }
 
+    pub(crate) fn update_materials(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        table: &ChunkTransformTable,
+        materials: &MaterialTable,
+    ) {
+        if !materials.has_custom_materials() {
+            self.material_bind_group = None;
+            return;
+        }
+        if (self.material_bind_group.is_none()
+            || self.bound_material_transform_gen != table.generation()
+            || self.bound_material_gen != materials.ssbo_generation())
+            && let (Some(transforms_buf), Some(materials_buf)) = (table.buffer(), materials.ssbo())
+        {
+            self.material_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iletki-3d storage view + materials binding"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.origin_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: transforms_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: materials_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+            self.bound_material_transform_gen = table.generation();
+            self.bound_material_gen = materials.ssbo_generation();
+        }
+    }
+
     pub(crate) fn bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.bind_group.as_ref()
+    }
+
+    pub(crate) fn material_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.material_bind_group.as_ref()
     }
 }
 

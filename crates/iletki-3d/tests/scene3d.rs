@@ -7,10 +7,17 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use iletki_3d::{
-    GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Mesh3D, Scene3DLayer, TransformGizmoLayer,
+    GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D,
+    Scene3DLayer, TransformGizmoLayer,
 };
-use iletki_core::{Bounds3, Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
-use iletki_wgpu::{ViewportConfig, ViewportHost, ViewportLayer, wgpu};
+use iletki_core::{
+    Bounds3, Camera, DirtyFlags, DrawPhase, DrawPhaseMask, PickId, Plane, Vec3, ViewportId,
+    ViewportMode,
+};
+use iletki_wgpu::{
+    DEPTH_FORMAT, DEPTH_STENCIL_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportHost,
+    ViewportLayer, wgpu,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -1621,4 +1628,283 @@ fn operational_resilience_optional_features_block_resizes_and_teardown() {
         !hits.is_empty(),
         "surviving viewport must continue picking after sibling teardown"
     );
+}
+
+#[test]
+fn material_ssbo_and_fallback_shade_update_section_and_pick() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.06, 1.0],
+            mode: ViewportMode::OnDemand,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [240, 120],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, -10.0, 0.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        4.5,
+        0.1,
+        50.0,
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let make_white_box = |x: f64, obj: u32| {
+        let mut m = Mesh3D::at_origin(Vec3::new(x, 0.0, 0.0));
+        m.push_box(
+            Vec3::new(-0.9, -0.9, -0.9),
+            Vec3::new(0.9, 0.9, 0.9),
+            [230, 230, 230, 255],
+            PickId::new(1, obj, 0),
+            false,
+        );
+        m
+    };
+    let left_id = scene.insert(make_white_box(-3.0, 10));
+    let center_id = scene.insert(make_white_box(0.0, 20));
+    let right_id = scene.insert(make_white_box(3.0, 30));
+
+    let red_mat = scene.insert_material(Material3D::tinted([1.0, 0.1, 0.1, 1.0]));
+    let green_unlit = scene.insert_material(Material3D {
+        emissive: [0.0, 0.15, 0.0],
+        ..Material3D::unlit([0.05, 0.9, 0.1])
+    });
+    assert_eq!(scene.chunk_material(left_id), Some(MaterialId::DEFAULT));
+    scene.set_chunk_material(center_id, red_mat);
+    scene.set_chunk_material(right_id, green_unlit);
+    assert_eq!(scene.chunk_material(center_id), Some(red_mat));
+    assert_eq!(scene.chunk_material(right_id), Some(green_unlit));
+
+    // Hostile material updates/removals on default or out-of-bounds handles are safely ignored.
+    assert!(!scene.update_material(MaterialId::DEFAULT, Material3D::unlit([1.0, 0.0, 0.0])));
+    assert!(!scene.remove_material(MaterialId::DEFAULT));
+    let hostile = scene.insert_material(Material3D {
+        base_color_factor: [f32::NAN, f32::INFINITY, -1.0, f32::NAN],
+        roughness: f32::NAN,
+        metallic: f32::INFINITY,
+        opacity: f32::NAN,
+        backface_tint: f32::NEG_INFINITY,
+        emissive: [f32::NAN, 0.0, 0.0],
+        flags: MaterialFlags::NONE,
+    });
+    assert!(scene.remove_material(hostile));
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    // Frame 1: left neutral gray/white, center red-tinted, right unlit green.
+    let img1 = render(&mut host, &mut scene);
+    let left_px = img1.pixel(50, 60).unwrap();
+    let center_px = img1.pixel(120, 60).unwrap();
+    let right_px = img1.pixel(190, 60).unwrap();
+    assert!(
+        left_px[0].abs_diff(left_px[1]) <= 6
+            && left_px[1].abs_diff(left_px[2]) <= 6
+            && left_px[0] > 90,
+        "default material box must remain neutral gray/white, got {left_px:?}"
+    );
+    assert!(
+        center_px[0] > center_px[1].saturating_add(70)
+            && center_px[0] > center_px[2].saturating_add(70),
+        "red material box must shade red, got {center_px:?}"
+    );
+    assert!(
+        right_px[1] > right_px[0].saturating_add(120)
+            && right_px[1] > right_px[2].saturating_add(120),
+        "unlit green material box must shade green, got {right_px:?}"
+    );
+
+    // Frame 2: live in-place update_material switches center from red to blue without geometry rebuild.
+    assert!(scene.update_material(red_mat, Material3D::tinted([0.1, 0.2, 1.0, 1.0])));
+    let img2 = render(&mut host, &mut scene);
+    let center_blue = img2.pixel(120, 60).unwrap();
+    assert!(
+        center_blue[2] > center_blue[0].saturating_add(70)
+            && center_blue[2] > center_blue[1].saturating_add(50),
+        "updated material box must shade blue, got {center_blue:?}"
+    );
+
+    // Frame 3: live section clip plane + MRT preview (when supported) + exact 64-bit pick.
+    if let Some(plane) = Plane::from_normal_point(Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane]);
+    }
+    let supports_mrt = host.supports_color_frame_selection(&device);
+    if supports_mrt {
+        host.set_color_frame_selection_rect(Some([10, 10, 220, 100]));
+    }
+    let img3 = render(&mut host, &mut scene);
+    // Upper half (z > 0) stays rendered, lower half (z < 0) is cleanly clipped to background.
+    let upper_center = img3.pixel(120, 45).unwrap();
+    let lower_center = img3.pixel(120, 75).unwrap();
+    assert!(
+        upper_center[2] > upper_center[0].saturating_add(50),
+        "unclipped upper half of blue box must remain blue, got {upper_center:?}"
+    );
+    assert!(
+        lower_center[0] < 30 && lower_center[1] < 30 && lower_center[2] < 35,
+        "clipped lower half must reveal background, got {lower_center:?}"
+    );
+    if supports_mrt {
+        let mut pending = host.take_color_frame_selection_preview(&device).unwrap();
+        let slots = loop {
+            match pending.try_read() {
+                Poll::Ready(res) => break res.unwrap(),
+                Poll::Pending => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(
+            slots.len(),
+            3,
+            "MRT preview with custom materials must report all 3 visible boxes, got {slots:?}"
+        );
+        host.set_color_frame_selection_rect(None);
+    }
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [10, 10, 220, 50])
+        .unwrap();
+    let hit_objs: Vec<u32> = hits.iter().map(|h| h.id.object).collect();
+    assert!(
+        hit_objs.contains(&10) && hit_objs.contains(&20) && hit_objs.contains(&30),
+        "exact pick must find all 3 boxes under custom materials, got {hit_objs:?}"
+    );
+
+    // Frame 4: removing material resets center chunk cleanly back to default neutral shading.
+    host.camera_mut().set_clip_planes(&[]);
+    assert!(scene.remove_material(red_mat));
+    assert_eq!(scene.chunk_material(center_id), Some(MaterialId::DEFAULT));
+    let img4 = render(&mut host, &mut scene);
+    let center_reset = img4.pixel(120, 60).unwrap();
+    assert!(
+        center_reset[0].abs_diff(center_reset[1]) <= 6
+            && center_reset[1].abs_diff(center_reset[2]) <= 6
+            && center_reset[0] > 90,
+        "center box must revert to neutral default shading after remove_material, got {center_reset:?}"
+    );
+}
+
+struct StencilToggleLayer {
+    enabled: bool,
+}
+
+impl ViewportLayer<()> for StencilToggleLayer {
+    fn id(&self) -> u16 {
+        42
+    }
+
+    fn phases(&self) -> DrawPhaseMask {
+        DrawPhaseMask::NONE
+    }
+
+    fn requires_stencil(&self, _viewport_id: ViewportId) -> bool {
+        self.enabled
+    }
+
+    fn prepare(&mut self, _ctx: &mut PrepareCtx<'_, ()>) -> bool {
+        false
+    }
+
+    fn paint(&self, _phase: DrawPhase, _pass: &mut wgpu::RenderPass<'_>, _ctx: &PaintCtx<'_, ()>) {}
+}
+
+#[test]
+fn lazy_stencil_depth_format_works_with_3d_scene_grid_and_gizmo() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [160, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(4.0, -5.0, 4.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        45_f64.to_radians(),
+        0.1,
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+    mesh.push_box_with_edges(
+        Vec3::new(-1.0, -1.0, -1.0),
+        Vec3::new(1.0, 1.0, 1.0),
+        [180, 200, 220, 255],
+        [20, 25, 30, 255],
+        PickId::new(1, 77, 0),
+        true,
+    );
+    let chunk = scene.insert(mesh);
+    let mat = scene.insert_material(Material3D::tinted([0.9, 0.5, 0.2, 1.0]));
+    scene.set_chunk_material(chunk, mat);
+    scene.set_selected(chunk, true);
+    let mut grid = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
+    let mut gizmo = TransformGizmoLayer::new(3, 900);
+    gizmo.origin = Some(Vec3::ZERO);
+    let mut toggle = StencilToggleLayer { enabled: false };
+
+    let render_all = |host: &mut ViewportHost,
+                      scene: &mut Scene3DLayer,
+                      grid: &mut InfiniteGrid3DLayer,
+                      gizmo: &mut TransformGizmoLayer,
+                      toggle: &mut StencilToggleLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut layers: [&mut dyn ViewportLayer<()>; 4] = [scene, grid, gizmo, toggle];
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers);
+        }
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    // Pass 1: plain Depth32Float.
+    let img_depth = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+
+    // Pass 2: lazily upgrade to Depth32FloatStencil8 across Scene3D + Grid + Gizmo + Outline.
+    toggle.enabled = true;
+    let img_stencil = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    if host.supports_stencil(&device) {
+        assert_eq!(host.depth_format(), DEPTH_STENCIL_FORMAT);
+    }
+    assert_eq!([img_depth.width, img_depth.height], [160, 160]);
+    assert_eq!(img_depth.pixels.len(), img_stencil.pixels.len());
+
+    // Exact 64-bit picking remains healthy while viewport is on Depth32FloatStencil8.
+    let hits = {
+        let mut layers: [&mut dyn ViewportLayer<()>; 4] =
+            [&mut scene, &mut grid, &mut gizmo, &mut toggle];
+        host.pick_rect_blocking(&device, &queue, &(), &mut layers, [40, 40, 80, 80])
+            .unwrap()
+    };
+    assert!(
+        hits.iter().any(|h| h.id.object == 77),
+        "scene box must remain pickable while viewport depth format is stencil-enabled"
+    );
+
+    // Pass 3: downgrade back to Depth32Float cleanly.
+    toggle.enabled = false;
+    let _img_back = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
 }

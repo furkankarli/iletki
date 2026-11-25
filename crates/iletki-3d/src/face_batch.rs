@@ -755,6 +755,11 @@ impl PackedDraws {
         self.push_inner(geometry, offset, draw_index, false);
     }
 
+    pub(crate) fn push_direct(&mut self, draw_index: usize) {
+        self.section_gap_end = None;
+        self.commands.push(Draw::Direct(draw_index));
+    }
+
     fn push_inner(
         &mut self,
         geometry: &VertexRange,

@@ -50,6 +50,7 @@ impl Instance3D {
 
 struct InstPipelines {
     format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
     msaa: u32,
     batch_layout: wgpu::BindGroupLayout,
     lit: wgpu::RenderPipeline,
@@ -136,6 +137,7 @@ impl InstancedMesh3DLayer {
         let section_aa = SectionAa::for_viewport(ctx);
         if self.pipelines.as_ref().is_some_and(|p| {
             p.format == ctx.color_format
+                && p.depth_format == ctx.depth_format
                 && p.msaa == ctx.msaa_samples
                 && (section_aa.is_none() || p.section_lit.is_some())
         }) {
@@ -216,7 +218,7 @@ impl InstancedMesh3DLayer {
                         ..wgpu::PrimitiveState::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
+                        format: ctx.depth_format,
                         depth_write_enabled: Some(true),
                         depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                         stencil: wgpu::StencilState::default(),
@@ -286,6 +288,7 @@ impl InstancedMesh3DLayer {
         self.per_viewport.clear();
         self.pipelines = Some(InstPipelines {
             format: ctx.color_format,
+            depth_format: ctx.depth_format,
             msaa: ctx.msaa_samples,
             batch_layout,
             lit,
