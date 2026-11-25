@@ -14,6 +14,10 @@ The CSVs include the run number, frame index within the run, and elapsed millise
 - [Crosshair updates](benchmarks/rtx-4050-vulkan/cad2d-crosshair.csv)
 - [100,000-instance orbit](benchmarks/rtx-4050-vulkan/instanced-orbit.csv)
 
+For full-geometry 1080p 3D assembly, BIM/CAD model, and interactive windowed 60 Hz / 120 Hz
+measurements on AMD Radeon 680M and NVIDIA RTX 4050, see
+[Full-geometry 60 Hz and 120 Hz measurements](#full-geometry-60-hz-and-120-hz-measurements).
+
 ## Reproduce the workloads
 
 ```sh
@@ -112,9 +116,26 @@ series for separate percentile analysis.
 
 `ILETKI_ASSEMBLY_NO_REPEATED_PAGES=1` keeps color draws on the regular packed path
 when a page contains byte-identical small meshes. Selection and picking use the
-same geometry in both variants. Set `ILETKI_ASSEMBLY_OVERLAP=1` in a two-view run to
+same geometry in both variants. Set `ILETKI_ASSEMBLY_NO_INDEXED=1` to disable
+provoking-vertex flat indexing and smooth exact-record indexing,
+`ILETKI_ASSEMBLY_NO_STORAGE=1` to force the 256-entry uniform transform path instead of
+Q32.32 storage-buffer transforms, and `ILETKI_ASSEMBLY_NO_GPU_CULL=1` to fall back from
+two-phase compute frustum/section/Hi-Z culling to CPU retained storage draws. Set
+`ILETKI_ASSEMBLY_SMOOTH=1` to run the 500-chunk synthetic smooth-shaded control
+(spheres and cylinders). Set `ILETKI_ASSEMBLY_OVERLAP=1` in a two-view run to
 submit the first viewport before encoding the second. The wall timer still ends
 at completion of both views.
+
+When `ILETKI_PROFILE=1` is set, `profile.csv` also records delivery counters
+(`scene.uploaded_chunks`, `scene.uploaded_flat_chunks`,
+`scene.uploaded_smooth_indexed_chunks`, `scene.uploaded_input_vertices`,
+`scene.uploaded_stored_vertices`, `scene.uploaded_preprocess_us`), draw-reuse and
+culling counters (`scene.retained_hit`, `scene.gpu_cull_active`, `scene.gpu_cull_items`),
+and—when the adapter supports `PIPELINE_STATISTICS_QUERY`—vertex and fragment shader
+invocations split across Phase 1 (`gpu.scene.*`), Phase 2 (`gpu.scene_p2.*`), and
+picking (`gpu.pick.*`). On adapters that support `Rg16Uint` color-frame selection
+previews and compute reduction, the picking phase also records 120 samples each of
+`marquee-preview-static` and `marquee-preview-moving` after warm-up.
 
 The offscreen workloads exclude window acquisition, compositing and presentation. The
 asynchronous pick workload polls continuously to measure request readiness independently
@@ -148,8 +169,9 @@ The default `mixed` region alternates center and left rectangles for historical 
 Use `--rect-size 512` for large rectangles and `--motion orbit|section|edit` for invalidation
 under camera moves, live section changes or 1% part edits. Section motion requires
 `--style edges-section`. Replay requests default to a 60 Hz schedule and write a separate
-final release event. Set `--input-hz 240 --samples 1440` or
-`--input-hz 500 --samples 3000` to replay six seconds of input faster than the display.
+final release event. Set `--input-hz 120 --samples 360` for the 120 Hz fixed-rate track,
+or `--input-hz 240 --samples 1440` / `--input-hz 500 --samples 3000` to replay six
+seconds of input faster than the display.
 During a burst, the demo keeps the newest pending preview and schedules GPU work against
 the window's nominal refresh interval. A ready preview gets a redraw opportunity before
 the next preview is encoded. When a readback exceeds three quarters of a refresh interval,
@@ -191,6 +213,9 @@ Compare the intervals between adjacent applied previews independently of input l
 The software pacing targets for fixed-view previews are 18.33 ms p95 and 25 ms p99.
 Set `ILETKI_DIRECT_PICK=1` in the profiling build
 to A/B the per-chunk pick path while keeping the same preview and contour code.
+Set `ILETKI_NO_MRT_PREVIEW=1` to disable color-frame `Rg16Uint` MRT marquee previews in
+`iletki-demo` (including in `--dual` split view) and compare against the exact-pick
+preview path as a same-adapter reference.
 
 For a controlled presentation comparison, select `--present fifo` or `--present mailbox`,
 `--depth 1` or `--depth 2`, and optionally `--notify-present` for the Wayland frame
@@ -327,4 +352,81 @@ Set `ILETKI_ASSEMBLY_SIGNATURES=1` to hash a full orbit outside the timed sample
 A moving section can leave individual reference frames empty. The model still
 has to be visible in at least one validated reference frame. Set
 `ILETKI_ASSEMBLY_IMAGES=1` to save three row-major RGBA8 frames per viewport from
-that orbit. The filenames include the output size.
+that orbit (or combine with `ILETKI_ASSEMBLY_ALL_IMAGES=1` to save all 30 poses).
+The filenames include the output size.
+
+## Full-geometry 60 Hz and 120 Hz measurements
+
+All measurements below were recorded on Linux x86-64 with Rust 1.100.0 at `1920×1080`
+and `4× MSAA` with full geometry (no interactive LOD), merged in commit `6cf5d43`:
+
+- **Integrated GPU:** AMD Radeon 680M (RADV Mesa 26.2.7, Vulkan)
+- **Discrete GPU:** NVIDIA GeForce RTX 4050 Laptop GPU (NVIDIA Vulkan 620.70.06)
+- **West Riverside Hospital IFC4 federation:** 17,236 parts, 5,343,828 triangles
+  (fixture SHA-256 `43add343e3c2a48af72bf48e68bef7d8beaf85b13e2c6679f7884e3793132afd`)
+- **OpenArm Cell 2.0 STEP:** 538 parts, 1,586,648 triangles
+  (fixture SHA-256 `0b5c528692f804bf811684fb1de07ac98d3b69317bf28decaa82e012274666fd`)
+- **Synthetic controls:** 20,000-part wide grid (`20000/wide`) and 100,000-part shuffled
+  assembly (`shuffled-100k`, 1,200,000 triangles)
+
+### Synchronized offscreen 3D rendering (`assembly_bench`)
+
+Interleaved release repetitions at `1920×1080`, `4× MSAA`, with provoking-vertex flat
+indexing, smooth exact-record indexing, Q32.32 storage transforms, and two-phase
+quarter-res Hi-Z GPU culling active where eligible:
+
+| Workload | Radeon 680M GPU p50 | Radeon 680M Wall p95 / p99 | RTX 4050 GPU p50 | RTX 4050 Wall p95 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Hospital wide | 3.81 ms | 5.11 / 5.37 ms | 0.84 ms | 1.53 ms (p95) |
+| Hospital close (`MODEL_CLOSE=1`) | 6.63–7.29 ms | 9.94–10.92 / 10.42–12.06 ms | 1.17 ms | 2.28 / 2.61 ms |
+| Hospital split (`edges-section` + edits) | 2.43 ms | 8.87 / 9.56 ms | 0.58 ms | 2.82 ms (p95) |
+| OpenArm STEP split | — | 5.80 ms (p95) | — | 1.51 ms (p95) |
+| Synthetic 20k wide | — | 1.14 ms (p95) | — | 0.29 ms (p95) |
+| Shuffled 100k split | — | 11.26 ms (p95) | — | 3.07 ms (p95) |
+
+For the 5.34M-triangle Hospital scene, provoking-vertex indexing and compact vertex
+streams reduced GPU allocator usage from `715 MB` to `322.8 MB` (Radeon 680M) /
+`319.5 MB` (RTX 4050), including the quarter-res Hi-Z pyramid. For a `256×256` marquee
+preview on Hospital wide, `Rg16Uint` color-frame selection with compute bitset reduction
+reads back `~2.2 KB` (vs. `~786 KB` for exact picking) and measures `0.14 ms` p50 /
+`0.17 ms` p95 on Radeon 680M and `0.09 ms` p50 / `0.11 ms` p95 on RTX 4050 in static view.
+All exact-pick release digests match bit-for-bit across backends.
+
+### Interactive windowed 60 Hz sign-off (`iletki-demo`)
+
+Three alternating repetitions per GPU on a `1920×1080` 144 Hz display (`--1080p`,
+`--input-hz 60 --samples 360`, 4× MSAA). Values show the 3-repetition median input-to-present-return
+`p50 / p95 (max rep p95) / p99` latency and applied rate. Software gate: `≥ 57/s`,
+`p95 ≤ 16.67 ms`, `p99 ≤ 33.3 ms`, and bit-exact `release_digest` against
+`ILETKI_NO_MRT_PREVIEW=1`.
+
+| Workload | Radeon 680M Rate | Radeon 680M p50 / p95 (max) / p99 | RTX 4050 Rate | RTX 4050 p50 / p95 (max) / p99 | Release Digest |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Hospital single orbit | 60.0/s | 1.34 / 1.78 (1.80) / 1.95 ms | 60.0/s | 1.29 / 1.69 (1.78) / 1.84 ms | — |
+| Hospital dual orbit | 60.0/s | 1.83 / 2.29 (2.32) / 2.53 ms | 60.0/s | 1.72 / 2.19 (2.19) / 2.38 ms | — |
+| Hospital single marquee + orbit | 59.8/s | 9.13 / 9.92 (10.17) / 10.68 ms | 59.8/s | 5.25 / 6.00 (6.03) / 6.42 ms | Bit-exact |
+| Hospital dual marquee + combined | 59.8/s | 11.82 / 13.88 (13.88) / 14.80 ms | 59.8/s | 6.12 / 7.28 (7.42) / 7.71 ms | Bit-exact |
+| OpenArm single orbit | 60.0/s | 0.67 / 0.97 (0.97) / 1.03 ms | 60.0/s | 0.66 / 0.91 (0.94) / 1.00 ms | — |
+| OpenArm dual marquee + combined | 59.8/s | 8.31 / 11.33 (11.71) / 11.94 ms | 59.8/s | 3.93 / 5.60 (5.77) / 6.15 ms | Bit-exact |
+| Shuffled 100k single orbit | 60.0/s | 1.14 / 1.51 (1.56) / 1.69 ms | 60.0/s | 1.17 / 1.64 (1.66) / 1.81 ms | — |
+| Shuffled 100k dual marquee + combined | 59.8/s | 12.87 / 16.57 (16.76) / 17.12 ms | 59.8/s | 6.43 / 10.27 (10.39) / 10.79 ms | Bit-exact |
+
+### Fixed-rate 120 Hz track (`iletki-demo`)
+
+Two-repetition medians at `--1080p --input-hz 120 --samples 360` on the same 144 Hz display
+(target `≤ 6.0 ms` p95 / `≤ 8.33 ms` p99):
+
+| GPU & Workload | Rate | p50 | p95 (max) | p99 (max) | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| RTX 4050 · Hospital single orbit | 120.0/s | 1.17 ms | 1.52 (1.61) ms | 1.79 (1.81) ms | Pass |
+| RTX 4050 · Hospital dual orbit | 120.0/s | 1.56 ms | 2.07 (2.13) ms | 2.49 (2.57) ms | Pass |
+| RTX 4050 · Hospital single marquee + orbit | 119.5/s | 4.07 ms | 4.81 (4.82) ms | 5.62 (5.95) ms | Pass |
+| RTX 4050 · Hospital dual marquee + combined | 119.5/s | 5.63 ms | 7.30 (8.04) ms | 8.57 (9.81) ms | 119.5/s (`p50 < 6 ms`) |
+| RTX 4050 · OpenArm single orbit | 120.0/s | 0.60 ms | 0.83 (0.84) ms | 0.98 (0.98) ms | Pass |
+| RTX 4050 · OpenArm dual marquee + combined | 119.7/s | 3.38 ms | 4.59 (4.62) ms | 5.46 (5.95) ms | Pass |
+| RTX 4050 · Shuffled 100k single orbit | 120.0/s | 1.03 ms | 1.35 (1.41) ms | 1.67 (1.76) ms | Pass |
+| RTX 4050 · Shuffled 100k dual marquee + combined | 119.7/s | 5.25 ms | 9.19 (9.23) ms | 10.58 (10.78) ms | 119.7/s (`p50 < 6 ms`) |
+| Radeon 680M · Hospital single orbit | 120.0/s | 1.15 ms | 1.42 (1.45) ms | 1.59 (1.63) ms | Pass |
+| Radeon 680M · Hospital dual orbit | 120.0/s | 1.79 ms | 2.64 (2.69) ms | 3.20 (3.29) ms | Pass |
+| Radeon 680M · OpenArm single orbit | 120.0/s | 0.58 ms | 0.73 (0.75) ms | 0.83 (0.83) ms | Pass |
+| Radeon 680M · Shuffled 100k single orbit | 120.0/s | 0.95 ms | 1.20 (1.23) ms | 1.44 (1.53) ms | Pass |
