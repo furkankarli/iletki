@@ -31,5 +31,5 @@ pub use iletki_3d as cad3d;
 pub use iletki_3d::{
     Chunk3DId, GizmoAxis, Grid3DConfig, GridPlane, InfiniteGrid3DLayer, Instance3D,
     InstancedMesh3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D, Scene3DLayer,
-    TransformGizmoLayer, Vertex3D,
+    SectionCapConfig, SectionCapPattern, TransformGizmoLayer, Vertex3D,
 };

@@ -8,7 +8,7 @@
 
 use iletki_3d::{
     GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D,
-    Scene3DLayer, TransformGizmoLayer,
+    Scene3DLayer, SectionCapConfig, SectionCapPattern, TransformGizmoLayer,
 };
 use iletki_core::{
     Bounds3, Camera, DirtyFlags, DrawPhase, DrawPhaseMask, PickId, Plane, Vec3, ViewportId,
@@ -1907,4 +1907,537 @@ fn lazy_stencil_depth_format_works_with_3d_scene_grid_and_gizmo() {
     toggle.enabled = false;
     let _img_back = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
     assert_eq!(host.depth_format(), DEPTH_FORMAT);
+}
+
+fn create_device_with_clip_distances() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..wgpu::RequestAdapterOptions::default()
+    }))
+    .or_else(|_| {
+        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+            ..wgpu::RequestAdapterOptions::default()
+        }))
+    })
+    .ok()?;
+    if !adapter.features().contains(wgpu::Features::CLIP_DISTANCES) {
+        return None;
+    }
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d clip_distances test device"),
+        required_features: wgpu::Features::CLIP_DISTANCES,
+        required_limits: wgpu::Limits::default(),
+        ..wgpu::DeviceDescriptor::default()
+    }))
+    .ok()
+}
+
+fn verify_section_caps_on_device(device: &wgpu::Device, queue: &wgpu::Queue, label: &str) {
+    let mut host = ViewportHost::new(
+        device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [200, 200],
+            ..ViewportConfig::default()
+        },
+    )
+    .ok()
+    .into_iter()
+    .next();
+    let Some(mut host) = host.take() else {
+        return;
+    };
+    if !host.supports_stencil(device) {
+        return;
+    }
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut box_mesh = Mesh3D::at_origin(Vec3::ZERO);
+    box_mesh.push_box(
+        Vec3::new(-1.5, -1.5, -2.0),
+        Vec3::new(1.5, 1.5, 2.0),
+        [185, 185, 185, 255],
+        PickId::new(1, 501, 0),
+        false,
+    );
+    let chunk = scene.insert(box_mesh);
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(device, queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(device, queue).ok()
+    };
+
+    // View from +Z looking down into a Z <= 0 cut plane (kept side is -Z).
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+
+    // 1. Caps disabled (zero-tax default): stays Depth32Float and interior shows neutral gray.
+    let img_off = render(&mut host, &mut scene);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT, "{label}: caps off depth");
+    if let Some(img) = img_off
+        && let Some(px) = img.pixel(100, 100)
+    {
+        assert!(
+            px[0].abs_diff(px[1]) <= 8 && px[1].abs_diff(px[2]) <= 8 && px[0] > 50,
+            "{label}: uncapped cut interior must show neutral gray back-face, got {px:?}"
+        );
+    }
+
+    // 2. Enable solid red section cap: upgrades to Depth32FloatStencil8 and fills center red.
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    let img_solid = render(&mut host, &mut scene);
+    assert_eq!(
+        host.depth_format(),
+        DEPTH_STENCIL_FORMAT,
+        "{label}: caps on depth"
+    );
+    if let Some(img) = img_solid {
+        if let Some(center) = img.pixel(100, 100) {
+            assert!(
+                center[0] > 200 && center[1] < 55 && center[2] < 55,
+                "{label}: solid red cap must fill cut center, got {center:?}"
+            );
+        }
+        if let Some(corner) = img.pixel(5, 5) {
+            assert!(
+                corner[0] < 30 && corner[1] < 30 && corner[2] < 35,
+                "{label}: background outside solid must stay dark, got {corner:?}"
+            );
+        }
+    }
+
+    // 3. View from the KEPT side (-Z looking toward +Z): cut face is not viewer-facing -> no cap.
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, -5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+    if let Some(img_back) = render(&mut host, &mut scene)
+        && let Some(center) = img_back.pixel(100, 100)
+    {
+        assert!(
+            center[0].abs_diff(center[2]) <= 12 && center[0] > 60,
+            "{label}: kept-side exterior face must not be capped red, got {center:?}"
+        );
+    }
+
+    // 4. Opposing parallel clip planes (slab cut: -0.5 <= z <= +0.5).
+    //    Pass A must clip ONLY by the active plane so the far back face at z=-2 still stamps stencil!
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let (Some(p_hi), Some(p_lo)) = (
+        Plane::from_normal_point(-Vec3::Z, Vec3::new(0.0, 0.0, 0.5)),
+        Plane::from_normal_point(Vec3::Z, Vec3::new(0.0, 0.0, -0.5)),
+    ) {
+        host.camera_mut().set_clip_planes(&[p_hi, p_lo]);
+    }
+    if let Some(img_slab) = render(&mut host, &mut scene)
+        && let Some(center) = img_slab.pixel(100, 100)
+    {
+        assert!(
+            center[0] > 200 && center[1] < 55 && center[2] < 55,
+            "{label}: opposing parallel slab cut must still cap cleanly, got {center:?}"
+        );
+    }
+
+    // 5. Two perpendicular clip planes (corner cutaway: x >= 0 AND y >= 0, viewed from (-4, -4, 0)).
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(-4.5, -4.5, 0.0),
+        Vec3::new(0.5, 0.5, 0.0),
+        Vec3::Z,
+        55_f64.to_radians(),
+        0.1,
+    );
+    if let (Some(px_plane), Some(py_plane)) = (
+        Plane::from_normal_point(Vec3::X, Vec3::ZERO),
+        Plane::from_normal_point(Vec3::Y, Vec3::ZERO),
+    ) {
+        host.camera_mut().set_clip_planes(&[px_plane, py_plane]);
+    }
+    if let Some(img_corner) = render(&mut host, &mut scene) {
+        let mut red_left = 0usize;
+        let mut red_right = 0usize;
+        for y in 70..130 {
+            for x in 30..98 {
+                if let Some(p) = img_corner.pixel(x, y)
+                    && p[0] > 190
+                    && p[1] < 60
+                    && p[2] < 60
+                {
+                    red_left += 1;
+                }
+            }
+            for x in 102..170 {
+                if let Some(p) = img_corner.pixel(x, y)
+                    && p[0] > 190
+                    && p[1] < 60
+                    && p[2] < 60
+                {
+                    red_right += 1;
+                }
+            }
+        }
+        assert!(
+            red_left > 100 && red_right > 100,
+            "{label}: corner cutaway must cap both x=0 and y=0 faces (left={red_left}, right={red_right})"
+        );
+    }
+
+    // 6. Hatch vs CrossHatch patterns on a clean Z <= 0 cut.
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+    let count_white_and_blue = |img: &iletki_wgpu::RgbaImage| -> (usize, usize) {
+        let mut white = 0usize;
+        let mut blue = 0usize;
+        for y in 60..140 {
+            for x in 60..140 {
+                if let Some(p) = img.pixel(x, y) {
+                    if p[0] > 210 && p[1] > 210 && p[2] > 210 {
+                        white += 1;
+                    } else if p[2] > p[0].saturating_add(80) && p[2] > 150 {
+                        blue += 1;
+                    }
+                }
+            }
+        }
+        (white, blue)
+    };
+    scene.set_section_caps(SectionCapConfig {
+        hatch_width_px: 2.5,
+        ..SectionCapConfig::hatch([0.96, 0.96, 0.96, 1.0], [0.05, 0.1, 0.96, 1.0], 0.35)
+    });
+    let (hatch_white, hatch_blue) = render(&mut host, &mut scene)
+        .map(|img| count_white_and_blue(&img))
+        .unwrap_or((0, 0));
+    assert!(
+        hatch_white > 1000 && hatch_blue > 150,
+        "{label}: hatch cap must show both white base ({hatch_white}) and blue hatch lines ({hatch_blue})"
+    );
+
+    scene.set_section_caps(SectionCapConfig {
+        hatch_width_px: 2.5,
+        ..SectionCapConfig::cross_hatch([0.96, 0.96, 0.96, 1.0], [0.05, 0.1, 0.96, 1.0], 0.35)
+    });
+    assert_eq!(scene.section_caps().pattern, SectionCapPattern::CrossHatch);
+    let (cross_white, cross_blue) = render(&mut host, &mut scene)
+        .map(|img| count_white_and_blue(&img))
+        .unwrap_or((0, 0));
+    assert!(
+        cross_white > 500 && cross_blue > hatch_blue,
+        "{label}: cross-hatch must add perpendicular blue lines ({cross_blue} > {hatch_blue}, white={cross_white})"
+    );
+
+    // 6b. Hollow thick-walled room (outer CCW box + inner inward-facing cavity):
+    //     Two-sided stencil wrap must cap ONLY the solid walls and leave the hollow interior open!
+    let mut hollow = Mesh3D::at_origin(Vec3::ZERO);
+    hollow.push_box(
+        Vec3::new(-1.5, -1.5, -2.0),
+        Vec3::new(1.5, 1.5, 2.0),
+        [185, 185, 185, 255],
+        PickId::new(1, 502, 0),
+        false,
+    );
+    let inner_start = hollow.vertices.len();
+    hollow.push_box(
+        Vec3::new(-0.7, -0.7, -1.5),
+        Vec3::new(0.7, 0.7, 1.5),
+        [160, 160, 160, 255],
+        PickId::new(1, 503, 0),
+        false,
+    );
+    // Flip inner cavity triangles to inward-facing (hollow void inside solid shell).
+    if let Some(inner) = hollow.vertices.get_mut(inner_start..) {
+        for tri in inner.as_chunks_mut::<3>().0 {
+            tri.swap(1, 2);
+            for v in tri.iter_mut() {
+                v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+            }
+        }
+    }
+    scene.remove(chunk);
+    let hollow_chunk = scene.insert(hollow);
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    if let Some(img_hollow) = render(&mut host, &mut scene) {
+        // Center (x=0, y=0) is inside the hollow cavity -> stencil == 0 -> NOT capped red.
+        if let Some(cavity) = img_hollow.pixel(100, 100) {
+            assert!(
+                cavity[0].abs_diff(cavity[2]) <= 15 && cavity[0] < 200,
+                "{label}: hollow cavity interior must stay uncapped gray, got {cavity:?}"
+            );
+        }
+        // Solid wall cross-section (between 0.7 and 1.5 -> ~35 px off center) MUST be capped red.
+        let wall_red = (128..146)
+            .filter_map(|x| img_hollow.pixel(x, 100))
+            .filter(|p| p[0] > 200 && p[1] < 55 && p[2] < 55)
+            .count();
+        assert!(
+            wall_red >= 8,
+            "{label}: solid wall cross-section around hollow cavity must be capped red, got {wall_red} px"
+        );
+    }
+
+    // 7. Large-world UTM coordinates + Ortho3D + Transparent InfiniteGrid3DLayer + MRT + Pick.
+    scene.remove(hollow_chunk);
+    let utm = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+    let mut utm_mesh = Mesh3D::at_origin(utm);
+    utm_mesh.push_box(
+        Vec3::new(-2.0, -2.0, -2.0),
+        Vec3::new(2.0, 2.0, 2.0),
+        [180, 180, 180, 255],
+        PickId::new(1, 777, 0),
+        false,
+    );
+    let _utm_chunk = scene.insert(utm_mesh);
+    scene.set_section_caps(SectionCapConfig::solid([0.1, 0.92, 0.2, 1.0]));
+    *host.camera_mut() = Camera::ortho_3d(utm + Vec3::Z * 10.0, utm, Vec3::Y, 6.0, 0.1, 50.0);
+    if let Some(utm_plane) = Plane::from_normal_point(-Vec3::Z, utm) {
+        host.camera_mut().set_clip_planes(&[utm_plane]);
+    }
+    let mut grid = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
+    let supports_mrt = host.supports_color_frame_selection(device);
+    if supports_mrt {
+        host.set_color_frame_selection_rect(Some([50, 50, 100, 100]));
+    }
+    {
+        let mut enc = device.create_command_encoder(&Default::default());
+        let mut layers: [&mut dyn ViewportLayer<()>; 2] = [&mut scene, &mut grid];
+        host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
+        queue.submit([enc.finish()]);
+    }
+    if let Ok(img_utm) = host.readback_rgba_blocking(device, queue)
+        && let Some(center) = img_utm.pixel(100, 100)
+    {
+        assert!(
+            center[1] > 190 && center[0] < 60 && center[2] < 80,
+            "{label}: UTM Ortho3D cap must fill cut center green, got {center:?}"
+        );
+    }
+    if supports_mrt {
+        if let Some(mut pending) = host.take_color_frame_selection_preview(device) {
+            let slots = loop {
+                match pending.try_read() {
+                    Poll::Ready(res) => break res.ok(),
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            };
+            assert!(
+                slots.as_ref().is_some_and(|s| !s.is_empty()),
+                "{label}: MRT preview with active section caps must still report visible chunk"
+            );
+        }
+        host.set_color_frame_selection_rect(None);
+    }
+    if let Ok(hits) =
+        host.pick_rect_blocking(device, queue, &(), &mut [&mut scene], [80, 80, 40, 40])
+    {
+        assert!(
+            hits.iter().any(|h| h.id.object == 777),
+            "{label}: exact 64-bit pick must still hit UTM box under active section caps"
+        );
+    }
+
+    // 8. Disabling section caps cleanly downgrades viewport back to Depth32Float.
+    scene.set_section_caps(SectionCapConfig::default());
+    let _img_disabled = render(&mut host, &mut scene);
+    assert_eq!(
+        host.depth_format(),
+        DEPTH_FORMAT,
+        "{label}: disabling caps must downgrade depth format back to Depth32Float"
+    );
+}
+
+#[test]
+fn section_caps_solid_hatch_multiplane_and_utm_precision() {
+    if let Some((device, queue)) = create_headless_device() {
+        verify_section_caps_on_device(&device, &queue, "discard_fallback");
+    }
+    if let Some((device, queue)) = create_device_with_clip_distances() {
+        verify_section_caps_on_device(&device, &queue, "clip_distances");
+    }
+}
+
+#[test]
+fn section_caps_multi_viewport_and_continuous_mode_isolated() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host_a = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            mode: ViewportMode::Continuous,
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    let mut host_b = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            mode: ViewportMode::OnDemand,
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    if !host_a.supports_stencil(&device) {
+        return;
+    }
+
+    // Viewport A: sliced at z <= 0, viewing cut face from +Z (should show bright red cap).
+    *host_a.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    host_a
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap()]);
+
+    // Viewport B: sliced at x >= 0, viewing from -X (different clip plane in the same encoder!).
+    *host_b.camera_mut() = Camera::perspective_3d(
+        Vec3::new(-5.0, 0.0, 0.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        50_f64.to_radians(),
+        0.1,
+    );
+    host_b
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(Vec3::X, Vec3::ZERO).unwrap()]);
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+    mesh.push_box(
+        Vec3::new(-1.5, -1.5, -1.5),
+        Vec3::new(1.5, 1.5, 1.5),
+        [185, 185, 185, 255],
+        PickId::new(1, 900, 0),
+        false,
+    );
+    scene.insert(mesh);
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+
+    // Render BOTH viewports into one shared CommandEncoder (quad-view pattern).
+    let mut encoder = device.create_command_encoder(&Default::default());
+    host_a.render_to_texture(&device, &queue, &mut encoder, &(), &mut [&mut scene]);
+    host_b.render_to_texture(&device, &queue, &mut encoder, &(), &mut [&mut scene]);
+    queue.submit([encoder.finish()]);
+
+    let img_a = host_a.readback_rgba_blocking(&device, &queue).unwrap();
+    let img_b = host_b.readback_rgba_blocking(&device, &queue).unwrap();
+    let px_a = img_a.pixel(64, 64).unwrap();
+    let px_b = img_b.pixel(64, 64).unwrap();
+    assert!(
+        px_a[0] > 200 && px_a[1] < 55 && px_a[2] < 55,
+        "Continuous MSAA viewport A must show solid red cap, got {px_a:?}"
+    );
+    assert!(
+        px_b[0] > 200 && px_b[1] < 55 && px_b[2] < 55,
+        "OnDemand viewport B with distinct clip plane in same encoder must also cap cleanly, got {px_b:?}"
+    );
+    assert_eq!(host_a.depth_format(), DEPTH_STENCIL_FORMAT);
+    assert_eq!(host_b.depth_format(), DEPTH_STENCIL_FORMAT);
+
+    // Also verify 1x MSAA + 144 repeated packed boxes (exercises packed/repeated/GPU-cull stencil paths).
+    let mut host_1x = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 1,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [160, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host_1x.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, 0.0, 12.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        16.0,
+        0.1,
+        50.0,
+    );
+    host_1x
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap()]);
+    let mut packed_scene = Scene3DLayer::new(2);
+    for idx in 0..144 {
+        let gx = f64::from(idx % 12) * 1.2 - 6.6;
+        let gy = f64::from(idx / 12) * 1.2 - 6.6;
+        let mut m = Mesh3D::at_origin(Vec3::new(gx, gy, 0.0));
+        m.push_box(
+            Vec3::new(-0.45, -0.45, -1.0),
+            Vec3::new(0.45, 0.45, 1.0),
+            [180, 180, 180, 255],
+            PickId::new(1, idx + 1, 0),
+            false,
+        );
+        packed_scene.insert(m);
+    }
+    packed_scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    let mut enc = device.create_command_encoder(&Default::default());
+    host_1x.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut packed_scene]);
+    queue.submit([enc.finish()]);
+    let img_1x = host_1x.readback_rgba_blocking(&device, &queue).unwrap();
+    let red_pixels = img_1x
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] > 200 && p[1] < 55 && p[2] < 55)
+        .count();
+    assert!(
+        red_pixels > 2000,
+        "1x MSAA 144-box repeated/packed scene must cap cross-sections cleanly, got {red_pixels} red pixels"
+    );
 }

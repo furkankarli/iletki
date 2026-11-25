@@ -16,6 +16,9 @@ use crate::objects::{
 use crate::outline_bounds::OutlineUpdate;
 use crate::provoking::{self, DedupScratch};
 use crate::section::SectionAa;
+use crate::section_cap::{
+    SectionCapConfig, SectionCapPipelines, ViewSectionCaps, compute_visible_cap_planes,
+};
 use crate::shading::ScenePipelines;
 use crate::storage_batch::{self, ChunkTransformTable, StorageDraws, StorageViewBinding};
 use crate::vertex::Mesh3D;
@@ -23,7 +26,10 @@ use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
-use iletki_wgpu::{GpuCullCtx, LayerRevision, PaintCtx, PrepareCtx, ViewportLayer};
+use iletki_wgpu::{
+    GpuCullCtx, LayerRevision, PaintCtx, PassHookCtx, PassHookMask, PassHookStage, PrepareCtx,
+    ViewportLayer,
+};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{
@@ -227,6 +233,12 @@ pub struct Scene3DLayer {
     geometry_revision: u64,
     pipelines: Option<ScenePipelines>,
     materials: MaterialTable,
+    section_caps: SectionCapConfig,
+    section_cap_pipelines: Option<SectionCapPipelines>,
+    shared_stencil_draws: StorageDraws,
+    shared_stencil_direct: Vec<usize>,
+    shared_stencil_rev: u64,
+    cap_bounds_cache: (Option<LayerRevision>, Option<Bounds3>, bool),
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
     /// Compact per-slot generation (`0` = vacant) for cache-hot `chunk_id_at_slot` / `set_selected`.
@@ -309,6 +321,12 @@ impl Scene3DLayer {
             geometry_revision: 1,
             pipelines: None,
             materials: MaterialTable::new(),
+            section_caps: SectionCapConfig::default(),
+            section_cap_pipelines: None,
+            shared_stencil_draws: StorageDraws::default(),
+            shared_stencil_direct: Vec::new(),
+            shared_stencil_rev: 0,
+            cap_bounds_cache: (None, None, false),
             use_antialiased_section: false,
             chunks: Vec::new(),
             chunk_generations: Vec::new(),
@@ -704,6 +722,9 @@ impl Scene3DLayer {
             self.shared_mask_rev = 0;
             self.shared_mask_bounds_rev = 0;
             self.shared_selected_envelope = None;
+            self.shared_stencil_draws.clear();
+            self.shared_stencil_direct.clear();
+            self.shared_stencil_rev = 0;
             for view in &mut self.views {
                 view.faces.clear();
                 view.edges.clear();
@@ -712,6 +733,9 @@ impl Scene3DLayer {
                 view.storage_edges.clear();
                 view.gpu_cull_active = false;
                 view.retained_full_scene = false;
+                if let Some(caps) = view.section_caps.as_mut() {
+                    caps.clear_active();
+                }
             }
             self.revision.mark_static();
         }
@@ -834,6 +858,34 @@ impl Scene3DLayer {
             .map(|entry| entry.material_id)
     }
 
+    /// Configures GPU stencil section caps for solid cross-sections sliced by active camera clip
+    /// planes.
+    ///
+    /// Disabled by default (`SectionCapConfig::default().enabled == false`), incurring zero stencil
+    /// VRAM, zero extra pipelines and zero extra passes until enabled.
+    pub fn set_section_caps(&mut self, config: SectionCapConfig) {
+        if self.section_caps == config {
+            return;
+        }
+        self.section_caps = config;
+        if !config.enabled {
+            self.section_cap_pipelines = None;
+            self.shared_stencil_draws.clear();
+            self.shared_stencil_direct.clear();
+            self.shared_stencil_rev = 0;
+            for view in &mut self.views {
+                view.section_caps = None;
+            }
+        }
+        self.revision.mark_static();
+    }
+
+    /// Returns the active [`SectionCapConfig`] for this scene.
+    #[must_use]
+    pub fn section_caps(&self) -> SectionCapConfig {
+        self.section_caps
+    }
+
     /// Releases per-viewport binding sets for closed viewports and returns the number released.
     ///
     /// The layer also prunes closed bindings before preparing a viewport.
@@ -856,7 +908,219 @@ impl Scene3DLayer {
             return;
         }
         self.views.clear();
+        self.section_cap_pipelines = None;
         self.pipelines = Some(ScenePipelines::build(ctx, want_storage));
+    }
+
+    fn cap_scene_bounds(&mut self) -> (Option<Bounds3>, bool) {
+        let rev = self.revision.static_only();
+        if self.cap_bounds_cache.0 == Some(rev) {
+            return (self.cap_bounds_cache.1, self.cap_bounds_cache.2);
+        }
+        let mut bounds = Bounds3::EMPTY;
+        let mut untrusted = false;
+        for chunk in self.chunks.iter().flatten() {
+            if !chunk.visible
+                || chunk.vertex_count == 0
+                || chunk.has_translucent
+                || self.materials.is_translucent(chunk.material_id)
+            {
+                continue;
+            }
+            if chunk.section_bounds_trusted
+                && !chunk.local_bounds.is_empty()
+                && chunk.origin.is_finite()
+            {
+                let wmin = chunk.origin + chunk.local_bounds.min;
+                let wmax = chunk.origin + chunk.local_bounds.max;
+                if wmin.is_finite() && wmax.is_finite() {
+                    bounds.include(wmin);
+                    bounds.include(wmax);
+                } else {
+                    untrusted = true;
+                }
+            } else {
+                untrusted = true;
+            }
+        }
+        let result = (!bounds.is_empty()).then_some(bounds);
+        self.cap_bounds_cache = (Some(rev), result, untrusted);
+        (result, untrusted)
+    }
+
+    fn prepare_section_caps<W>(
+        &mut self,
+        ctx: &PrepareCtx<'_, W>,
+        view_index: usize,
+        use_storage: bool,
+    ) {
+        if !self.section_caps.enabled || !ctx.depth_format.has_stencil_aspect() {
+            if let Some(caps) = self
+                .views
+                .get_mut(view_index)
+                .and_then(|v| v.section_caps.as_mut())
+            {
+                caps.clear_active();
+            }
+            return;
+        }
+        if ctx.camera.clip_planes().is_empty() {
+            if let Some(caps) = self
+                .views
+                .get_mut(view_index)
+                .and_then(|v| v.section_caps.as_mut())
+            {
+                caps.clear_active();
+            }
+            return;
+        }
+
+        let (bounds, untrusted) = self.cap_scene_bounds();
+        let visible_planes = compute_visible_cap_planes(
+            ctx.camera,
+            bounds,
+            untrusted,
+            ctx.dpi_scale,
+            self.section_caps,
+        );
+        if visible_planes.is_empty() {
+            if let Some(caps) = self
+                .views
+                .get_mut(view_index)
+                .and_then(|v| v.section_caps.as_mut())
+            {
+                caps.clear_active();
+            }
+            return;
+        }
+
+        let Some(p) = self.pipelines.as_ref() else {
+            return;
+        };
+        let has_storage = p.storage.is_some();
+        let has_packed = p.packed.is_some();
+        if !self
+            .section_cap_pipelines
+            .as_ref()
+            .is_some_and(|cap_pl| cap_pl.matches(ctx, has_storage, has_packed))
+        {
+            let use_either = p.flat_support.is_some_and(|s| s.use_either)
+                || ctx.device.adapter_info().backend == wgpu::Backend::Gl;
+            self.section_cap_pipelines = Some(SectionCapPipelines::build(
+                ctx,
+                p.vertex_layout,
+                &p.object_layout,
+                p.packed.as_ref().map(|pk| &pk.layout),
+                p.storage.as_ref().map(|st| &st.layout),
+                use_either,
+            ));
+            for v in &mut self.views {
+                v.section_caps = None;
+            }
+        }
+        let Some(cap_pl) = self.section_cap_pipelines.as_ref() else {
+            return;
+        };
+        let dynamic_uniforms = p.dynamic_uniforms;
+
+        if use_storage && self.shared_stencil_rev != self.geometry_revision {
+            self.shared_stencil_direct.clear();
+            let chunks = &self.chunks;
+            let materials = &self.materials;
+            let direct = &mut self.shared_stencil_direct;
+            let packed_iter = chunks.iter().enumerate().filter_map(|(slot, entry)| {
+                let chunk = entry.as_ref()?;
+                if chunk.vertex_count == 0
+                    || chunk.has_translucent
+                    || materials.is_translucent(chunk.material_id)
+                {
+                    return None;
+                }
+                let geometry = chunk.vertex_buf.as_ref()?;
+                if geometry.is_direct() {
+                    direct.push(slot);
+                    return None;
+                }
+                Some((slot, geometry))
+            });
+            self.shared_stencil_draws
+                .rebuild_unordered(ctx.device, ctx.queue, packed_iter);
+            self.shared_stencil_rev = self.geometry_revision;
+        }
+
+        let cam_pos = ctx.camera.position_3d();
+        let Some(view) = self.views.get_mut(view_index) else {
+            return;
+        };
+        let view_caps = view
+            .section_caps
+            .get_or_insert_with(|| ViewSectionCaps::new(ctx.device, cap_pl, dynamic_uniforms));
+        view_caps.use_storage = use_storage;
+        view_caps.upload_planes(ctx.queue, &visible_planes);
+        view_caps.clear_draws();
+
+        if use_storage {
+            for &chunk_idx in &self.shared_stencil_direct {
+                if let Some(Some(chunk)) = self.chunks.get(chunk_idx)
+                    && chunk.visible
+                    && chunk.vertex_count != 0
+                {
+                    view_caps.push_direct(
+                        chunk_idx,
+                        ObjectUniforms {
+                            offset_rel: (chunk.origin - cam_pos).to_f32(),
+                            scale: 1.0,
+                        },
+                    );
+                }
+            }
+            view_caps.upload_direct_uniforms(ctx.device, ctx.queue, &p.object_layout);
+        } else {
+            let projection = ctx.camera.view_proj_relative(ctx.logical_size);
+            let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
+            let packed_layout = p.packed.as_ref().map(|pk| &pk.layout);
+            for (chunk_idx, entry) in self.chunks.iter().enumerate() {
+                let Some(chunk) = entry else { continue };
+                if !chunk.visible
+                    || chunk.vertex_count == 0
+                    || chunk.has_translucent
+                    || self.materials.is_translucent(chunk.material_id)
+                {
+                    continue;
+                }
+                if chunk.section_bounds_trusted && !chunk.local_bounds.is_empty() {
+                    let world = Bounds3::from_corners(
+                        chunk.origin + chunk.local_bounds.min,
+                        chunk.origin + chunk.local_bounds.max,
+                    );
+                    if !world.is_empty() && !frustum.intersects_bounds_world(world, cam_pos) {
+                        continue;
+                    }
+                }
+                let Some(geometry) = chunk.vertex_buf.as_ref() else {
+                    continue;
+                };
+                let uniforms = ObjectUniforms {
+                    offset_rel: (chunk.origin - cam_pos).to_f32(),
+                    scale: 1.0,
+                };
+                if packed_layout.is_some() && !geometry.is_direct() {
+                    view_caps
+                        .fallback_packed
+                        .push(geometry, uniforms, chunk_idx);
+                } else {
+                    view_caps.push_direct(chunk_idx, uniforms);
+                }
+            }
+            if let Some(layout) = packed_layout
+                && view_caps.fallback_packed.has_packed()
+            {
+                view_caps
+                    .fallback_packed
+                    .upload(ctx.device, layout, ctx.queue);
+            }
+            view_caps.upload_direct_uniforms(ctx.device, ctx.queue, &p.object_layout);
+        }
     }
 
     fn ensure_select_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
@@ -1189,6 +1453,176 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
     fn revision(&self) -> LayerRevision {
         self.revision
+    }
+
+    fn requires_stencil(&self, _viewport_id: ViewportId) -> bool {
+        self.section_caps.enabled
+    }
+
+    fn pass_hooks(&self, viewport_id: ViewportId) -> PassHookMask {
+        if !self.section_caps.enabled || self.section_cap_pipelines.is_none() {
+            return PassHookMask::NONE;
+        }
+        let active = self.views.iter().any(|view| {
+            view.id == viewport_id
+                && !view.picking
+                && view
+                    .section_caps
+                    .as_ref()
+                    .is_some_and(ViewSectionCaps::is_active)
+        });
+        if active {
+            PassHookMask::POST_OPAQUE
+        } else {
+            PassHookMask::NONE
+        }
+    }
+
+    fn encode_pass_hook(
+        &mut self,
+        stage: PassHookStage,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &PassHookCtx<'_, W>,
+    ) {
+        if stage != PassHookStage::PostOpaque
+            || !self.section_caps.enabled
+            || !ctx.depth_format.has_stencil_aspect()
+        {
+            return;
+        }
+        let [aw, ah] = ctx.active_px;
+        if aw == 0 || ah == 0 {
+            return;
+        }
+        let (Some(p), Some(cap_pl)) = (&self.pipelines, &self.section_cap_pipelines) else {
+            return;
+        };
+        let Some(view) = self
+            .views
+            .iter()
+            .find(|view| view.id == ctx.viewport_id && !view.picking)
+        else {
+            return;
+        };
+        let Some(view_caps) = view.section_caps.as_ref() else {
+            return;
+        };
+        let plane_count = view_caps.visible_count();
+        if plane_count == 0 {
+            return;
+        }
+        let storage_bg = view
+            .storage_binding
+            .as_ref()
+            .and_then(StorageViewBinding::bind_group);
+
+        for slot in 0..plane_count {
+            let (Some(plane_bg), Some(quad_bg)) = (
+                view_caps.plane_bind_group(slot),
+                view_caps.quad_bind_group(slot),
+            ) else {
+                continue;
+            };
+
+            // Pass A: Two-sided stencil mark clipped strictly by this clip plane alone.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iletki-3d section cap stencil"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: ctx.depth_stencil_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, aw, ah);
+                pass.set_bind_group(0, ctx.camera_bind_group, &[]);
+
+                if !view_caps.direct_chunks.is_empty() {
+                    pass.set_pipeline(&cap_pl.direct_stencil);
+                    pass.set_bind_group(2, plane_bg, &[]);
+                    for (direct_idx, &chunk_idx) in view_caps.direct_chunks.iter().enumerate() {
+                        if let Some(Some(chunk)) = self.chunks.get(chunk_idx)
+                            && chunk.visible
+                            && let Some(geometry) = chunk.vertex_buf.as_ref()
+                            && view_caps.bind_direct(&mut pass, direct_idx, p.dynamic_uniforms)
+                        {
+                            geometry.draw_direct_position(&mut pass, chunk.vertex_count);
+                        }
+                    }
+                }
+
+                if view_caps.use_storage {
+                    if self.shared_stencil_draws.has_packed()
+                        && let (Some(storage_pl), Some(st_bg)) =
+                            (&cap_pl.storage_stencil, storage_bg)
+                    {
+                        pass.set_bind_group(2, plane_bg, &[]);
+                        self.shared_stencil_draws.paint_position_only(
+                            &mut pass,
+                            st_bg,
+                            storage_pl,
+                            cap_pl.storage_repeated_stencil.as_ref(),
+                            |_, _| {},
+                        );
+                    }
+                } else if view_caps.fallback_packed.has_packed()
+                    && let Some(packed_pl) = &cap_pl.packed_stencil
+                {
+                    pass.set_bind_group(2, plane_bg, &[]);
+                    view_caps
+                        .fallback_packed
+                        .paint_position_only(&mut pass, packed_pl, |_, _| {});
+                }
+            }
+
+            // Pass B: Plane-aligned cap quad filling nonzero stencil pixels and writing cap depth.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iletki-3d section cap fill"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ctx.color_attachment_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: ctx.depth_stencil_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_viewport(0.0, 0.0, aw as f32, ah as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, aw, ah);
+                pass.set_stencil_reference(0);
+                pass.set_pipeline(&cap_pl.cap_quad);
+                pass.set_bind_group(0, ctx.camera_bind_group, &[]);
+                pass.set_bind_group(1, quad_bg, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        }
     }
 
     fn prepare(&mut self, ctx: &mut PrepareCtx<'_, W>) -> bool {
@@ -1658,6 +2092,15 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 );
             }
         }
+        if picking.is_none() {
+            self.prepare_section_caps(ctx, index, use_storage);
+        }
+        let Some(p) = self.pipelines.as_ref() else {
+            return pending;
+        };
+        let Some(view) = self.views.get_mut(index) else {
+            return pending;
+        };
         if picking.is_none() {
             let update = {
                 #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
