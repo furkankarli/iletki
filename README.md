@@ -136,9 +136,11 @@ The example needs a working `wgpu` adapter.
 ## Platform tests
 
 The [CI workflow](.github/workflows/ci.yml) checks rendered pixels and 64-bit picking on
-Linux/Vulkan (Mesa lavapipe), Windows/DX12, macOS/Metal, and Chrome/WebGPU (SwiftShader).
-Each job requires its named backend. These headless tests cover offscreen rendering and picking.
-The standalone egui example also checks compositing into an egui render pass.
+Linux/Vulkan (Mesa lavapipe), Linux/OpenGL (Mesa llvmpipe), Windows/DX12, macOS/Metal,
+and Chrome/WebGPU. Each job requires its named backend. These headless tests cover
+offscreen rendering, live section clipping, selection outlines, MRT selection previews,
+and 64-bit picking. CI also runs the standalone egui example (compositing into an egui
+render pass) and the standalone Slint example (`--smoke`).
 
 ## Support iletki
 
