@@ -150,6 +150,7 @@ fn instanced_100k_3d_boxes_single_draw_call_and_pick() {
             clear_color: [0.05, 0.05, 0.08, 1.0],
             mode: ViewportMode::Continuous,
             initial_px: [256, 256],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
             ..ViewportConfig::default()
         },
     )
@@ -250,6 +251,7 @@ fn quad_view_four_viewports_share_one_scene_in_single_encoder() {
                 clear_color: [0.08, 0.09, 0.11, 1.0],
                 mode: ViewportMode::OnDemand,
                 initial_px: [128, 128],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
                 ..ViewportConfig::default()
             },
         )
@@ -600,6 +602,7 @@ fn multisampled_outline_preserves_edge_coverage_at_large_screen_coordinates() {
                     color: [1.0, 0.0, 0.0, 1.0],
                     width_px: 3.0,
                 },
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
                 ..Default::default()
             },
         )

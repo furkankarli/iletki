@@ -71,6 +71,7 @@ fn separate_vertex_streams_match_the_interleaved_fallback() {
             device,
             ViewportConfig {
                 initial_px: [192, 192],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
                 ..ViewportConfig::default()
             },
         )
@@ -105,9 +106,15 @@ fn separate_vertex_streams_match_the_interleaved_fallback() {
         assert_eq!(hits.len(), 144);
         (pixels, hits)
     };
+    let (sep_pixels, sep_hits) = render(&device, &queue);
+    let (int_pixels, int_hits) = render(&fallback_device, &fallback_queue);
     assert_eq!(
-        render(&device, &queue),
-        render(&fallback_device, &fallback_queue)
+        sep_hits, int_hits,
+        "separate vs interleaved pick hits differed"
+    );
+    assert!(
+        sep_pixels == int_pixels,
+        "separate vs interleaved rendered pixels differed"
     );
 }
 
@@ -361,7 +368,14 @@ fn single_pixel_pick_keeps_the_section_face_at_fractional_dpi() {
         return;
     };
     let center = Vec3::new(1_000_000_000.25, -2_000_000_000.5, 20.0);
-    let mut host = ViewportHost::new(&device, ViewportConfig::default()).unwrap();
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
     host.resize(&device, [127, 93], 1.75);
     *host.camera_mut() = Camera::perspective_3d(
         center - Vec3::Y * 2.0,
@@ -575,32 +589,53 @@ fn indexed_flat_and_smooth_geometry_match_unindexed_with_exact_picks() {
             !ref_hits.is_empty(),
             "expected pick hits (section={with_section})"
         );
-        if device.adapter_info().backend == iletki_wgpu::wgpu::Backend::Gl {
-            // OpenGL uses `Last` provoking corner, so flat indexing rotates each triangle's
-            // vertex order (a,b,c) -> (b,c,a); software rasterizers (llvmpipe) can differ by
-            // 1 ULP in interpolated depth while returning the exact same PickIds.
-            assert_eq!(
-                idx_hits.len(),
-                ref_hits.len(),
-                "indexed pick count must match (section={with_section})"
+        // Provoking-vertex flat indexing rotates each triangle's vertex order
+        // (a,b,c) -> (b,c,a)/(c,a,b) so each triangle's provoking corner lands at the
+        // backend's provoking slot. Software rasterizers (Lavapipe, WARP, llvmpipe) and
+        // tiled GPUs (Apple Metal) can differ by ~1 ULP in interpolated depth from the
+        // rotated edge equations while returning the exact same PickId set and world positions.
+        assert_eq!(
+            idx_hits.len(),
+            ref_hits.len(),
+            "indexed pick count must match (section={with_section})"
+        );
+        assert!(
+            idx_hits.windows(2).all(|w| w[0].depth >= w[1].depth),
+            "indexed pick hits must stay sorted nearest-first (section={with_section})"
+        );
+        let ref_by_id: std::collections::HashMap<_, _> =
+            ref_hits.iter().map(|hit| (hit.id, hit)).collect();
+        assert_eq!(
+            ref_by_id.len(),
+            ref_hits.len(),
+            "reference pick hits must have unique IDs (section={with_section})"
+        );
+        for idx in &idx_hits {
+            let r = ref_by_id.get(&idx.id).unwrap_or_else(|| {
+                panic!(
+                    "indexed pick returned unexpected PickId {:?} (section={with_section})",
+                    idx.id
+                )
+            });
+            assert!(
+                (idx.depth - r.depth).abs() <= 1e-5,
+                "indexed pick depth diverged for {:?}: {} vs {} (section={with_section})",
+                idx.id,
+                idx.depth,
+                r.depth
             );
-            for (idx, r) in idx_hits.iter().zip(ref_hits.iter()) {
-                assert_eq!(
-                    idx.id, r.id,
-                    "indexed pick ID must match on GL (section={with_section})"
-                );
-                assert!(
-                    (idx.depth - r.depth).abs() <= 1e-5,
-                    "indexed pick depth diverged on GL: {} vs {} (section={with_section})",
-                    idx.depth,
-                    r.depth
-                );
+            match (idx.world_pos, r.world_pos) {
+                (Some(a), Some(b)) => assert!(
+                    (a - b).length() <= 1e-3,
+                    "indexed pick world_pos diverged for {:?}: {a:?} vs {b:?} (section={with_section})",
+                    idx.id
+                ),
+                (None, None) => {}
+                (a, b) => panic!(
+                    "indexed pick world_pos presence mismatch for {:?}: {a:?} vs {b:?} (section={with_section})",
+                    idx.id
+                ),
             }
-        } else {
-            assert_eq!(
-                idx_hits, ref_hits,
-                "indexed pick must be bit-exact (section={with_section})"
-            );
         }
         let mut max_delta = 0u8;
         let mut diff_gt1 = 0usize;

@@ -7,7 +7,12 @@ use iletki_core::{Camera, PickId, Plane, Vec3, ViewportMode};
 use iletki_wgpu::{RgbaImage, ViewportConfig, ViewportError, ViewportHost, ViewportLayer, wgpu};
 use std::future::Future;
 use std::pin::pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
+
+// Serialize `wgpu::Instance` / `Adapter` / `Device` initialization across parallel test threads so
+// Vulkan/EGL ICD loaders never race during concurrent instance teardown and creation.
+static DEVICE_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 const SIZE: u32 = 128;
 const COLOR: [u8; 4] = [0, 255, 0, 255];
@@ -25,6 +30,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn adapter() -> Option<wgpu::Adapter> {
+    let _guard = DEVICE_INIT_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = block_on(instance.request_adapter(&Default::default())).ok();
@@ -37,6 +45,26 @@ fn adapter() -> Option<wgpu::Adapter> {
         );
     }
     adapter
+}
+
+fn open_device(
+    shared: Option<&wgpu::Adapter>,
+    desc: &wgpu::DeviceDescriptor<'_>,
+) -> Result<Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)>, wgpu::RequestDeviceError> {
+    let adapter = match shared {
+        Some(a) => a.clone(),
+        None => {
+            let Some(a) = adapter() else {
+                return Ok(None);
+            };
+            a
+        }
+    };
+    let _guard = DEVICE_INIT_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let (device, queue) = block_on(adapter.request_device(desc))?;
+    Ok(Some((adapter, device, queue)))
 }
 
 fn device_features(adapter: &wgpu::Adapter) -> impl Iterator<Item = wgpu::Features> {
@@ -74,22 +102,27 @@ fn render(
 #[test]
 fn packed_live_cut_matches_direct_faces_edges_selection_and_pick() {
     let Some(probe) = adapter() else { return };
+    let is_gl = probe.get_info().backend == wgpu::Backend::Gl;
     let dynamic_limit = wgpu::Limits::default().max_dynamic_uniform_buffers_per_pipeline_layout;
     let combos: Vec<_> = device_features(&probe)
         .flat_map(|features| [(features, dynamic_limit), (features, 0)])
         .collect();
-    drop(probe);
+    let shared_adapter = (!is_gl).then_some(probe);
     for (features, limit) in combos {
-        let Some(adapter) = adapter() else { return };
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: features,
-            required_limits: wgpu::Limits {
-                max_dynamic_uniform_buffers_per_pipeline_layout: limit,
+        let Some((adapter, device, queue)) = open_device(
+            shared_adapter.as_ref(),
+            &wgpu::DeviceDescriptor {
+                required_features: features,
+                required_limits: wgpu::Limits {
+                    max_dynamic_uniform_buffers_per_pipeline_layout: limit,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        }))
-        .unwrap();
+        )
+        .unwrap() else {
+            return;
+        };
         let mut settings = config(4, ViewportMode::OnDemand);
         settings.upload_budget = iletki_core::UploadBudget::UNLIMITED;
         let mut host = ViewportHost::new_with_adapter(&device, &adapter, settings).unwrap();
@@ -393,16 +426,21 @@ fn section_coverage_matches_geometry_in_four_views() {
         ),
     ];
 
+    let is_gl = info.backend == wgpu::Backend::Gl;
     let feature_sets: Vec<_> = device_features(&probe).collect();
-    drop(probe);
+    let shared_adapter = (!is_gl).then_some(probe);
 
     for features in feature_sets {
-        let Some(adapter) = adapter() else { return };
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: features,
-            ..Default::default()
-        }))
-        .unwrap();
+        let Some((adapter, device, queue)) = open_device(
+            shared_adapter.as_ref(),
+            &wgpu::DeviceDescriptor {
+                required_features: features,
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            return;
+        };
         let antialiased = info.backend != wgpu::Backend::Gl && (sampled || !features.is_empty());
         let mut stock = inclined_quad(None).unwrap();
         let mut reference = inclined_quad(Some(plane)).unwrap();
@@ -459,17 +497,20 @@ fn section_clips_cad_lines_and_instances() {
         .flags
         .contains(wgpu::DownlevelFlags::MULTISAMPLED_SHADING);
     let feature_sets: Vec<_> = device_features(&probe).collect();
-    drop(probe);
     for features in feature_sets {
         if !sampled && features.is_empty() {
             continue;
         }
-        let Some(adapter) = adapter() else { return };
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: features,
-            ..Default::default()
-        }))
-        .unwrap();
+        let Some((adapter, device, queue)) = open_device(
+            Some(&probe),
+            &wgpu::DeviceDescriptor {
+                required_features: features,
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            return;
+        };
         let mut host =
             ViewportHost::new_with_adapter(&device, &adapter, config(4, ViewportMode::OnDemand))
                 .unwrap();

@@ -1504,11 +1504,12 @@ impl ViewportHost {
         stats: &mut FrameStats,
     ) {
         let (color_view, resolve_target) = self.targets.output_color_views();
-        let has_second_pass = outline_rect.is_some()
-            || layers.iter().any(|l| {
-                let m = l.phases();
-                m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
-            });
+        let has_gizmo_or_overlay = layers.iter().any(|l| {
+            let m = l.phases();
+            m.contains(DrawPhase::Gizmo) || m.contains(DrawPhase::Overlay)
+        });
+        let fast_outline_1x = !has_gizmo_or_overlay && outline_rect.is_some();
+        let has_second_pass = has_gizmo_or_overlay;
         if let Some(hiz) = use_gpu_cull.then_some(self.hiz_pyramid.as_ref()).flatten() {
             let final_resolve = if has_second_pass {
                 None
@@ -1611,6 +1612,30 @@ impl ViewportHost {
             stats.static_rebuilt = true;
         }
 
+        if fast_outline_1x && let (Some(rect), Some(outline)) = (outline_rect, &self.outline) {
+            // Fast 1x outline-only path: Pass 1 already resolved into `output_view`, so alpha-blend
+            // the Jump-Flood halo directly in 1x without storing/reloading the 4x MSAA color buffer.
+            let gpu_timer = crate::trace::pass("iletki outline composite 1x");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iletki outline composite 1x"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.targets.output_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: gpu_timer.as_ref().and_then(|timer| timer.writes()),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            outline.composite_into_pass_1x(&mut pass, rect);
+            stats.dynamic_drawn = true;
+        }
+
         if has_second_pass {
             let gpu_timer = crate::trace::pass("iletki continuous gizmo/overlay");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1621,7 +1646,9 @@ impl ViewportHost {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
-                        store: resolved_color_store(resolve_target),
+                        // Keep `Store` when loading an existing MSAA attachment with a resolve
+                        // target and partial outline scissor so software drivers resolve cleanly.
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {

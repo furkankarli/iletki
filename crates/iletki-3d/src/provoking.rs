@@ -231,7 +231,8 @@ pub(crate) fn make_flat_color_wgsl(wgsl: &str, use_either: bool) -> String {
     } else {
         "@interpolate(flat)"
     };
-    let adapted = adapt_flat_sampling(wgsl, use_either);
+    // Normalize CRLF checkouts (Windows `core.autocrlf=true`) before matching multi-line struct fields.
+    let adapted = adapt_flat_sampling(wgsl, use_either).replace("\r\n", "\n");
     adapted
         .replace(
             "@location(0) pos_rel: vec3<f32>,\n    @location(1) normal: vec3<f32>,\n    @location(2) color: vec4<f32>,",
@@ -746,5 +747,34 @@ mod tests {
         assert!(build_exact_indexed(&verts, None, &mut scratch));
         assert_eq!(scratch.vertices.len(), 4);
         assert_eq!(scratch.indices.len(), 6);
+    }
+
+    #[test]
+    fn make_flat_color_wgsl_handles_windows_crlf_line_endings() {
+        let shaders = [
+            include_str!("shaders/mesh3d.wgsl"),
+            include_str!("shaders/sampled_section.wgsl"),
+            include_str!("shaders/raster_section.wgsl"),
+            include_str!("shaders/mesh3d_select.wgsl"),
+            include_str!("shaders/mesh3d_select_sampled.wgsl"),
+            include_str!("shaders/mesh3d_select_raster.wgsl"),
+        ];
+        for src in shaders {
+            let crlf = src.replace("\r\n", "\n").replace('\n', "\r\n");
+            for (use_either, expected) in [
+                (false, "@interpolate(flat)"),
+                (true, "@interpolate(flat, either)"),
+            ] {
+                let transformed = make_flat_color_wgsl(&crlf, use_either);
+                assert!(
+                    transformed.contains(&format!("@location(1) {expected} normal: vec3<f32>,")),
+                    "missing flat normal interpolation for use_either={use_either}"
+                );
+                assert!(
+                    transformed.contains(&format!("@location(2) {expected} color: vec4<f32>,")),
+                    "missing flat color interpolation for use_either={use_either}"
+                );
+            }
+        }
     }
 }
