@@ -16,7 +16,7 @@
 //! - `Q` : Toggle 4-Way CAD Quad-View (Top / Persp / Front / Right in 1 CommandEncoder)
 //! - `C` : Toggle 3D Section Clip Plane
 //! - `K` : Cycle Section Caps (Off / Solid / Hatch / CrossHatch)
-//! - `A` : Toggle Half-Res Depth-Only GTAO (Ambient Occlusion)
+//! - `A` : Toggle Full-Res Depth-Only GTAO (Ambient Occlusion)
 //! - `S` : Cycle CAD VisualStyle (Shaded+Edges / Shaded / Technical / Wireframe / X-Ray)
 //! - `D` : Cycle DiagnosticView (None / Normals / Facets / Backfaces / Overdraw / Chunks / Depth)
 //! - `G` : Toggle Ghost (WBOIT) on selected 3D part(s)
@@ -2243,11 +2243,10 @@ impl ApplicationHandler for DemoApp {
                                 if cur.enabled {
                                     s.scene_3d.set_gtao(GtaoConfig::default());
                                 } else {
-                                    let radius = s.bench_fit.map_or(0.65_f32, |(_, r)| {
-                                        ((r as f32) * 0.02).clamp(0.35, 2.0)
+                                    let radius = s.bench_fit.map_or(0.95_f32, |(_, r)| {
+                                        ((r as f32) * 0.025).clamp(0.5, 2.5)
                                     });
-                                    let mut cfg = GtaoConfig::with_radius(radius);
-                                    cfg.intensity = 1.15;
+                                    let cfg = GtaoConfig::with_radius(radius);
                                     s.scene_3d.set_gtao(cfg);
                                 }
                                 s.mark_3d_dirty();

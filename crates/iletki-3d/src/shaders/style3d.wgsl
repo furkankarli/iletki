@@ -58,7 +58,12 @@ fn fs_style(in: StyleOut, @builtin(front_facing) is_front: bool) -> @location(0)
     if ((style_u.params.y & 1u) != 0u && iletki_is_clipped(in.pos_rel)) {
         discard;
     }
+    return style_color(in, is_front, facet_cross);
+}
 
+// Shared by the pixel-rate entry point above and the antialiased section entry points.
+// `facet_cross` must be evaluated by the caller in uniform control flow.
+fn style_color(in: StyleOut, is_front: bool, facet_cross: vec3<f32>) -> vec4<f32> {
     let mode = style_u.params.x;
     let view_dir = normalize(-in.pos_rel);
     let n_len = length(in.normal);
@@ -128,5 +133,9 @@ fn fs_style_edge(in: StyleOut) -> @location(0) vec4<f32> {
     if ((style_u.params.y & 1u) != 0u && iletki_is_clipped(in.pos_rel)) {
         discard;
     }
+    return style_edge_color();
+}
+
+fn style_edge_color() -> vec4<f32> {
     return vec4<f32>(iletki_color_to_target(style_u.tint.rgb), style_u.tint.a);
 }
