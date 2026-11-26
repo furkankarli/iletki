@@ -135,6 +135,26 @@ impl Material3D {
         }
     }
 
+    /// Creates a translucent lit material (e.g. architectural glazing or translucent housings).
+    #[must_use]
+    pub const fn translucent(rgba: [f32; 4]) -> Self {
+        Self {
+            base_color_factor: rgba,
+            roughness: 0.18,
+            ..Self::DEFAULT
+        }
+    }
+
+    /// Creates a subdued CAD ghost material with the given opacity (clamped to `<= 0.35`).
+    #[must_use]
+    pub const fn ghost(opacity: f32) -> Self {
+        Self {
+            opacity,
+            flags: MaterialFlags::GHOST,
+            ..Self::DEFAULT
+        }
+    }
+
     /// Returns whether this material produces partial transparency (`opacity * alpha < 1.0` or
     /// [`MaterialFlags::GHOST`]).
     #[must_use]

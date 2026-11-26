@@ -51,6 +51,20 @@ impl ViewCameraOrigin {
     }
 }
 
+/// Chunk flag bit indicating per-chunk CAD ghost translucency.
+pub(crate) const CHUNK_FLAG_GHOST: u32 = 1 << 2;
+
+/// Packs a per-chunk opacity in `[0.0, 1.0]` into 5 bits (`0` = exact `1.0`, `1..=31` = `(k - 1) / 30.0`).
+#[inline]
+pub(crate) fn pack_chunk_opacity(opacity: f32) -> u32 {
+    if !opacity.is_finite() || opacity >= 0.999 {
+        return 0;
+    }
+    let clamped = opacity.clamp(0.0, 1.0);
+    let step = (clamped * 30.0).round().clamp(0.0, 30.0) as u32;
+    step.saturating_add(1)
+}
+
 /// Per-chunk persistent GPU transform entry (`@group(1) @binding(2)`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -59,7 +73,8 @@ pub(crate) struct ChunkTransformGpu {
     pub(crate) scale: f32,
     pub(crate) frac: [u32; 3],
     /// Bit 0 = visible (`1` = drawn, `0` = clipped by vertex shader); bit 1 = pickable;
-    /// bits 2..7 = reserved per-chunk render flags; bits 8..31 = 24-bit [`MaterialId`] index.
+    /// bit 2 = ghost; bits 3..=7 = 5-bit quantized opacity (`0` = 1.0, `1..=31` = `(k-1)/30`);
+    /// bits 8..=31 = 24-bit [`MaterialId`] index.
     pub(crate) flags: u32,
 }
 
@@ -68,17 +83,21 @@ impl ChunkTransformGpu {
         origin_rel: Vec3,
         visible: bool,
         pickable: bool,
+        ghost: bool,
+        opacity: f32,
         material_id: MaterialId,
     ) -> Self {
         let (wx, fx) = to_q32_32(origin_rel.x);
         let (wy, fy) = to_q32_32(origin_rel.y);
         let (wz, fz) = to_q32_32(origin_rel.z);
+        let ghost_bit = if ghost { CHUNK_FLAG_GHOST } else { 0 };
+        let op_bits = (pack_chunk_opacity(opacity) & 31) << 3;
         let mat_bits = (material_id.index().min(MAX_MATERIAL_ID)) << 8;
         Self {
             whole: [wx, wy, wz],
             scale: 1.0,
             frac: [fx, fy, fz],
-            flags: u32::from(visible) | (u32::from(pickable) << 1) | mat_bits,
+            flags: u32::from(visible) | (u32::from(pickable) << 1) | ghost_bit | op_bits | mat_bits,
         }
     }
 }
@@ -207,12 +226,15 @@ impl ChunkTransformTable {
         !self.out_of_range && in_q32_range(camera_pos - self.anchor())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mark_chunk(
         &mut self,
         index: usize,
         origin: Vec3,
         visible: bool,
         pickable: bool,
+        ghost: bool,
+        opacity: f32,
         material_id: MaterialId,
     ) {
         if self.anchor.is_none() && origin.is_finite() {
@@ -224,7 +246,7 @@ impl ChunkTransformTable {
         }
         self.set_raw(
             index,
-            ChunkTransformGpu::new(rel, visible, pickable, material_id),
+            ChunkTransformGpu::new(rel, visible, pickable, ghost, opacity, material_id),
         );
     }
 
@@ -1032,32 +1054,10 @@ impl StorageDraws {
         repeated_pipeline: Option<&wgpu::RenderPipeline>,
         direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
-        if !self.indirect.rep_groups.is_empty()
-            && let (Some(rep_pl), Some(rep_buf)) =
-                (repeated_pipeline, self.indirect.rep_buf.as_ref())
-        {
-            pass.set_bind_group(1, storage_bg, &[]);
-            pass.set_pipeline(rep_pl);
-            for group in &self.indirect.rep_groups {
-                group.geometry.bind_position(pass);
-                let byte_start = u64::from(group.first_instance).saturating_mul(4);
-                let byte_end = u64::from(group.first_instance.saturating_add(group.instance_count))
-                    .saturating_mul(4);
-                pass.set_vertex_buffer(1, rep_buf.slice(byte_start..byte_end));
-                if group.indexed {
-                    if let Some(indices) = group.geometry.indices() {
-                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
-                        pass.draw_indexed(0..group.elements, 0, 0..group.instance_count);
-                    }
-                } else {
-                    pass.draw(0..group.elements, 0..group.instance_count);
-                }
-            }
-        }
         let pipelines = PaintPipelines {
             smooth: pipeline,
             flat: None,
-            repeated_smooth: None,
+            repeated_smooth: repeated_pipeline,
             repeated_flat: None,
             repeated_slots: None,
         };
@@ -1073,6 +1073,47 @@ impl StorageDraws {
         picking: bool,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
+        if !self.indirect.rep_groups.is_empty()
+            && !picking
+            && let Some(rep_buf) = self.indirect.rep_buf.as_ref()
+            && pipelines.repeated_smooth.is_some()
+        {
+            pass.set_bind_group(1, storage_bg, &[]);
+            let mut active_flat: Option<bool> = None;
+            for group in &self.indirect.rep_groups {
+                let use_flat = group.geometry.kind() == PageKind::IndexedFlat
+                    && pipelines.repeated_flat.is_some();
+                if active_flat != Some(use_flat) {
+                    let Some(pl) = (if use_flat {
+                        pipelines.repeated_flat.or(pipelines.repeated_smooth)
+                    } else {
+                        pipelines.repeated_smooth
+                    }) else {
+                        continue;
+                    };
+                    pass.set_pipeline(pl);
+                    active_flat = Some(use_flat);
+                }
+                let slot_binding = if position_only {
+                    group.geometry.bind_position(pass);
+                    1
+                } else {
+                    group.geometry.bind_vertices(pass)
+                };
+                let byte_start = u64::from(group.first_instance).saturating_mul(4);
+                let byte_end = u64::from(group.first_instance.saturating_add(group.instance_count))
+                    .saturating_mul(4);
+                pass.set_vertex_buffer(slot_binding, rep_buf.slice(byte_start..byte_end));
+                if group.indexed {
+                    if let Some(indices) = group.geometry.indices() {
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                        pass.draw_indexed(0..group.elements, 0, 0..group.instance_count);
+                    }
+                } else {
+                    pass.draw(0..group.elements, 0..group.instance_count);
+                }
+            }
+        }
         if self.indirect.active && !picking {
             for &index in &self.indirect.direct {
                 direct(pass, index);
