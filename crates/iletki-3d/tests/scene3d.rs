@@ -3184,3 +3184,492 @@ fn gtao_darkens_concave_corners_preserves_background_and_coexists_with_caps_and_
         "combined Section Caps + WBOIT + GTAO in Continuous mode must render cleanly (non_bg={non_bg})"
     );
 }
+
+#[test]
+fn technical_style_draws_automatic_creases_on_edgeless_meshes_and_coexists_with_gtao() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let is_gl = device.adapter_info().backend == wgpu::Backend::Gl;
+
+    // Two edge-less solid boxes (slab + stacked upper block, zero explicit edge geometry).
+    let mut scene = Scene3DLayer::new(1);
+    let mut slab = Mesh3D::at_origin(Vec3::ZERO);
+    slab.push_box(
+        Vec3::new(-3.0, -3.0, 0.0),
+        Vec3::new(3.0, 3.0, 0.4),
+        [180, 185, 195, 255],
+        PickId::new(1, 601, 0),
+        false,
+    );
+    let mut block = Mesh3D::at_origin(Vec3::new(0.0, 0.0, 0.402));
+    block.push_box(
+        Vec3::new(-1.0, -1.0, 0.0),
+        Vec3::new(1.0, 1.0, 1.8),
+        [210, 100, 90, 255],
+        PickId::new(1, 602, 0),
+        false,
+    );
+    scene.insert(slab);
+    scene.insert(block);
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            msaa_samples: 4,
+            clear_color: [0.08, 0.09, 0.11, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [256, 192],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(5.5, -6.0, 4.6),
+        Vec3::new(0.0, 0.0, 0.9),
+        Vec3::Z,
+        50.0_f64.to_radians(),
+        0.1,
+    );
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    scene.set_visual_style(VisualStyle::Technical);
+    let img_tech = render(&mut host, &mut scene);
+    let bg = img_tech.pixel(4, 4).unwrap();
+    let paper_px = img_tech
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > 180 && px[1] > 180 && px[2] > 180)
+        .count();
+    assert!(
+        paper_px > 2500,
+        "Technical mode must preserve bright paper faces (paper_px={paper_px})"
+    );
+
+    if !is_gl {
+        // Count dark ink pixels inside the bounding region of the geometry (strictly darker than
+        // architectural paper and distinct from clear background pixels).
+        let mut ink_px = 0usize;
+        for y in 20..172u32 {
+            for x in 24..232u32 {
+                let px = img_tech.pixel(x, y).unwrap();
+                let is_bg = px[0].abs_diff(bg[0]) <= 3
+                    && px[1].abs_diff(bg[1]) <= 3
+                    && px[2].abs_diff(bg[2]) <= 3;
+                let luma = (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3;
+                if !is_bg && luma < 150 {
+                    ink_px += 1;
+                }
+            }
+        }
+        assert!(
+            ink_px > 180,
+            "Technical mode must synthesize automatic silhouette/crease ink lines on edge-less meshes (ink_px={ink_px})"
+        );
+
+        // Coexistence: Technical + GTAO together must keep paper bright while adding corner AO.
+        scene.set_gtao(GtaoConfig::with_radius(1.4));
+        let img_tech_gtao = render(&mut host, &mut scene);
+        assert_eq!(
+            img_tech.pixel(4, 4).unwrap(),
+            img_tech_gtao.pixel(4, 4).unwrap(),
+            "Technical + GTAO must keep background pixels exact"
+        );
+        assert_ne!(
+            img_tech.pixels, img_tech_gtao.pixels,
+            "Technical + GTAO must visibly add ambient shading under the ink lines"
+        );
+    }
+}
+
+#[test]
+fn gtao_cut_cavity_preserves_msaa_edges_and_monotonic_falloff() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    if device.adapter_info().backend == wgpu::Backend::Gl {
+        return;
+    }
+
+    // Reproduce the clipped hollow-box CAD inspection case:
+    // - Mezzanine Deck sliced by Y = -0.35 (shallow diagonal cut lip in 4x MSAA)
+    // - Green Core Block sliced by Y = -0.35 (thin left inner wall next to wide interior floor)
+    let mut scene = Scene3DLayer::new(1);
+    let mut deck = Mesh3D::at_origin(Vec3::new(0.0, 0.0, 4.0));
+    deck.push_box(
+        Vec3::new(-4.0, -3.0, 0.0),
+        Vec3::new(4.0, 3.0, 0.45),
+        [190, 195, 205, 255],
+        PickId::new(1, 701, 0),
+        false,
+    );
+    let mut core = Mesh3D::at_origin(Vec3::new(-0.8, 0.4, 0.402));
+    core.push_box(
+        Vec3::new(-1.2, -1.0, 0.0),
+        Vec3::new(1.2, 1.0, 2.6),
+        [65, 195, 130, 255],
+        PickId::new(1, 702, 0),
+        false,
+    );
+    scene.insert(deck);
+    scene.insert(core);
+
+    let clip = Plane::from_normal_point(Vec3::Y, Vec3::new(0.0, -0.35, 0.0)).unwrap();
+    let render_pair = |cam: Camera, size: [u32; 2], scene: &mut Scene3DLayer| {
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                msaa_samples: 4,
+                clear_color: [0.09, 0.09, 0.10, 1.0],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                initial_px: size,
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        let mut c = cam;
+        c.set_clip_planes(&[clip]);
+        *host.camera_mut() = c;
+
+        scene.set_gtao(GtaoConfig::default());
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        let img_off = host.readback_rgba_blocking(&device, &queue).unwrap();
+
+        scene.set_gtao(GtaoConfig::with_radius(1.35));
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        let img_on = host.readback_rgba_blocking(&device, &queue).unwrap();
+        (img_off, img_on)
+    };
+
+    // 1. Close-up on the sliced green Core Block cavity: verify monotonic horizontal falloff
+    //    moving rightward away from the thin left inner wall (zero phantom double-shadow bands).
+    let cam_core = Camera::perspective_3d(
+        Vec3::new(-0.55, -2.4, 2.55),
+        Vec3::new(-0.8, 0.4, 0.85),
+        Vec3::Z,
+        48.0_f64.to_radians(),
+        0.05,
+    );
+    let (core_off, core_on) = render_pair(cam_core, [320, 240], &mut scene);
+    // Find interior green floor columns (bright green floor in baseline, distinct from darker
+    // vertical side wall) across rows y in 125..165.
+    let mut floor_prof = Vec::new();
+    for x in 0..320u32 {
+        let mut sum = 0.0f32;
+        let mut cnt = 0u32;
+        for y in 125..165u32 {
+            let base = core_off.pixel(x, y).unwrap();
+            let px = core_on.pixel(x, y).unwrap();
+            if base[1] > 140 && base[1] > base[0].saturating_add(60) {
+                sum += f32::from(px[1]);
+                cnt += 1;
+            }
+        }
+        if cnt == 40 {
+            floor_prof.push((x, sum / 40.0));
+        }
+    }
+    assert!(
+        floor_prof.len() > 60,
+        "expected wide interior green floor slice, found {} columns",
+        floor_prof.len()
+    );
+    // Start 4 px right of the left wall-floor corner; check that luminance rises smoothly without
+    // phantom secondary shadow dips (> 1.5 luma levels below prior peak).
+    let mut peak = 0.0f32;
+    let mut max_dip = 0.0f32;
+    for &(_x, g) in floor_prof.iter().skip(4).take(100) {
+        if g > peak {
+            peak = g;
+        } else {
+            max_dip = max_dip.max(peak - g);
+        }
+    }
+    assert!(
+        max_dip < 1.5,
+        "cut-cavity GTAO must not produce phantom double-shadow dips (max_dip={max_dip:.2} luma)"
+    );
+
+    // 2. Close-up on the sliced grey Mezzanine Deck shallow diagonal lip: verify 4x MSAA edge
+    //    pixels smoothly interpolate the applied AO factor (`g_on / g_off`) horizontally along the
+    //    diagonal boundary without binary zig-zag cliffs, with symmetric even-vs-odd row parity
+    //    and blotch-free smoothness inside the shallow cavity.
+    let cam_deck = Camera::perspective_3d(
+        Vec3::new(0.4, -4.8, 4.95),
+        Vec3::new(0.0, 0.2, 4.15),
+        Vec3::Z,
+        45.0_f64.to_radians(),
+        0.05,
+    );
+    let (deck_off, deck_on) = render_pair(cam_deck, [320, 160], &mut scene);
+    let mut msaa_edges_checked = 0usize;
+    let mut max_ratio_jump = 0.0f32;
+    let mut even_ratios = Vec::new();
+    let mut odd_ratios = Vec::new();
+    let mut cavity_scan = Vec::new();
+    for x in 60..259u32 {
+        // Locate the top-deck -> cavity MSAA edge row `y` at column `x`.
+        let mut saw_top = false;
+        for y in 10..130u32 {
+            let g_off = f32::from(deck_off.pixel(x, y).unwrap()[1]);
+            if g_off > 170.0 {
+                saw_top = true;
+            } else if saw_top && g_off < 165.0 {
+                // Compare applied AO ratio on the same row `y` between adjacent columns `x` and `x+1`
+                // whenever both are inside the shallow-slope transition (g_off > 60).
+                let g_off_next = f32::from(deck_off.pixel(x + 1, y).unwrap()[1]);
+                if g_off > 60.0 && g_off_next > 60.0 {
+                    let r0 = f32::from(deck_on.pixel(x, y).unwrap()[1]) / g_off;
+                    let r1 = f32::from(deck_on.pixel(x + 1, y).unwrap()[1]) / g_off_next;
+                    msaa_edges_checked += 1;
+                    max_ratio_jump = max_ratio_jump.max((r1 - r0).abs());
+                    if y % 2 == 0 {
+                        even_ratios.push(r0);
+                    } else {
+                        odd_ratios.push(r0);
+                    }
+                }
+                // Sample 5 px inside the shallow cut cavity to verify zero blotchy noise.
+                if y + 5 < 155 {
+                    let g_cav = f32::from(deck_on.pixel(x, y + 5).unwrap()[1]);
+                    cavity_scan.push(g_cav);
+                }
+                break;
+            }
+        }
+    }
+    assert!(
+        msaa_edges_checked > 40,
+        "expected diagonal cut-lip MSAA transitions, found {msaa_edges_checked}"
+    );
+    assert!(
+        max_ratio_jump < 0.14,
+        "4x MSAA GTAO composite must transition smoothly across shallow diagonal cut lips (max_ratio_jump={max_ratio_jump:.3})"
+    );
+    if !even_ratios.is_empty() && !odd_ratios.is_empty() {
+        let even_mean = even_ratios.iter().sum::<f32>() / even_ratios.len() as f32;
+        let odd_mean = odd_ratios.iter().sum::<f32>() / odd_ratios.len() as f32;
+        assert!(
+            (even_mean - odd_mean).abs() < 0.05,
+            "full-res XeGTAO must eliminate even/odd row sawtooth on shallow diagonal cut lips (even={even_mean:.3}, odd={odd_mean:.3})"
+        );
+    }
+    // Check local detrended smoothness along the cavity scanline (max |g[i] - 0.5*(g[i-3]+g[i+3])|):
+    // Hilbert 3x3 blotches exceeded 8-12 luma; 4x4 stratified A-Trous stays silky smooth.
+    if cavity_scan.len() > 20 {
+        let mut sq_sum = 0.0f32;
+        let mut cnt = 0usize;
+        for w in cavity_scan.windows(7) {
+            let trend = 0.5 * (w[0] + w[6]);
+            let dev = w[3] - trend;
+            sq_sum += dev * dev;
+            cnt += 1;
+        }
+        let rms = (sq_sum / cnt.max(1) as f32).sqrt();
+        assert!(
+            rms < 2.2,
+            "cut-cavity GTAO must be free of blotchy spatial noise (detrended rms={rms:.2} luma)"
+        );
+    }
+}
+
+fn verify_antialiased_section_styles_on_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+) {
+    let is_gl = device.adapter_info().backend == wgpu::Backend::Gl;
+    let host = ViewportHost::new(
+        device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            msaa_samples: 4,
+            clear_color: [0.07, 0.09, 0.12, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [256, 192],
+            ..ViewportConfig::default()
+        },
+    );
+    assert!(host.is_ok(), "{label}: viewport host creation must succeed");
+    let Ok(mut host) = host else {
+        return;
+    };
+    let clip = Plane::from_normal_point(Vec3::new(0.22, 1.0, 0.0), Vec3::new(0.0, -0.35, 0.0));
+    assert!(clip.is_some(), "{label}: clip plane must be valid");
+    let Some(clip) = clip else {
+        return;
+    };
+    let mut cam = Camera::perspective_3d(
+        Vec3::new(4.8, -5.8, 3.8),
+        Vec3::new(0.0, 0.2, 1.1),
+        Vec3::Z,
+        46.0_f64.to_radians(),
+        0.05,
+    );
+    cam.set_clip_planes(&[clip]);
+    *host.camera_mut() = cam;
+
+    // Include both an edged box and an edge-less box (plus several identical boxes to exercise
+    // packed/indexed-flat and storage/repeated `_section` style pipelines).
+    let mut scene = Scene3DLayer::new(1);
+    let mut slab = Mesh3D::at_origin(Vec3::ZERO);
+    slab.push_box_with_edges(
+        Vec3::new(-3.2, -2.6, 0.0),
+        Vec3::new(3.2, 2.6, 0.45),
+        [185, 190, 200, 255],
+        [15, 18, 24, 150],
+        PickId::new(1, 801, 0),
+        true,
+    );
+    scene.insert(slab);
+    for idx in 0..8u32 {
+        let mut block = Mesh3D::at_origin(Vec3::new(f64::from(idx % 4) * 1.4 - 2.1, 0.3, 0.452));
+        block.push_box(
+            Vec3::new(-0.45, -0.9, 0.0),
+            Vec3::new(0.45, 0.9, 1.6),
+            [110, 175, 145, 255],
+            PickId::new(1, 810 + idx, 0),
+            false,
+        );
+        scene.insert(block);
+    }
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(device, queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        let img = host.readback_rgba_blocking(device, queue);
+        assert!(img.is_ok(), "{label}: readback must succeed");
+        img.ok()
+    };
+
+    // 1. Clipped Technical + GTAO: exercises `vs_style_*_section` + `fs_style_section` +
+    //    `fs_style_edge_section` + 4x MSAA `technical_edges.wgsl` + full-res XeGTAO.
+    scene.set_visual_style(VisualStyle::Technical);
+    scene.set_gtao(GtaoConfig::with_radius(1.0));
+    let Some(img_tech) = render(&mut host, &mut scene) else {
+        return;
+    };
+    let Some(bg) = img_tech.pixel(4, 4) else {
+        return;
+    };
+    let paper_px = img_tech
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > 180 && px[1] > 180 && px[2] > 180)
+        .count();
+    assert!(
+        paper_px > 2500,
+        "{label}: clipped Technical style must render bright paper faces (paper_px={paper_px})"
+    );
+    if !is_gl {
+        let mut ink_px = 0usize;
+        for y in 20..176u32 {
+            for x in 16..240u32 {
+                if let Some(px) = img_tech.pixel(x, y) {
+                    let is_bg = px[0].abs_diff(bg[0]) <= 3
+                        && px[1].abs_diff(bg[1]) <= 3
+                        && px[2].abs_diff(bg[2]) <= 3;
+                    let luma = (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3;
+                    if !is_bg && luma < 150 {
+                        ink_px += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            ink_px > 120,
+            "{label}: clipped Technical style must draw antialiased ink edges (ink_px={ink_px})"
+        );
+    }
+
+    // 2. Clipped Facets (`dpdx`/`dpdy` uniform control flow in `fs_style_section`) + Overdraw + Wireframe.
+    scene.set_gtao(GtaoConfig::default());
+    scene.set_diagnostic_view(DiagnosticView::Facets);
+    let Some(img_facets) = render(&mut host, &mut scene) else {
+        return;
+    };
+    let facets_lit = img_facets
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > 80 && px[1] > 80 && px[2] > 80)
+        .count();
+    assert!(
+        facets_lit > 2500,
+        "{label}: clipped Facets diagnostic must render cleanly (facets_lit={facets_lit})"
+    );
+
+    scene.set_diagnostic_view(DiagnosticView::Overdraw);
+    let Some(img_overdraw) = render(&mut host, &mut scene) else {
+        return;
+    };
+    let overdraw_lit = img_overdraw
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > bg[0].saturating_add(15))
+        .count();
+    assert!(
+        overdraw_lit > 1500,
+        "{label}: clipped Overdraw diagnostic must accumulate cleanly (overdraw_lit={overdraw_lit})"
+    );
+
+    scene.set_diagnostic_view(DiagnosticView::None);
+    scene.set_visual_style(VisualStyle::Wireframe);
+    let Some(img_wire) = render(&mut host, &mut scene) else {
+        return;
+    };
+    let wire_lit = img_wire
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[2] > 120 && px[0] > 90)
+        .count();
+    assert!(
+        wire_lit > 80,
+        "{label}: clipped Wireframe style must draw antialiased section edges (wire_lit={wire_lit})"
+    );
+
+    // 3. Toggling clip plane off and back on must reuse cached style pipelines without errors.
+    host.camera_mut().clear_clip_planes();
+    scene.set_visual_style(VisualStyle::Technical);
+    let Some(img_unclipped) = render(&mut host, &mut scene) else {
+        return;
+    };
+    assert_ne!(
+        img_unclipped.pixels, img_tech.pixels,
+        "{label}: clearing clip plane must reveal full unclipped Technical geometry"
+    );
+    host.camera_mut().set_clip_planes(&[clip]);
+    let _img_reclipped = render(&mut host, &mut scene);
+}
+
+#[test]
+fn antialiased_section_styles_render_cleanly_with_clip_distances_and_sampled_fallback() {
+    if let Some((device, queue)) = create_headless_device() {
+        verify_antialiased_section_styles_on_device(&device, &queue, "sampled_fallback");
+    }
+    if let Some((device, queue)) = create_device_with_clip_distances() {
+        verify_antialiased_section_styles_on_device(&device, &queue, "clip_distances");
+    }
+}

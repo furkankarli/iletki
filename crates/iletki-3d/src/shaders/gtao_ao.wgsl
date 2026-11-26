@@ -1,131 +1,261 @@
-// Half-resolution depth-only Ground-Truth Ambient Occlusion (GTAO) horizon integration pass
-// (prepended with `gtao_common.wgsl`).
+// Full-resolution XeGTAO horizon integration + packed 4-neighbor edge pass (prepended with
+// `gtao_common.wgsl`). Clean-room WGSL architecture based on Jimenez et al. (2016) and Intel
+// XeGTAO (MIT):
+// - 5-level weighted linear-depth MIP pyramid sampling (L1-cache friendly even at 200 px radius).
+// - Slope-adjusted 4-neighbor edge weights packed into R8Unorm (2 bits/side) + edge-weighted
+//   4-quadrant normal reconstruction.
+// - Zero-correlation 4x4 Bayer-Latin stratified spatial noise + per-(slice, step) R1 golden-ratio
+//   radial sequence: every 4x4 block covers all 16 azimuthal and radial strata uniformly with zero
+//   low-frequency blotches on static (non-TAA) CAD frames, and is annihilated cleanly by the
+//   paired 2-pass A-Trous edge-chained denoiser.
+// - Packed with 1.5x headroom into R8Unorm so denoiser averaging never clips bright slopes dark.
 
 @group(0) @binding(0)
-var half_depth_tex: texture_2d<u32>;
+var depth_pyramid: texture_2d<f32>;
 
 @group(0) @binding(1)
 var<uniform> gtao: GtaoUniform;
 
 const GTAO_PI: f32 = 3.141592653589793;
 const GTAO_HALF_PI: f32 = 1.5707963267948966;
+const GTAO_OCCLUSION_SCALE: f32 = 1.5;
+const GTAO_RADIUS_MULTIPLIER: f32 = 1.457;
+const GTAO_FALLOFF_RANGE: f32 = 0.615;
+const GTAO_THIN_OCCLUDER_COMP: f32 = 0.18;
 
-fn load_half_depth(coord: vec2<i32>) -> f32 {
-    let max_c = vec2<i32>(max(i32(gtao.half_px.x) - 1, 0), max(i32(gtao.half_px.y) - 1, 0));
-    let clamped = clamp(coord, vec2<i32>(0, 0), max_c);
-    return bitcast<f32>(textureLoad(half_depth_tex, clamped, 0).r);
+// Exact 4x4 Bayer stratification for azimuth (every 2x2 hits all 4 quarters; every 4x4 hits 0..15).
+const PHI_LUT_4X4 = array<f32, 16>(
+    0.03125, 0.53125, 0.15625, 0.65625,
+    0.78125, 0.28125, 0.90625, 0.40625,
+    0.21875, 0.71875, 0.09375, 0.59375,
+    0.96875, 0.46875, 0.84375, 0.34375,
+);
+
+// Orthogonal zero-correlation (corr = 0.0000) 4x4 Latin-quarter permutation for radial jitter.
+const RAD_LUT_4X4 = array<f32, 16>(
+    0.78125, 0.71875, 0.09375, 0.40625,
+    0.46875, 0.03125, 0.65625, 0.84375,
+    0.21875, 0.28125, 0.90625, 0.59375,
+    0.53125, 0.96875, 0.34375, 0.15625,
+);
+
+struct MainOut {
+    @location(0) ao_packed: vec4<f32>,
+    @location(1) edges_packed: vec4<f32>,
+};
+
+fn load_depth_mip0(coord: vec2<i32>, max_c: vec2<i32>) -> f32 {
+    return textureLoad(depth_pyramid, clamp(coord, vec2<i32>(0, 0), max_c), 0).r;
 }
 
-// Minimum-depth-discontinuity 4-neighbor normal reconstruction (eliminates silhouette halos on
-// sharp CAD corners and thin walls).
-fn reconstruct_normal(coord: vec2<i32>, pos_c: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
-    let z_l = load_half_depth(coord + vec2<i32>(-1, 0));
-    let z_r = load_half_depth(coord + vec2<i32>(1, 0));
-    let z_u = load_half_depth(coord + vec2<i32>(0, -1));
-    let z_d = load_half_depth(coord + vec2<i32>(0, 1));
+fn spatial_noise(coord: vec2<i32>) -> vec2<f32> {
+    let idx = (u32(coord.x) & 3u) | ((u32(coord.y) & 3u) << 2u);
+    return vec2<f32>(PHI_LUT_4X4[idx], RAD_LUT_4X4[idx]);
+}
 
-    var dx = vec3<f32>(0.0);
-    var has_dx = false;
-    let has_l = z_l > 0.0 && coord.x > 0;
-    let has_r = z_r > 0.0 && coord.x + 1 < i32(gtao.half_px.x);
-    if (has_l && has_r) {
-        let dl = pos_c - gtao_view_pos_half(gtao, coord + vec2<i32>(-1, 0), z_l);
-        let dr = gtao_view_pos_half(gtao, coord + vec2<i32>(1, 0), z_r) - pos_c;
-        dx = select(dr, dl, abs(dl.z) < abs(dr.z));
-        has_dx = true;
-    } else if (has_r) {
-        dx = gtao_view_pos_half(gtao, coord + vec2<i32>(1, 0), z_r) - pos_c;
-        has_dx = true;
-    } else if (has_l) {
-        dx = pos_c - gtao_view_pos_half(gtao, coord + vec2<i32>(-1, 0), z_l);
-        has_dx = true;
-    }
+// Slope-adjusted 4-neighbor depth continuity weights (L, R, T, B) in [0, 1] (XeGTAO eq.).
+fn calculate_edges(
+    center_d: f32,
+    left_d: f32,
+    right_d: f32,
+    top_d: f32,
+    bottom_d: f32,
+) -> vec4<f32> {
+    let is_persp = (gtao.flags & 1u) != 0u;
+    let scale = select(
+        max(gtao.radius * 0.05, 1e-4),
+        max(center_d * 0.011, 1e-4),
+        is_persp,
+    );
+    let dl = select(1e6, left_d - center_d, left_d > 0.0);
+    let dr = select(1e6, right_d - center_d, right_d > 0.0);
+    let dt = select(1e6, top_d - center_d, top_d > 0.0);
+    let db = select(1e6, bottom_d - center_d, bottom_d > 0.0);
+    let raw = vec4<f32>(dl, dr, dt, db);
+    let slope_lr = (dr - dl) * 0.5;
+    let slope_tb = (db - dt) * 0.5;
+    let slope_adj = raw + vec4<f32>(slope_lr, -slope_lr, slope_tb, -slope_tb);
+    let min_err = min(abs(raw), abs(slope_adj));
+    return clamp(vec4<f32>(1.25) - min_err / scale, vec4<f32>(0.0), vec4<f32>(1.0));
+}
 
-    var dy = vec3<f32>(0.0);
-    var has_dy = false;
-    let has_u = z_u > 0.0 && coord.y > 0;
-    let has_d = z_d > 0.0 && coord.y + 1 < i32(gtao.half_px.y);
-    if (has_u && has_d) {
-        let du = gtao_view_pos_half(gtao, coord + vec2<i32>(0, -1), z_u) - pos_c;
-        let dd = pos_c - gtao_view_pos_half(gtao, coord + vec2<i32>(0, 1), z_d);
-        dy = select(dd, du, abs(du.z) < abs(dd.z));
-        has_dy = true;
-    } else if (has_u) {
-        dy = gtao_view_pos_half(gtao, coord + vec2<i32>(0, -1), z_u) - pos_c;
-        has_dy = true;
-    } else if (has_d) {
-        dy = pos_c - gtao_view_pos_half(gtao, coord + vec2<i32>(0, 1), z_d);
-        has_dy = true;
-    }
+// Pack 4 edge weights into R8Unorm (2 bits per side -> 0, 0.33, 0.67, 1.0).
+fn pack_edges(e: vec4<f32>) -> f32 {
+    let q = round(clamp(e, vec4<f32>(0.0), vec4<f32>(1.0)) * 2.9);
+    return dot(q, vec4<f32>(64.0 / 255.0, 16.0 / 255.0, 4.0 / 255.0, 1.0 / 255.0));
+}
 
-    if (!has_dx || !has_dy) {
+// Edge-weighted 4-quadrant view-space normal reconstruction (XeGTAO eq.): smooth on curved
+// surfaces, razor-sharp at 90-degree corners and silhouettes.
+fn calculate_normal(
+    edges: vec4<f32>,
+    c_pos: vec3<f32>,
+    l_pos: vec3<f32>,
+    r_pos: vec3<f32>,
+    t_pos: vec3<f32>,
+    b_pos: vec3<f32>,
+    view_dir: vec3<f32>,
+) -> vec3<f32> {
+    // edges = (L, R, T, B)
+    let accepted = clamp(
+        vec4<f32>(
+            edges.x * edges.z,
+            edges.z * edges.y,
+            edges.y * edges.w,
+            edges.w * edges.x,
+        ) + vec4<f32>(0.01),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
+
+    let dl = l_pos - c_pos;
+    let dr = r_pos - c_pos;
+    let dt = t_pos - c_pos;
+    let db = b_pos - c_pos;
+    let nl = select(vec3<f32>(-1.0, 0.0, 0.0), normalize(dl), dot(dl, dl) > 1e-12);
+    let nr = select(vec3<f32>(1.0, 0.0, 0.0), normalize(dr), dot(dr, dr) > 1e-12);
+    let nt = select(vec3<f32>(0.0, 1.0, 0.0), normalize(dt), dot(dt, dt) > 1e-12);
+    let nb = select(vec3<f32>(0.0, -1.0, 0.0), normalize(db), dot(db, db) > 1e-12);
+
+    // Right-handed view space (+X right, +Y up, +Z toward camera):
+    // cross(nt, nl) = cross(+Y, -X) = +Z; cross(nr, nt) = +Z; cross(nb, nr) = +Z; cross(nl, nb) = +Z.
+    let raw_n = accepted.x * cross(nt, nl)
+        + accepted.y * cross(nr, nt)
+        + accepted.z * cross(nb, nr)
+        + accepted.w * cross(nl, nb);
+    let nlen = length(raw_n);
+    if (nlen <= 1e-7) {
         return view_dir;
     }
-    let c = cross(dx, dy);
-    let clen = length(c);
-    if (clen <= 1e-8) {
-        return view_dir;
-    }
-    var n = c / clen;
+    var n = raw_n / nlen;
     if (dot(n, view_dir) < 0.0) {
         n = -n;
     }
     return n;
 }
 
-// Deterministic Interleaved Gradient Noise (Jimenez) for static-frame stability in OnDemand CAD.
-fn ign(coord: vec2<f32>) -> f32 {
-    return fract(52.9829189 * fract(dot(coord, vec2<f32>(0.06711056, 0.00583715))));
-}
-
 fn integrate_arc(h: f32, n: f32, cos_n: f32, sin_n: f32) -> f32 {
     return 0.25 * (-cos(2.0 * h - n) + cos_n + 2.0 * h * sin_n);
 }
 
+fn sample_horizon_mip(
+    sample_px: vec2<f32>,
+    mip_u: u32,
+    max_full: vec2<i32>,
+    pos_biased: vec3<f32>,
+    view_dir: vec3<f32>,
+    falloff_mul: f32,
+    falloff_add: f32,
+    cos_flat: f32,
+    cur_max: f32,
+) -> f32 {
+    if (sample_px.x < 0.0
+        || sample_px.y < 0.0
+        || sample_px.x > f32(max_full.x)
+        || sample_px.y > f32(max_full.y))
+    {
+        return cur_max;
+    }
+    let mip_dims = vec2<i32>(textureDimensions(depth_pyramid, i32(mip_u)));
+    let max_mip = max(mip_dims - vec2<i32>(1, 1), vec2<i32>(0, 0));
+    let scale = f32(1u << mip_u);
+    let mcoord = clamp(vec2<i32>(floor(sample_px / scale)), vec2<i32>(0, 0), max_mip);
+    let ds = textureLoad(depth_pyramid, mcoord, i32(mip_u)).r;
+    if (ds <= 0.0) {
+        return cur_max;
+    }
+    // Reconstruct at the exact center of the sampled mip texel so slanted planes keep exact slope.
+    let exact_px = (vec2<f32>(mcoord) + vec2<f32>(0.5)) * scale;
+    let delta = gtao_view_pos_linear(gtao, exact_px, ds) - pos_biased;
+    let len2 = dot(delta, delta);
+    if (len2 <= 1e-10) {
+        return cur_max;
+    }
+    let dist = sqrt(len2);
+    // XeGTAO thin-occluder compensation penalizes depth separation slightly more than XY separation
+    // so floating shelves and hollow cut lips cast clean contact shadows without muddy halos.
+    let falloff_base = length(vec3<f32>(
+        delta.x,
+        delta.y,
+        delta.z * (1.0 + GTAO_THIN_OCCLUDER_COMP),
+    ));
+    let weight = clamp(falloff_base * falloff_mul + falloff_add, 0.0, 1.0);
+    if (weight <= 0.0) {
+        return cur_max;
+    }
+    let cos_h = dot(delta, view_dir) / dist;
+    if (cos_h <= cos_flat) {
+        return cur_max;
+    }
+    let eff = mix(cos_flat, cos_h, weight);
+    return max(cur_max, eff);
+}
+
 @fragment
-fn fs_gtao_ao(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let coord = vec2<i32>(frag_pos.xy);
-    let z_c = load_half_depth(coord);
-    if (z_c <= 0.0) {
-        return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-    }
-
-    let pos_c = gtao_view_pos_half(gtao, coord, z_c);
-    let view_dir = gtao_view_dir(gtao, pos_c);
-    let normal = reconstruct_normal(coord, pos_c, view_dir);
-    let dist_c = max(-pos_c.z, 1e-4);
-
-    // Compute sampling radius in half-res pixels from world-space radius.
-    let half_h = max(f32(gtao.half_px.y), 1.0);
-    let world_h = select(
-        2.0 * gtao.proj_xy.y,
-        2.0 * gtao.proj_xy.y * dist_c,
-        (gtao.flags & 1u) != 0u,
+fn fs_gtao_ao(@builtin(position) frag_pos: vec4<f32>) -> MainOut {
+    let max_c = vec2<i32>(
+        max(i32(gtao.active_px.x) - 1, 0),
+        max(i32(gtao.active_px.y) - 1, 0),
     );
-    let raw_radius_px = (gtao.radius * half_h) / max(world_h, 1e-5);
-    if (raw_radius_px < 1.25) {
-        return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    let coord = clamp(vec2<i32>(frag_pos.xy), vec2<i32>(0, 0), max_c);
+    let d_c = load_depth_mip0(coord, max_c);
+    if (d_c <= 0.0) {
+        return MainOut(
+            vec4<f32>(1.0 / GTAO_OCCLUSION_SCALE, 0.0, 0.0, 1.0),
+            vec4<f32>(0.0, 0.0, 0.0, 1.0),
+        );
     }
-    let radius_px = min(raw_radius_px, gtao.max_half_radius_px);
 
-    // Clamp effective world falloff radius when screen-space clamping shrinks the search kernel
-    // at very close zoom distances, keeping contact shading crisp.
-    let eff_world_radius = max(gtao.radius * (radius_px / raw_radius_px), 1e-4);
-    let inv_r2 = 1.0 / (eff_world_radius * eff_world_radius);
-    // Small depth bias along normal prevents flat-surface self-occlusion from fp32 quantization.
-    let pos_biased = pos_c + normal * max(eff_world_radius * 0.008, dist_c * 0.0005);
+    let d_l = select(0.0, load_depth_mip0(coord + vec2<i32>(-1, 0), max_c), coord.x > 0);
+    let d_r = select(0.0, load_depth_mip0(coord + vec2<i32>(1, 0), max_c), coord.x < max_c.x);
+    let d_t = select(0.0, load_depth_mip0(coord + vec2<i32>(0, -1), max_c), coord.y > 0);
+    let d_b = select(0.0, load_depth_mip0(coord + vec2<i32>(0, 1), max_c), coord.y < max_c.y);
 
-    let noise_phi = ign(vec2<f32>(coord));
-    let noise_step = ign(vec2<f32>(coord) + vec2<f32>(7.0, 13.0));
-    let slices = clamp(gtao.slices, 1u, 4u);
-    let steps = clamp(gtao.steps_per_side, 2u, 6u);
-    let max_coord = vec2<i32>(max(i32(gtao.half_px.x) - 1, 0), max(i32(gtao.half_px.y) - 1, 0));
+    let edges = calculate_edges(d_c, d_l, d_r, d_t, d_b);
+    let packed_edge = pack_edges(edges);
+
+    let px_c = vec2<f32>(coord) + vec2<f32>(0.5);
+    let pos_c = gtao_view_pos_linear(gtao, px_c, d_c);
+    let view_dir = gtao_view_dir(gtao, pos_c);
+    let pos_l = select(pos_c, gtao_view_pos_linear(gtao, px_c + vec2<f32>(-1.0, 0.0), d_l), d_l > 0.0);
+    let pos_r = select(pos_c, gtao_view_pos_linear(gtao, px_c + vec2<f32>(1.0, 0.0), d_r), d_r > 0.0);
+    let pos_t = select(pos_c, gtao_view_pos_linear(gtao, px_c + vec2<f32>(0.0, -1.0), d_t), d_t > 0.0);
+    let pos_b = select(pos_c, gtao_view_pos_linear(gtao, px_c + vec2<f32>(0.0, 1.0), d_b), d_b > 0.0);
+    let normal = calculate_normal(edges, pos_c, pos_l, pos_r, pos_t, pos_b, view_dir);
+
+    let effect_radius = gtao.radius * GTAO_RADIUS_MULTIPLIER;
+    let ah = max(f32(gtao.active_px.y), 1.0);
+    let is_persp = (gtao.flags & 1u) != 0u;
+    let world_h = select(2.0 * gtao.proj_xy.y, 2.0 * gtao.proj_xy.y * d_c, is_persp);
+    let raw_radius_px = (effect_radius * ah) / max(world_h, 1e-5);
+    if (raw_radius_px < 1.5) {
+        return MainOut(
+            vec4<f32>(1.0 / GTAO_OCCLUSION_SCALE, 0.0, 0.0, 1.0),
+            vec4<f32>(packed_edge, 0.0, 0.0, 1.0),
+        );
+    }
+
+    let radius_px = min(raw_radius_px, gtao.max_screen_radius_px);
+    let eff_radius = max(effect_radius * (radius_px / raw_radius_px), 1e-4);
+    let falloff_range = GTAO_FALLOFF_RANGE * eff_radius;
+    let falloff_from = eff_radius * (1.0 - GTAO_FALLOFF_RANGE);
+    let falloff_mul = -1.0 / max(falloff_range, 1e-5);
+    let falloff_add = falloff_from / max(falloff_range, 1e-5) + 1.0;
+
+    // Slight view-space nudge toward normal eliminates fp32 self-occlusion on flat planes.
+    let pos_biased = pos_c + normal * max(eff_radius * 0.002, d_c * 0.00025);
+
+    let noise = spatial_noise(coord);
+    let slices = clamp(gtao.slices, 1u, 6u);
+    let steps = clamp(gtao.steps_per_side, 2u, 8u);
+    let max_mip = max(gtao.mip_count, 1u) - 1u;
+    let min_s = 1.3 / max(radius_px, 1.5);
 
     var vis_sum = 0.0;
     var weight_sum = 0.0;
 
     for (var s: u32 = 0u; s < slices; s = s + 1u) {
-        let phi = (f32(s) + noise_phi) * (GTAO_PI / f32(slices));
+        let phi = (f32(s) + noise.x) * (GTAO_PI / f32(slices));
         let omega = vec2<f32>(cos(phi), sin(phi));
         // Screen +Y points downward -> view-space slice direction flips Y.
         let dir_v = vec3<f32>(omega.x, -omega.y, 0.0);
@@ -147,49 +277,47 @@ fn fs_gtao_ao(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> 
         let n_angle = sign_n * acos(cos_n);
         let sin_n = sin(n_angle);
 
-        var max_cos_neg = -1.0;
-        var max_cos_pos = -1.0;
+        let cos_flat_pos = -sin_n;
+        let cos_flat_neg = sin_n;
+        var max_cos_pos = cos_flat_pos;
+        var max_cos_neg = cos_flat_neg;
 
         for (var step_i: u32 = 0u; step_i < steps; step_i = step_i + 1u) {
-            let t = (f32(step_i) + 0.35 + 0.55 * noise_step) / f32(steps);
-            // Quadratic step distribution concentrates samples near fine CAD crevices.
-            let sample_dist_px = max(1.0, t * t * radius_px);
-            let offset_px = vec2<i32>(round(omega * sample_dist_px));
-            if (offset_px.x == 0 && offset_px.y == 0) {
-                continue;
-            }
+            // Per-(slice, step) R1 golden-ratio sequence breaks radial phase locking across slices.
+            let step_base = f32(s + step_i * steps) * 0.6180339887;
+            let step_noise = fract(noise.y + step_base);
+            let s_norm = (f32(step_i) + step_noise) / f32(steps);
+            let s_dist = pow(s_norm, 1.65) + min_s;
+            let offset_px = omega * (s_dist * radius_px);
+            let offset_len = length(offset_px);
 
-            // Positive side (+omega)
-            let cp = coord + offset_px;
-            if (cp.x >= 0 && cp.y >= 0 && cp.x <= max_coord.x && cp.y <= max_coord.y) {
-                let zp = load_half_depth(cp);
-                if (zp > 0.0) {
-                    let delta = gtao_view_pos_half(gtao, cp, zp) - pos_biased;
-                    let len2 = dot(delta, delta);
-                    if (len2 > 1e-10) {
-                        let falloff = clamp(len2 * inv_r2, 0.0, 1.0);
-                        let cos_h = dot(delta, view_dir) * inverseSqrt(len2);
-                        let eff = mix(cos_h, -1.0, falloff * falloff);
-                        max_cos_pos = max(max_cos_pos, eff);
-                    }
-                }
-            }
+            // Conservative MIP bias (-3.3) keeps near/mid occluders sharp while far taps stay cache-hot.
+            let mip_f = clamp(log2(max(offset_len, 1.0)) - 3.3, 0.0, f32(max_mip));
+            let mip_u = u32(floor(mip_f));
+            let snapped = round(offset_px);
 
-            // Negative side (-omega)
-            let cn = coord - offset_px;
-            if (cn.x >= 0 && cn.y >= 0 && cn.x <= max_coord.x && cn.y <= max_coord.y) {
-                let zn = load_half_depth(cn);
-                if (zn > 0.0) {
-                    let delta = gtao_view_pos_half(gtao, cn, zn) - pos_biased;
-                    let len2 = dot(delta, delta);
-                    if (len2 > 1e-10) {
-                        let falloff = clamp(len2 * inv_r2, 0.0, 1.0);
-                        let cos_h = dot(delta, view_dir) * inverseSqrt(len2);
-                        let eff = mix(cos_h, -1.0, falloff * falloff);
-                        max_cos_neg = max(max_cos_neg, eff);
-                    }
-                }
-            }
+            max_cos_pos = sample_horizon_mip(
+                px_c + snapped,
+                mip_u,
+                max_c,
+                pos_biased,
+                view_dir,
+                falloff_mul,
+                falloff_add,
+                cos_flat_pos,
+                max_cos_pos,
+            );
+            max_cos_neg = sample_horizon_mip(
+                px_c - snapped,
+                mip_u,
+                max_c,
+                pos_biased,
+                view_dir,
+                falloff_mul,
+                falloff_add,
+                cos_flat_neg,
+                max_cos_neg,
+            );
         }
 
         let h1_raw = -acos(clamp(max_cos_neg, -1.0, 1.0));
@@ -198,15 +326,21 @@ fn fs_gtao_ao(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> 
         let h2 = n_angle + min(h2_raw - n_angle, GTAO_HALF_PI);
         let arc_sum = integrate_arc(h1, n_angle, cos_n, sin_n)
             + integrate_arc(h2, n_angle, cos_n, sin_n);
-        // Normalize by exact unoccluded slice integral so tilted flat planes evaluate to 1.000
-        // with zero rotational banding even at 2 slices.
         let unoccluded = max(cos_n + n_angle * sin_n, 1e-4);
-        let slice_vis = clamp(arc_sum / unoccluded, 0.0, 1.0);
+        let slice_vis = clamp(arc_sum / unoccluded, 0.0, 1.25);
 
-        vis_sum = vis_sum + proj_n_len * slice_vis;
-        weight_sum = weight_sum + proj_n_len;
+        let p_w = mix(proj_n_len, 1.0, 0.05);
+        vis_sum = vis_sum + p_w * slice_vis;
+        weight_sum = weight_sum + p_w;
     }
 
-    let visibility = select(1.0, clamp(vis_sum / weight_sum, 0.0, 1.0), weight_sum > 1e-5);
-    return vec4<f32>(visibility, 0.0, 0.0, 1.0);
+    var visibility = select(1.0, vis_sum / weight_sum, weight_sum > 1e-5);
+    // Gentle fade-out for tiny sub-10px screen radii avoids single-pixel shimmering in wide views.
+    visibility = visibility + clamp((10.0 - raw_radius_px) / 100.0, 0.0, 1.0) * 0.5;
+    visibility = clamp(visibility, 0.03, GTAO_OCCLUSION_SCALE);
+
+    return MainOut(
+        vec4<f32>(visibility / GTAO_OCCLUSION_SCALE, 0.0, 0.0, 1.0),
+        vec4<f32>(packed_edge, 0.0, 0.0, 1.0),
+    );
 }

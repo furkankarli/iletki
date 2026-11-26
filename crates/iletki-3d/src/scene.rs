@@ -26,7 +26,9 @@ use crate::section_cap::{
 };
 use crate::shading::ScenePipelines;
 use crate::storage_batch::{self, ChunkTransformTable, StorageDraws, StorageViewBinding};
-use crate::style::{DiagnosticView, StylePipelines, StyleUniform, ViewStyleUniform, VisualStyle};
+use crate::style::{
+    DiagnosticView, StylePipelines, StyleUniform, TechEdgeUniform, ViewStyleUniform, VisualStyle,
+};
 use crate::vertex::Mesh3D;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, DrawPhase, DrawPhaseMask, Vec3, ViewportId};
@@ -252,6 +254,8 @@ pub struct Scene3DLayer {
     shared_oit_rev: u64,
     shared_oit_mode: u8,
     translucent_scan_cache: (u64, bool, bool),
+    /// `(geometry_revision, any chunk has faces without authored edges)`.
+    edgeless_scan_cache: (u64, bool),
     section_caps: SectionCapConfig,
     section_cap_pipelines: Option<SectionCapPipelines>,
     gtao: GtaoConfig,
@@ -350,6 +354,7 @@ impl Scene3DLayer {
             shared_oit_rev: 0,
             shared_oit_mode: 0,
             translucent_scan_cache: (0, false, false),
+            edgeless_scan_cache: (0, true),
             section_caps: SectionCapConfig::default(),
             section_cap_pipelines: None,
             gtao: GtaoConfig::default(),
@@ -1132,6 +1137,22 @@ impl Scene3DLayer {
         (any_tr, explicit_tr)
     }
 
+    /// Returns whether any chunk has faces but no authored edges. Such chunks need screen-space
+    /// crease detection in `VisualStyle::Technical`; authored edges own every other crease.
+    /// Hidden chunks count too, so visibility toggles never leave the cache stale.
+    fn has_edgeless_faces(&mut self) -> bool {
+        if self.edgeless_scan_cache.0 == self.geometry_revision && self.geometry_revision != 0 {
+            return self.edgeless_scan_cache.1;
+        }
+        let edgeless = self
+            .chunks
+            .iter()
+            .flatten()
+            .any(|chunk| chunk.vertex_count > 0 && chunk.edge_count == 0);
+        self.edgeless_scan_cache = (self.geometry_revision, edgeless);
+        edgeless
+    }
+
     #[inline]
     fn is_xray_active(&self) -> bool {
         !self.diagnostic_view.is_active() && self.visual_style == VisualStyle::XRay
@@ -1587,18 +1608,34 @@ impl Scene3DLayer {
                 v.style_uniform = None;
             }
         }
+        let has_clip_planes = !ctx.camera.clip_planes().is_empty();
+        let creases = self.visual_style == VisualStyle::Technical && self.has_edgeless_faces();
         let Some(sp) = self.style_pipelines.as_ref() else {
             return;
         };
-        let has_clip_planes = !ctx.camera.clip_planes().is_empty();
         let face_u =
             StyleUniform::for_faces(self.visual_style, self.diagnostic_view, has_clip_planes);
         let edge_u = StyleUniform::for_edges(self.visual_style, has_clip_planes);
+        let tech_edge_u = (self.visual_style == VisualStyle::Technical
+            && !self.diagnostic_view.is_active()
+            && sp.tech_edges.is_some())
+        .then(|| {
+            TechEdgeUniform::from_camera(
+                ctx.camera,
+                ctx.logical_size,
+                ctx.active_px,
+                ctx.msaa_samples,
+                ctx.color_format,
+                creases,
+            )
+        })
+        .flatten();
         if let Some(view) = self.views.get_mut(view_index) {
             let uniform = view
                 .style_uniform
                 .get_or_insert_with(|| ViewStyleUniform::new(ctx.device, &sp.style_layout));
             uniform.update(ctx.queue, face_u, edge_u);
+            uniform.update_tech_edges(ctx.device, ctx.queue, tech_edge_u);
         }
     }
 
@@ -2180,9 +2217,14 @@ impl Scene3DLayer {
         let Some(style_u) = &view.style_uniform else {
             return;
         };
+        let aa = self.use_antialiased_section;
+        let direct_set = sp.direct.variant(aa);
+        let packed_set = sp.packed.as_ref().map(|set| set.variant(aa));
+        let storage_set = sp.storage.as_ref().map(|set| set.variant(aa));
+        let repeated_set = sp.storage_repeated.as_ref().map(|set| set.variant(aa));
         let is_overdraw = self.diagnostic_view == DiagnosticView::Overdraw;
         let is_wireframe = self.is_wireframe_active();
-        let draw_faces = !is_wireframe || sp.direct.wireframe_line.is_some();
+        let draw_faces = !is_wireframe || direct_set.wireframe_line.is_some();
         let draw_edges = self.draws_edges() && view.has_edges;
 
         let storage_bg = view
@@ -2211,15 +2253,15 @@ impl Scene3DLayer {
                 }
             }
             if let Some((direct_smooth, direct_flat)) =
-                pick_style_face(&sp.direct, is_overdraw, is_wireframe)
+                pick_style_face(direct_set, is_overdraw, is_wireframe)
             {
                 let use_storage_faces = !is_wireframe
-                    && sp.storage.is_some()
+                    && storage_set.is_some()
                     && storage_bg.is_some()
                     && view.storage_faces.has_packed();
                 let use_packed_faces = !is_wireframe
                     && !use_storage_faces
-                    && sp.packed.is_some()
+                    && packed_set.is_some()
                     && view.faces.has_packed();
 
                 // Draw direct (or unbatched) faces first with `object_layout` at @group(1) so
@@ -2251,13 +2293,11 @@ impl Scene3DLayer {
                 }
 
                 if use_storage_faces
-                    && let (Some(st_set), Some(st_bg)) = (&sp.storage, storage_bg)
+                    && let (Some(st_set), Some(st_bg)) = (storage_set, storage_bg)
                     && let Some((smooth, flat)) = pick_style_face(st_set, is_overdraw, is_wireframe)
                 {
-                    let rep = sp
-                        .storage_repeated
-                        .as_ref()
-                        .and_then(|s| pick_style_face(s, is_overdraw, is_wireframe));
+                    let rep =
+                        repeated_set.and_then(|s| pick_style_face(s, is_overdraw, is_wireframe));
                     let pipes = PaintPipelines {
                         smooth,
                         flat,
@@ -2269,7 +2309,7 @@ impl Scene3DLayer {
                     view.storage_faces
                         .paint(pass, st_bg, &pipes, false, |_, _| {});
                 } else if use_packed_faces
-                    && let Some(pk_set) = &sp.packed
+                    && let Some(pk_set) = packed_set
                     && let Some((smooth, flat)) = pick_style_face(pk_set, is_overdraw, is_wireframe)
                 {
                     let pipes = PaintPipelines {
@@ -2288,9 +2328,9 @@ impl Scene3DLayer {
         if draw_edges {
             let edge_bg = style_u.edge_bind_group();
             let use_storage_edges =
-                sp.storage.is_some() && storage_bg.is_some() && view.storage_edges.has_packed();
+                storage_set.is_some() && storage_bg.is_some() && view.storage_edges.has_packed();
             let use_packed_edges =
-                !use_storage_edges && sp.packed.is_some() && view.edges.has_packed();
+                !use_storage_edges && packed_set.is_some() && view.edges.has_packed();
 
             let mut bound_direct_edge = false;
             for index in 0..view.draws.len() {
@@ -2304,7 +2344,7 @@ impl Scene3DLayer {
                 {
                     if !bound_direct_edge {
                         pass.set_bind_group(2, edge_bg, &[]);
-                        pass.set_pipeline(&sp.direct.edge);
+                        pass.set_pipeline(&direct_set.edge);
                         bound_direct_edge = true;
                     }
                     let slot = u32::try_from(object.chunk).unwrap_or(0);
@@ -2312,18 +2352,18 @@ impl Scene3DLayer {
                 }
             }
 
-            if use_storage_edges && let (Some(st_set), Some(st_bg)) = (&sp.storage, storage_bg) {
+            if use_storage_edges && let (Some(st_set), Some(st_bg)) = (storage_set, storage_bg) {
                 let pipes = PaintPipelines {
                     smooth: &st_set.edge,
                     flat: None,
-                    repeated_smooth: sp.storage_repeated.as_ref().map(|r| &r.edge),
+                    repeated_smooth: repeated_set.map(|r| &r.edge),
                     repeated_flat: None,
                     repeated_slots: None,
                 };
                 pass.set_bind_group(2, edge_bg, &[]);
                 view.storage_edges
                     .paint(pass, st_bg, &pipes, false, |_, _| {});
-            } else if use_packed_edges && let Some(pk_set) = &sp.packed {
+            } else if use_packed_edges && let Some(pk_set) = packed_set {
                 let pipes = PaintPipelines {
                     smooth: &pk_set.edge,
                     flat: None,
@@ -2400,11 +2440,25 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     && !view.picking
                     && view.gtao.as_ref().is_some_and(|g| g.active)
             });
+        let tech_edges_active = self.visual_style == VisualStyle::Technical
+            && !self.diagnostic_view.is_active()
+            && self
+                .style_pipelines
+                .as_ref()
+                .is_some_and(|sp| sp.tech_edges.is_some())
+            && self.views.iter().any(|view| {
+                view.id == viewport_id
+                    && !view.picking
+                    && view
+                        .style_uniform
+                        .as_ref()
+                        .is_some_and(ViewStyleUniform::tech_edges_active)
+            });
         let mut mask = PassHookMask::NONE;
         if caps_active || oit_active {
             mask = mask.union(PassHookMask::POST_OPAQUE);
         }
-        if gtao_active {
+        if gtao_active || tech_edges_active {
             mask = mask.union(PassHookMask::POST_SCENE_RESOLVED);
         }
         mask
@@ -2429,14 +2483,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         };
 
         if stage == PassHookStage::PostSceneResolved {
-            let (Some(gtao_pl), Some(depth_sample), Some(resolved_color)) = (
-                self.gtao_pipelines.as_ref(),
-                ctx.depth_sample_view,
-                ctx.resolved_color_view,
-            ) else {
+            let (Some(depth_sample), Some(resolved_color)) =
+                (ctx.depth_sample_view, ctx.resolved_color_view)
+            else {
                 return;
             };
-            if let Some(view) = self.views.get_mut(view_idx)
+            if let Some(gtao_pl) = self.gtao_pipelines.as_ref()
+                && let Some(view) = self.views.get_mut(view_idx)
                 && let Some(view_gtao) = view.gtao.as_mut().filter(|g| g.active)
             {
                 let targets = ViewGtaoTargets::ensure(
@@ -2447,6 +2500,20 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     depth_sample,
                 );
                 targets.encode(encoder, gtao_pl, ctx.active_px, resolved_color);
+            }
+            if self.visual_style == VisualStyle::Technical
+                && !self.diagnostic_view.is_active()
+                && let Some(tech_pl) = self
+                    .style_pipelines
+                    .as_ref()
+                    .and_then(|sp| sp.tech_edges.as_ref())
+                && let Some(view) = self.views.get_mut(view_idx)
+                && let Some(style_u) = view
+                    .style_uniform
+                    .as_mut()
+                    .filter(|s| s.tech_edges_active())
+            {
+                style_u.encode_tech_edges(encoder, ctx, tech_pl, depth_sample, resolved_color);
             }
             return;
         }
