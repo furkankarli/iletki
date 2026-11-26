@@ -29,7 +29,7 @@ pub use iletki_2d::{
 pub use iletki_3d as cad3d;
 #[cfg(feature = "cad3d")]
 pub use iletki_3d::{
-    Chunk3DId, DiagnosticView, GizmoAxis, Grid3DConfig, GridPlane, InfiniteGrid3DLayer, Instance3D,
-    InstancedMesh3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D, Scene3DLayer,
+    Chunk3DId, DiagnosticView, GizmoAxis, Grid3DConfig, GridPlane, GtaoConfig, InfiniteGrid3DLayer,
+    Instance3D, InstancedMesh3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D, Scene3DLayer,
     SectionCapConfig, SectionCapPattern, TransformGizmoLayer, Vertex3D, VisualStyle,
 };

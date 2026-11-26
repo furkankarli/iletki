@@ -7,9 +7,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use iletki_3d::{
-    DiagnosticView, GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Material3D, MaterialFlags,
-    MaterialId, Mesh3D, Scene3DLayer, SectionCapConfig, SectionCapPattern, TransformGizmoLayer,
-    VisualStyle,
+    DiagnosticView, GizmoAxis, Grid3DConfig, GtaoConfig, InfiniteGrid3DLayer, Material3D,
+    MaterialFlags, MaterialId, Mesh3D, Scene3DLayer, SectionCapConfig, SectionCapPattern,
+    TransformGizmoLayer, VisualStyle,
 };
 use iletki_core::{
     Bounds3, Camera, DirtyFlags, DrawPhase, DrawPhaseMask, PickId, Plane, Vec3, ViewportId,
@@ -2916,5 +2916,267 @@ fn cad_visual_styles_and_diagnostic_views_render_and_pick_cleanly() {
     assert!(
         lit_a > 200 && lit_b > 100,
         "shared Scene3DLayer XRay must render cleanly in both 4x and 1x viewports (lit_a={lit_a}, lit_b={lit_b})"
+    );
+}
+
+#[test]
+fn gtao_darkens_concave_corners_preserves_background_and_coexists_with_caps_and_oit() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let is_gl = device.adapter_info().backend == wgpu::Backend::Gl;
+
+    // Build an open trihedral concave CAD corner (floor + back wall + left wall) with visible sky.
+    let build_corner_scene = || {
+        let mut scene = Scene3DLayer::new(1);
+        let mat_color = [215, 215, 215, 255];
+        let mut floor = Mesh3D::at_origin(Vec3::ZERO);
+        floor.push_box(
+            Vec3::new(-0.4, -0.25, -0.4),
+            Vec3::new(3.6, 0.0, 3.6),
+            mat_color,
+            PickId::new(1, 501, 0),
+            false,
+        );
+        let mut back_wall = Mesh3D::at_origin(Vec3::ZERO);
+        back_wall.push_box(
+            Vec3::new(-0.4, 0.0, -0.4),
+            Vec3::new(3.6, 2.2, 0.0),
+            mat_color,
+            PickId::new(1, 502, 0),
+            false,
+        );
+        let mut left_wall = Mesh3D::at_origin(Vec3::ZERO);
+        left_wall.push_box(
+            Vec3::new(-0.4, 0.0, 0.0),
+            Vec3::new(0.0, 2.2, 3.6),
+            mat_color,
+            PickId::new(1, 503, 0),
+            false,
+        );
+        let floor_id = scene.insert(floor);
+        let _back_id = scene.insert(back_wall);
+        let _left_id = scene.insert(left_wall);
+        (scene, floor_id)
+    };
+
+    let project_px = |cam: &Camera, world: Vec3, w: u32, h: u32| -> (u32, u32) {
+        let vp = cam.view_proj_relative(iletki_core::Vec2::new(f64::from(w), f64::from(h)));
+        let rel = world - cam.position_3d();
+        let clip = vp.mul_vec4(iletki_core::Vec4::new(rel.x, rel.y, rel.z, 1.0));
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        let px = (((ndc_x + 1.0) * 0.5) * f64::from(w))
+            .round()
+            .clamp(0.0, f64::from(w - 1)) as u32;
+        let py = (((1.0 - ndc_y) * 0.5) * f64::from(h))
+            .round()
+            .clamp(0.0, f64::from(h - 1)) as u32;
+        (px, py)
+    };
+
+    let avg_luma = |img: &iletki_wgpu::RgbaImage, cx: u32, cy: u32| -> f32 {
+        let mut sum = 0.0f32;
+        let mut count = 0.0f32;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let x = (cx as i32 + dx).clamp(0, img.width as i32 - 1) as u32;
+                let y = (cy as i32 + dy).clamp(0, img.height as i32 - 1) as u32;
+                if let Some(px) = img.pixel(x, y) {
+                    sum += f32::from(px[0]) * 0.299
+                        + f32::from(px[1]) * 0.587
+                        + f32::from(px[2]) * 0.114;
+                    count += 1.0;
+                }
+            }
+        }
+        sum / count.max(1.0)
+    };
+
+    let configs = [
+        (
+            "persp_4x",
+            4u32,
+            Camera::perspective_3d(
+                Vec3::new(3.8, 3.0, 4.4),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                std::f64::consts::FRAC_PI_4,
+                0.1,
+            ),
+        ),
+        (
+            "persp_1x",
+            1u32,
+            Camera::perspective_3d(
+                Vec3::new(3.8, 3.0, 4.4),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                std::f64::consts::FRAC_PI_4,
+                0.1,
+            ),
+        ),
+        (
+            "ortho_4x",
+            4u32,
+            Camera::ortho_3d(
+                Vec3::new(4.2, 3.4, 4.8),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                5.4,
+                0.1,
+                40.0,
+            ),
+        ),
+    ];
+
+    for (label, msaa, cam) in configs {
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                color_format: wgpu::TextureFormat::Rgba8Unorm,
+                msaa_samples: msaa,
+                clear_color: [0.06, 0.08, 0.12, 1.0],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                initial_px: [240, 160],
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        *host.camera_mut() = cam.clone();
+        let (mut scene, _floor_id) = build_corner_scene();
+        assert!(!scene.gtao().enabled);
+
+        let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+            queue.submit([enc.finish()]);
+            host.readback_rgba_blocking(&device, &queue).unwrap()
+        };
+
+        let img_base = render(&mut host, &mut scene);
+
+        let mut gtao_cfg = GtaoConfig::with_radius(1.4);
+        gtao_cfg.intensity = 1.25;
+        gtao_cfg.power = 1.6;
+        scene.set_gtao(gtao_cfg);
+        assert!(scene.gtao().enabled);
+        let img_ao = render(&mut host, &mut scene);
+
+        let corner_px = project_px(&cam, Vec3::new(0.18, 0.02, 0.18), 240, 160);
+        let open_px = project_px(&cam, Vec3::new(2.9, 0.02, 2.9), 240, 160);
+        let bg_base = img_base.pixel(4, 4).unwrap();
+        let bg_ao = img_ao.pixel(4, 4).unwrap();
+        assert_eq!(
+            bg_base, bg_ao,
+            "{label}: GTAO must preserve background pixels bit-for-bit"
+        );
+
+        let corner_base = avg_luma(&img_base, corner_px.0, corner_px.1);
+        let corner_ao = avg_luma(&img_ao, corner_px.0, corner_px.1);
+        let open_base = avg_luma(&img_base, open_px.0, open_px.1);
+        let open_ao = avg_luma(&img_ao, open_px.0, open_px.1);
+
+        if !is_gl {
+            let corner_drop = corner_base - corner_ao;
+            let open_drop = open_base - open_ao;
+            assert!(
+                corner_drop > 18.0,
+                "{label}: GTAO must clearly darken concave corner (base={corner_base:.1}, ao={corner_ao:.1}, px={corner_px:?})"
+            );
+            assert!(
+                open_drop < 12.0 && corner_drop > open_drop * 2.0,
+                "{label}: open flat floor must remain bright without false self-shadowing (open_drop={open_drop:.1}, corner_drop={corner_drop:.1})"
+            );
+        } else {
+            assert_eq!(
+                img_base.pixels, img_ao.pixels,
+                "{label}: GL fallback must gracefully no-op without corrupting output"
+            );
+        }
+
+        // Exact 64-bit picking remains intact with GTAO active.
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [0, 0, 240, 160])
+            .unwrap();
+        let hit_ids: Vec<u32> = hits.iter().map(|h| h.id.object).collect();
+        assert!(
+            hit_ids.contains(&501) && hit_ids.contains(&502) && hit_ids.contains(&503),
+            "{label}: picking must succeed with GTAO enabled, got {hit_ids:?}"
+        );
+
+        // Toggling GTAO off restores exact baseline pixels and releases GPU resources.
+        scene.set_gtao(GtaoConfig::default());
+        assert!(!scene.gtao().enabled);
+        let img_off = render(&mut host, &mut scene);
+        assert_eq!(
+            img_base.pixels, img_off.pixels,
+            "{label}: disabling GTAO must restore baseline pixels exactly"
+        );
+    }
+
+    // Resilience & Coexistence: block-boundary resizes (including 1x1), Continuous mode,
+    // Section Caps + WBOIT + GTAO all enabled simultaneously in one frame.
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.06, 0.08, 0.12, 1.0],
+            mode: ViewportMode::Continuous,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [240, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(4.0, 3.0, 4.5),
+        Vec3::new(0.8, 0.5, 0.8),
+        Vec3::Y,
+        std::f64::consts::FRAC_PI_4,
+        0.1,
+    );
+    host.camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(2.2, 0.0, 0.0),
+        )
+        .unwrap()]);
+    let (mut scene, _floor_id) = build_corner_scene();
+    let mut glass_pane = Mesh3D::at_origin(Vec3::new(1.2, 0.8, 1.2));
+    glass_pane.push_box(
+        Vec3::new(-0.3, -0.5, -0.05),
+        Vec3::new(0.3, 0.5, 0.05),
+        [40, 120, 240, 255],
+        PickId::new(1, 504, 0),
+        false,
+    );
+    let glass_id = scene.insert(glass_pane);
+    let glass_mat = scene.insert_material(Material3D::translucent([0.2, 0.5, 1.0, 0.45]));
+    scene.set_chunk_material(glass_id, glass_mat);
+    if host.supports_stencil(&device) {
+        scene.set_section_caps(SectionCapConfig::solid([0.9, 0.2, 0.15, 1.0]));
+    }
+    scene.set_gtao(GtaoConfig::with_radius(1.2));
+
+    for size in [[257, 193], [1, 1], [240, 160]] {
+        host.resize(&device, size, 1.0);
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+    }
+    let img_combo = host.readback_rgba_blocking(&device, &queue).unwrap();
+    assert_eq!((img_combo.width, img_combo.height), (240, 160));
+    let non_bg = img_combo
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > 30 || px[1] > 30 || px[2] > 50)
+        .count();
+    assert!(
+        non_bg > 2000,
+        "combined Section Caps + WBOIT + GTAO in Continuous mode must render cleanly (non_bg={non_bg})"
     );
 }

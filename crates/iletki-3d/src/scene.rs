@@ -8,6 +8,7 @@ use crate::face_batch::{
 use crate::gpu_cull::{
     self, CullChunkInput, CullViewUniforms, GpuCullPipelines, GpuCullScene, GpuCullView,
 };
+use crate::gtao::{self, GtaoConfig, GtaoPipelines, GtaoUniform, ViewGtaoState, ViewGtaoTargets};
 use crate::material::{Material3D, MaterialId, MaterialTable};
 use crate::objects::{
     FaceRanges, PickVolume, PreparedObject, SectionGroup, SectionRelation, SectionVolume,
@@ -252,6 +253,8 @@ pub struct Scene3DLayer {
     translucent_scan_cache: (u64, bool, bool),
     section_caps: SectionCapConfig,
     section_cap_pipelines: Option<SectionCapPipelines>,
+    gtao: GtaoConfig,
+    gtao_pipelines: Option<GtaoPipelines>,
     shared_stencil_draws: StorageDraws,
     shared_stencil_direct: Vec<usize>,
     shared_stencil_rev: u64,
@@ -351,6 +354,8 @@ impl Scene3DLayer {
             translucent_scan_cache: (0, false, false),
             section_caps: SectionCapConfig::default(),
             section_cap_pipelines: None,
+            gtao: GtaoConfig::default(),
+            gtao_pipelines: None,
             shared_stencil_draws: StorageDraws::default(),
             shared_stencil_direct: Vec::new(),
             shared_stencil_rev: 0,
@@ -1168,6 +1173,37 @@ impl Scene3DLayer {
             )
     }
 
+    #[inline]
+    fn gtao_suppressed(&self) -> bool {
+        self.caps_suppressed()
+    }
+
+    /// Configures opt-in half-resolution depth-only Ground-Truth Ambient Occlusion (GTAO).
+    ///
+    /// Disabled by default ([`GtaoConfig::default`]) with zero GPU allocations or render passes.
+    /// Automatically degrades to a no-op on backends without sampleable depth (such as OpenGL)
+    /// and while engineering diagnostic, wireframe, or X-Ray views are active.
+    pub fn set_gtao(&mut self, config: GtaoConfig) {
+        let clean = config.sanitized();
+        if self.gtao == clean {
+            return;
+        }
+        self.gtao = clean;
+        if !self.gtao.enabled || self.gtao.intensity <= 0.0 {
+            self.gtao_pipelines = None;
+            for view in &mut self.views {
+                view.gtao = None;
+            }
+        }
+        self.revision.mark_static();
+    }
+
+    /// Returns the active [`GtaoConfig`].
+    #[must_use]
+    pub fn gtao(&self) -> GtaoConfig {
+        self.gtao
+    }
+
     fn oit_active(&mut self) -> bool {
         if self.diagnostic_view.is_active()
             || matches!(
@@ -1730,6 +1766,57 @@ impl Scene3DLayer {
         }
     }
 
+    fn prepare_gtao<W>(&mut self, ctx: &PrepareCtx<'_, W>, view_index: usize) {
+        if !self.gtao.enabled || self.gtao_suppressed() || self.gtao.intensity <= 0.0 {
+            if self.gtao_pipelines.is_some() {
+                self.gtao_pipelines = None;
+                for v in &mut self.views {
+                    v.gtao = None;
+                }
+            } else if let Some(view) = self.views.get_mut(view_index) {
+                view.gtao = None;
+            }
+            return;
+        }
+        if !gtao::supports_gtao(ctx.device, ctx.depth_format, ctx.msaa_samples) {
+            if let Some(view) = self.views.get_mut(view_index) {
+                view.gtao = None;
+            }
+            return;
+        }
+        let Some(uniform) = GtaoUniform::from_camera(
+            ctx.camera,
+            ctx.logical_size,
+            ctx.active_px,
+            ctx.msaa_samples,
+            self.gtao,
+        ) else {
+            if let Some(view) = self.views.get_mut(view_index)
+                && let Some(g) = view.gtao.as_mut()
+            {
+                g.active = false;
+            }
+            return;
+        };
+        if !self
+            .gtao_pipelines
+            .as_ref()
+            .is_some_and(|gp| gp.matches(ctx))
+        {
+            self.gtao_pipelines = Some(GtaoPipelines::build(ctx));
+            for v in &mut self.views {
+                v.gtao = None;
+            }
+        }
+        if let Some(view) = self.views.get_mut(view_index) {
+            let state = view
+                .gtao
+                .get_or_insert_with(|| ViewGtaoState::new(ctx.device));
+            state.active = true;
+            state.update(ctx.queue, uniform);
+        }
+    }
+
     fn ensure_select_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
         if let Some(p) = &mut self.pipelines {
             p.ensure_select(ctx);
@@ -2253,11 +2340,22 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     && !view.picking
                     && view.oit.as_ref().is_some_and(|o| o.active)
             });
+        let gtao_active = self.gtao.enabled
+            && !self.gtao_suppressed()
+            && self.gtao_pipelines.is_some()
+            && self.views.iter().any(|view| {
+                view.id == viewport_id
+                    && !view.picking
+                    && view.gtao.as_ref().is_some_and(|g| g.active)
+            });
+        let mut mask = PassHookMask::NONE;
         if caps_active || oit_active {
-            PassHookMask::POST_OPAQUE
-        } else {
-            PassHookMask::NONE
+            mask = mask.union(PassHookMask::POST_OPAQUE);
         }
+        if gtao_active {
+            mask = mask.union(PassHookMask::POST_SCENE_RESOLVED);
+        }
+        mask
     }
 
     fn encode_pass_hook(
@@ -2266,9 +2364,6 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         encoder: &mut wgpu::CommandEncoder,
         ctx: &PassHookCtx<'_, W>,
     ) {
-        if stage != PassHookStage::PostOpaque {
-            return;
-        }
         let [aw, ah] = ctx.active_px;
         if aw == 0 || ah == 0 {
             return;
@@ -2280,6 +2375,33 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
         else {
             return;
         };
+
+        if stage == PassHookStage::PostSceneResolved {
+            let (Some(gtao_pl), Some(depth_sample), Some(resolved_color)) = (
+                self.gtao_pipelines.as_ref(),
+                ctx.depth_sample_view,
+                ctx.resolved_color_view,
+            ) else {
+                return;
+            };
+            if let Some(view) = self.views.get_mut(view_idx)
+                && let Some(view_gtao) = view.gtao.as_mut().filter(|g| g.active)
+            {
+                let targets = ViewGtaoTargets::ensure(
+                    &mut view_gtao.targets,
+                    ctx,
+                    gtao_pl,
+                    &view_gtao.uniform_buf,
+                    depth_sample,
+                );
+                targets.encode(encoder, gtao_pl, ctx.active_px, resolved_color);
+            }
+            return;
+        }
+
+        if stage != PassHookStage::PostOpaque {
+            return;
+        }
 
         // 1. GPU Stencil Section Caps (writes opaque cap color + depth before WBOIT depth testing).
         if self.section_caps.enabled
@@ -3075,6 +3197,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
             self.prepare_section_caps(ctx, index, use_storage);
             self.prepare_style(ctx, index);
             self.prepare_oit(ctx, index, use_storage, oit_active);
+            self.prepare_gtao(ctx, index);
         }
         let Some(p) = self.pipelines.as_ref() else {
             return pending;

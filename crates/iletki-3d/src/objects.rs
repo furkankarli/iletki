@@ -1,6 +1,7 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
 use crate::gpu_cull::GpuCullView;
+use crate::gtao::ViewGtaoState;
 use crate::oit::ViewOitState;
 use crate::section_cap::ViewSectionCaps;
 use crate::style::ViewStyleUniform;
@@ -120,6 +121,7 @@ pub(crate) struct ViewObjects {
     pub(crate) outline_bounds: OutlineBounds,
     pub(crate) section_caps: Option<ViewSectionCaps>,
     pub(crate) oit: Option<ViewOitState>,
+    pub(crate) gtao: Option<ViewGtaoState>,
     pub(crate) style_uniform: Option<ViewStyleUniform>,
     pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
@@ -160,6 +162,7 @@ impl ViewObjects {
             outline_bounds: OutlineBounds::default(),
             section_caps: None,
             oit: None,
+            gtao: None,
             style_uniform: None,
             direct_uniforms: Vec::new(),
             pages: Vec::new(),

@@ -15,6 +15,7 @@ mod face_batch;
 pub mod gizmo;
 mod gpu_cull;
 pub mod grid;
+pub mod gtao;
 pub mod instanced;
 pub mod material;
 mod objects;
@@ -31,6 +32,7 @@ pub mod vertex;
 
 pub use gizmo::{GizmoAxis, TransformGizmoLayer};
 pub use grid::{Grid3DConfig, GridPlane, InfiniteGrid3DLayer};
+pub use gtao::GtaoConfig;
 pub use instanced::{Instance3D, InstancedMesh3DLayer};
 pub use material::{Material3D, MaterialFlags, MaterialId};
 pub use scene::{Chunk3DId, Scene3DLayer};
