@@ -22,8 +22,8 @@ mod assembly_fixture;
 mod native {
     use iletki::gpu::{RgbaImage, profiling, wgpu};
     use iletki::{
-        Camera, Chunk3DId, Mesh3D, PickHit, PickId, Plane, Scene3DLayer, Vec3, ViewportConfig,
-        ViewportHost,
+        Camera, Chunk3DId, DiagnosticView, GtaoConfig, Mesh3D, PickHit, PickId, Plane,
+        Scene3DLayer, SectionCapConfig, Vec3, ViewportConfig, ViewportHost, VisualStyle,
     };
     use std::fs::{self, File};
     use std::future::Future;
@@ -208,6 +208,9 @@ mod native {
                     | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
             if std::env::var_os("ILETKI_ASSEMBLY_SAMPLED_SECTION").is_none() {
                 required_features |= adapter.features() & wgpu::Features::CLIP_DISTANCES;
+            }
+            if std::env::var_os("ILETKI_ASSEMBLY_SECTION_CAPS").is_some() {
+                required_features |= adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8;
             }
             let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 required_features,
@@ -809,6 +812,69 @@ mod native {
         start.elapsed().as_secs_f64() * 1000.0
     }
 
+    fn apply_m6_env(scene: &mut Scene3DLayer) -> Result<(), Error> {
+        if let Ok(raw) = std::env::var("ILETKI_ASSEMBLY_GTAO") {
+            let radius = if raw == "1" || raw.eq_ignore_ascii_case("true") {
+                0.75
+            } else {
+                raw.parse::<f32>()?
+            };
+            scene.set_gtao(GtaoConfig::with_radius(radius));
+        }
+        if let Ok(raw) = std::env::var("ILETKI_ASSEMBLY_SECTION_CAPS") {
+            let cfg = match raw.as_str() {
+                "solid" => SectionCapConfig::solid([0.85, 0.28, 0.22, 1.0]),
+                "hatch" => {
+                    SectionCapConfig::hatch([0.92, 0.90, 0.86, 1.0], [0.18, 0.20, 0.24, 1.0], 0.35)
+                }
+                "cross" => SectionCapConfig::cross_hatch(
+                    [0.92, 0.90, 0.86, 1.0],
+                    [0.18, 0.20, 0.24, 1.0],
+                    0.35,
+                ),
+                _ => return Err("expected solid, hatch or cross for SECTION_CAPS".into()),
+            };
+            scene.set_section_caps(cfg);
+        }
+        if std::env::var_os("ILETKI_ASSEMBLY_OIT").is_some() {
+            scene.set_oit_enabled(true);
+        }
+        if let Ok(raw) = std::env::var("ILETKI_ASSEMBLY_VISUAL_STYLE") {
+            let style = match raw.as_str() {
+                "shaded-edges" => VisualStyle::ShadedWithEdges,
+                "shaded" => VisualStyle::Shaded,
+                "technical" => VisualStyle::Technical,
+                "wireframe" => VisualStyle::Wireframe,
+                "xray" => VisualStyle::XRay,
+                _ => {
+                    return Err(
+                        "expected shaded-edges, shaded, technical, wireframe or xray".into(),
+                    );
+                }
+            };
+            scene.set_visual_style(style);
+        }
+        if let Ok(raw) = std::env::var("ILETKI_ASSEMBLY_DIAGNOSTIC") {
+            let view = match raw.as_str() {
+                "none" => DiagnosticView::None,
+                "normals" => DiagnosticView::Normals,
+                "facets" => DiagnosticView::Facets,
+                "backfaces" => DiagnosticView::Backfaces,
+                "overdraw" => DiagnosticView::Overdraw,
+                "chunks" => DiagnosticView::Chunks,
+                "depth" => DiagnosticView::Depth,
+                _ => {
+                    return Err(
+                        "expected none, normals, facets, backfaces, overdraw, chunks or depth"
+                            .into(),
+                    );
+                }
+            };
+            scene.set_diagnostic_view(view);
+        }
+        Ok(())
+    }
+
     fn viewport_size() -> Result<[u32; 2], Error> {
         let Ok(value) = std::env::var("ILETKI_ASSEMBLY_SIZE") else {
             return Ok(SIZE);
@@ -875,7 +941,8 @@ mod native {
         );
         if std::env::var_os("ILETKI_ASSEMBLY_SMOOTH").is_some() {
             let started = Instant::now();
-            let (scene, edits, focus, radius, triangles) = make_smooth_scene(pack);
+            let (mut scene, edits, focus, radius, triangles) = make_smooth_scene(pack);
+            apply_m6_env(&mut scene)?;
             let case = Case {
                 chunks: 500,
                 view: "model",
@@ -928,6 +995,7 @@ mod native {
                 }
             }
             let insert_ms = elapsed_ms(insert_started);
+            apply_m6_env(&mut scene)?;
             eprintln!(
                 "model: {chunks} chunks, {} triangles, {:?} pixels",
                 fixture.triangles, bench.size
@@ -960,7 +1028,8 @@ mod native {
                 }
                 ran_case = true;
                 let started = Instant::now();
-                let (scene, edits) = case.make_scene(bench.variant != "visibility-only", pack);
+                let (mut scene, edits) = case.make_scene(bench.variant != "visibility-only", pack);
+                apply_m6_env(&mut scene)?;
                 bench.record(case, "scene-build", 0, 0.0, elapsed_ms(started), "")?;
                 bench.run_case(case, scene, &edits)?;
             }

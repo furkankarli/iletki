@@ -5,8 +5,8 @@ use iletki_core::{DrawPhase, DrawPhaseMask, ViewportId};
 use iletki_wgpu::wgpu;
 use iletki_wgpu::wgpu::util::DeviceExt;
 use iletki_wgpu::{
-    CAMERA_WGSL, DEPTH_FORMAT, LayerRevision, PaintCtx, PrepareCtx, SELECTION_ID_FORMAT,
-    ViewportLayer, ViewportLifetime,
+    CAMERA_WGSL, LayerRevision, PaintCtx, PrepareCtx, SELECTION_ID_FORMAT, ViewportLayer,
+    ViewportLifetime,
 };
 
 /// Ground plane orientation for [`InfiniteGrid3DLayer`].
@@ -79,6 +79,7 @@ struct GridViewportBinding {
 
 struct GridGpu {
     format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
     msaa: u32,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
@@ -125,10 +126,11 @@ impl InfiniteGrid3DLayer {
     }
 
     fn ensure_gpu<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        let rebuild = !self
-            .gpu
-            .as_ref()
-            .is_some_and(|g| g.format == ctx.color_format && g.msaa == ctx.msaa_samples);
+        let rebuild = !self.gpu.as_ref().is_some_and(|g| {
+            g.format == ctx.color_format
+                && g.depth_format == ctx.depth_format
+                && g.msaa == ctx.msaa_samples
+        });
         if rebuild {
             let wgsl = format!("{CAMERA_WGSL}\n{}", include_str!("shaders/grid3d.wgsl"));
             let shader = ctx
@@ -182,7 +184,7 @@ impl InfiniteGrid3DLayer {
                     }),
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
+                        format: ctx.depth_format,
                         depth_write_enabled: Some(false),
                         depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                         stencil: wgpu::StencilState::default(),
@@ -197,6 +199,7 @@ impl InfiniteGrid3DLayer {
                 });
             self.gpu = Some(GridGpu {
                 format: ctx.color_format,
+                depth_format: ctx.depth_format,
                 msaa: ctx.msaa_samples,
                 layout,
                 pipeline_layout,
@@ -239,7 +242,7 @@ impl InfiniteGrid3DLayer {
                     }),
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
+                        format: ctx.depth_format,
                         depth_write_enabled: Some(false),
                         depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                         stencil: wgpu::StencilState::default(),

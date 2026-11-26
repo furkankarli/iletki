@@ -311,6 +311,36 @@ impl VertexRange {
         }
     }
 
+    pub(crate) fn draw_direct_position(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        match self {
+            Self::Direct(buffers) => {
+                buffers.bind_position(pass, None);
+                pass.draw(0..count, 0..1);
+            }
+            Self::DirectIndexed {
+                vertices,
+                indices,
+                index_format,
+                index_count,
+                ..
+            } => {
+                vertices.bind_position(pass, None);
+                pass.set_index_buffer(indices.slice(..), *index_format);
+                pass.draw_indexed(0..*index_count, 0, 0..1);
+            }
+            Self::Packed { page, elements, .. } => {
+                if let Some(indices) = &page.indices {
+                    page.vertices.bind_position(pass, None);
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(elements.clone(), 0, 0..1);
+                } else {
+                    page.vertices.bind_position(pass, Some(elements));
+                    pass.draw(0..count, 0..1);
+                }
+            }
+        }
+    }
+
     pub(crate) fn draw_direct_pick(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -755,6 +785,11 @@ impl PackedDraws {
         self.push_inner(geometry, offset, draw_index, false);
     }
 
+    pub(crate) fn push_direct(&mut self, draw_index: usize) {
+        self.section_gap_end = None;
+        self.commands.push(Draw::Direct(draw_index));
+    }
+
     fn push_inner(
         &mut self,
         geometry: &VertexRange,
@@ -952,6 +987,33 @@ impl PackedDraws {
         pass: &mut wgpu::RenderPass<'_>,
         pipelines: &PaintPipelines<'_>,
         picking: bool,
+        direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
+    ) {
+        self.paint_inner(pass, pipelines, picking, picking, direct);
+    }
+
+    pub(crate) fn paint_position_only(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
+    ) {
+        let pipelines = PaintPipelines {
+            smooth: pipeline,
+            flat: None,
+            repeated_smooth: None,
+            repeated_flat: None,
+            repeated_slots: None,
+        };
+        self.paint_inner(pass, &pipelines, true, false, direct);
+    }
+
+    fn paint_inner(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipelines: &PaintPipelines<'_>,
+        position_only: bool,
+        picking: bool,
         mut direct: impl FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
         let mut bound: Option<(usize, bool)> = None;
@@ -996,7 +1058,7 @@ impl PackedDraws {
                             pass.set_pipeline(pipeline);
                             &geometry.slots
                         };
-                        let slot_binding = if picking {
+                        let slot_binding = if position_only {
                             geometry.vertices.bind_position(pass, None);
                             1
                         } else {

@@ -34,6 +34,7 @@ pub(crate) struct OutlineEngine {
     composite_pipe_1x: wgpu::RenderPipeline,
     composite_format: wgpu::TextureFormat,
     composite_msaa: u32,
+    depth_format: wgpu::TextureFormat,
     // Separate uniform buffers for each pass so queue writes never clobber each other.
     step_buffers: [wgpu::Buffer; 5],
     composite_buffer: wgpu::Buffer,
@@ -73,6 +74,7 @@ impl OutlineEngine {
             e.extent != allocated_px
                 || e.composite_format != composite_format
                 || e.composite_msaa != composite_msaa
+                || e.depth_format != depth_format
                 || e.multisampled_mask_view.is_some() != multisampled_mask
         });
         if needs_rebuild {
@@ -322,6 +324,7 @@ impl OutlineEngine {
             composite_pipe_1x,
             composite_format,
             composite_msaa,
+            depth_format,
             step_buffers,
             composite_buffer,
             extent: allocated_px,

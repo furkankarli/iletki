@@ -1,0 +1,46 @@
+// Sample-rate clipped storage-buffer MRT selection + MaterialGpu SSBO shaders.
+struct SampledStorageMatSelectOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) pos_rel: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) @interpolate(perspective, sample) sample_pos_rel: vec3<f32>,
+    @location(4) @interpolate(flat) slot_id: u32,
+    @location(5) @interpolate(flat) mat_id: u32,
+};
+
+@vertex
+fn vs_mesh_storage_mat_select_sampled(
+    v: VertIn,
+    @location(3) slot: u32,
+) -> SampledStorageMatSelectOut {
+    let st = load_storage_transform(slot);
+    let base = mesh_vertex_with_object(v, st.placement);
+    var out = SampledStorageMatSelectOut(
+        base.clip_pos,
+        base.pos_rel,
+        base.normal,
+        base.color,
+        base.pos_rel,
+        select(0u, slot + 1u, st.pickable),
+        load_material_id(slot),
+    );
+    if (!st.visible) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return out;
+}
+
+@fragment
+fn fs_lit_storage_mat_select_sampled(
+    in: SampledStorageMatSelectOut,
+    @builtin(front_facing) is_front: bool,
+) -> LitSelectOut {
+    if (iletki_is_clipped(in.sample_pos_rel)) {
+        discard;
+    }
+    return LitSelectOut(
+        shade_storage_material(in.pos_rel, in.normal, in.color, is_front, in.mat_id),
+        pack_slot_id(in.slot_id),
+    );
+}

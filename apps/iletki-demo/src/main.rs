@@ -15,8 +15,16 @@
 //! - `3` : 100,000-Instance 3D City Stress (1.2M triangles in 1 draw call)
 //! - `Q` : Toggle 4-Way CAD Quad-View (Top / Persp / Front / Right in 1 CommandEncoder)
 //! - `C` : Toggle 3D Section Clip Plane
+//! - `K` : Cycle Section Caps (Off / Solid / Hatch / CrossHatch)
+//! - `A` : Toggle Half-Res Depth-Only GTAO (Ambient Occlusion)
+//! - `S` : Cycle CAD VisualStyle (Shaded+Edges / Shaded / Technical / Wireframe / X-Ray)
+//! - `D` : Cycle DiagnosticView (None / Normals / Facets / Backfaces / Overdraw / Chunks / Depth)
+//! - `G` : Toggle Ghost (WBOIT) on selected 3D part(s)
+//! - `O` : Toggle Weighted Blended OIT for translucent vertex-alpha meshes
 //! - `M` : Toggle `OnDemand` (0 static draws on idle) vs `Continuous`
 //! - `R` : Reset camera
+//!
+//! Set `ILETKI_DEMO_MODEL=/path/to/model.iltmesh` to inspect a tessellated CAD/BIM model interactively.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -27,12 +35,13 @@ mod preview;
 
 use iletki::gpu::wgpu;
 use iletki::{
-    Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DirtyFlags, DrawStyle2D,
-    Grid3DConfig, GridStyle, InfiniteGrid3DLayer, Instance3D, InstancedMesh3DLayer, Mesh2D, Mesh3D,
-    Modifiers, OrbitRig, OutlineConfig, PassTargetDesc, PendingPick, PendingSlotPreview, PickHit,
-    PickId, Plane, PointerButton, Projection, Scene2DLayer, Scene3DLayer, ScrollUnit, StandardView,
+    Bounds2, Bounds3, Cad2DRig, Camera, CameraTransition, Chunk3DId, DiagnosticView, DirtyFlags,
+    DrawStyle2D, Grid3DConfig, GridStyle, GtaoConfig, InfiniteGrid3DLayer, Instance3D,
+    InstancedMesh3DLayer, Mesh2D, Mesh3D, Modifiers, OrbitRig, OutlineConfig, PassTargetDesc,
+    PendingPick, PendingSlotPreview, PickHit, PickId, Plane, PointerButton, Projection,
+    Scene2DLayer, Scene3DLayer, ScrollUnit, SectionCapConfig, SectionCapPattern, StandardView,
     TransformGizmoLayer, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportInput, ViewportLayer,
-    ViewportMode, order_to_depth,
+    ViewportMode, VisualStyle, order_to_depth,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -271,7 +280,9 @@ impl GpuState {
         let info = adapter.get_info();
         println!("iletki-demo GPU: {} ({:?})", info.name, info.backend);
 
-        let features = wgpu::Features::CLIP_DISTANCES | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        let features = wgpu::Features::CLIP_DISTANCES
+            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+            | wgpu::Features::DEPTH32FLOAT_STENCIL8;
         #[cfg(feature = "profiling")]
         let pick_profile = std::env::var_os("ILETKI_PICK_PROFILE").is_some();
         let no_mrt_preview = std::env::var_os("ILETKI_NO_MRT_PREVIEW").is_some();
@@ -391,7 +402,26 @@ impl GpuState {
                 );
                 bench_scene(fixture.meshes, &mut bench_edits)
             }
-            _ => build_arch_3d(),
+            _ => {
+                if let Some(path) = std::env::var_os("ILETKI_DEMO_MODEL") {
+                    let fixture = assembly_fixture::load(std::path::Path::new(&path))
+                        .map_err(|error| error.to_string())?;
+                    let center = fixture.bounds.center().ok_or("model bounds are empty")?;
+                    let radius = fixture.bounds.radius() * 2.2;
+                    if !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
+                        return Err("model camera bounds are invalid".into());
+                    }
+                    bench_fit = Some((center, radius));
+                    println!(
+                        "demo model: {} chunks, {} triangles",
+                        fixture.meshes.len(),
+                        fixture.triangles
+                    );
+                    bench_scene(fixture.meshes, &mut bench_edits)
+                } else {
+                    build_arch_3d()
+                }
+            }
         };
         let grid_3d = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
         let mut gizmo_3d = TransformGizmoLayer::new(3, 1);
@@ -525,38 +555,73 @@ impl GpuState {
     fn reset_cameras(&mut self) {
         match self.active_scene {
             DemoScene::Arch3D => {
-                *self.vp_main.camera_mut() = Camera::perspective_3d(
-                    Vec3::new(9.5, -10.5, 7.5),
-                    Vec3::new(0.0, 0.0, 1.8),
-                    Vec3::Z,
-                    std::f64::consts::FRAC_PI_4,
-                    0.05,
-                );
-                self.orbit_rig.pivot = Vec3::new(0.0, 0.0, 1.8);
-                *self.vp_top.camera_mut() = Camera::ortho_3d(
-                    Vec3::new(0.0, 0.0, 20.0),
-                    Vec3::new(0.0, 0.0, 1.5),
-                    Vec3::Y,
-                    14.0,
-                    0.1,
-                    100.0,
-                );
-                *self.vp_front.camera_mut() = Camera::ortho_3d(
-                    Vec3::new(0.0, -20.0, 2.0),
-                    Vec3::new(0.0, 0.0, 2.0),
-                    Vec3::Z,
-                    12.0,
-                    0.1,
-                    100.0,
-                );
-                *self.vp_right.camera_mut() = Camera::ortho_3d(
-                    Vec3::new(20.0, 0.0, 2.0),
-                    Vec3::new(0.0, 0.0, 2.0),
-                    Vec3::Z,
-                    12.0,
-                    0.1,
-                    100.0,
-                );
+                if let Some((center, radius)) = self.bench_fit {
+                    *self.vp_main.camera_mut() = Camera::perspective_3d(
+                        center + Vec3::new(0.0, -radius, radius * 0.65),
+                        center,
+                        Vec3::Z,
+                        55_f64.to_radians(),
+                        radius / 1500.0,
+                    );
+                    *self.vp_top.camera_mut() = Camera::ortho_3d(
+                        center + Vec3::Z * radius,
+                        center,
+                        Vec3::Y,
+                        radius,
+                        radius / 1500.0,
+                        radius * 3.0,
+                    );
+                    *self.vp_front.camera_mut() = Camera::ortho_3d(
+                        center - Vec3::Y * radius,
+                        center,
+                        Vec3::Z,
+                        radius,
+                        radius / 1500.0,
+                        radius * 3.0,
+                    );
+                    *self.vp_right.camera_mut() = Camera::ortho_3d(
+                        center + Vec3::X * radius,
+                        center,
+                        Vec3::Z,
+                        radius,
+                        radius / 1500.0,
+                        radius * 3.0,
+                    );
+                    self.orbit_rig.pivot = center;
+                } else {
+                    *self.vp_main.camera_mut() = Camera::perspective_3d(
+                        Vec3::new(9.5, -10.5, 7.5),
+                        Vec3::new(0.0, 0.0, 1.8),
+                        Vec3::Z,
+                        std::f64::consts::FRAC_PI_4,
+                        0.05,
+                    );
+                    self.orbit_rig.pivot = Vec3::new(0.0, 0.0, 1.8);
+                    *self.vp_top.camera_mut() = Camera::ortho_3d(
+                        Vec3::new(0.0, 0.0, 20.0),
+                        Vec3::new(0.0, 0.0, 1.5),
+                        Vec3::Y,
+                        14.0,
+                        0.1,
+                        100.0,
+                    );
+                    *self.vp_front.camera_mut() = Camera::ortho_3d(
+                        Vec3::new(0.0, -20.0, 2.0),
+                        Vec3::new(0.0, 0.0, 2.0),
+                        Vec3::Z,
+                        12.0,
+                        0.1,
+                        100.0,
+                    );
+                    *self.vp_right.camera_mut() = Camera::ortho_3d(
+                        Vec3::new(20.0, 0.0, 2.0),
+                        Vec3::new(0.0, 0.0, 2.0),
+                        Vec3::Z,
+                        12.0,
+                        0.1,
+                        100.0,
+                    );
+                }
             }
             DemoScene::Cad2D => {
                 *self.vp_main.camera_mut() =
@@ -577,6 +642,17 @@ impl GpuState {
         }
         self.apply_clip_planes();
         self.resize_viewports();
+    }
+
+    fn mark_3d_dirty(&mut self) {
+        for vp in [
+            &mut self.vp_main,
+            &mut self.vp_top,
+            &mut self.vp_front,
+            &mut self.vp_right,
+        ] {
+            vp.mark_dirty(DirtyFlags::STATIC_SCENE);
+        }
     }
 
     fn apply_clip_planes(&mut self) {
@@ -1302,14 +1378,52 @@ impl GpuState {
             ViewportMode::OnDemand => "OnDemand",
             ViewportMode::Continuous => "Continuous",
         };
-        let clip = if self.clip_enabled { " | CLIP" } else { "" };
+        let clip = if self.clip_enabled {
+            let cap = self.scene_3d.section_caps();
+            if cap.enabled {
+                match cap.pattern {
+                    SectionCapPattern::Solid => " | CLIP+CAP:Solid",
+                    SectionCapPattern::Hatch => " | CLIP+CAP:Hatch",
+                    SectionCapPattern::CrossHatch => " | CLIP+CAP:Cross",
+                }
+            } else {
+                " | CLIP"
+            }
+        } else {
+            ""
+        };
+        let gtao = if self.scene_3d.gtao().enabled {
+            " | GTAO"
+        } else {
+            ""
+        };
+        let oit = if self.scene_3d.oit_enabled() {
+            " | OIT"
+        } else {
+            ""
+        };
+        let style_tag = match self.scene_3d.diagnostic_view() {
+            DiagnosticView::None => match self.scene_3d.visual_style() {
+                VisualStyle::ShadedWithEdges => "",
+                VisualStyle::Shaded => " | Style:Shaded",
+                VisualStyle::Technical => " | Style:Technical",
+                VisualStyle::Wireframe => " | Style:Wireframe",
+                VisualStyle::XRay => " | Style:XRay",
+            },
+            DiagnosticView::Normals => " | Diag:Normals",
+            DiagnosticView::Facets => " | Diag:Facets",
+            DiagnosticView::Backfaces => " | Diag:Backfaces",
+            DiagnosticView::Overdraw => " | Diag:Overdraw",
+            DiagnosticView::Chunks => " | Diag:Chunks",
+            DiagnosticView::Depth => " | Diag:Depth",
+        };
         let frame_label = if self.timing_samples == 1 {
             "Startup frame"
         } else {
             "Frame"
         };
         self.window.set_title(&format!(
-            "iletki-demo | {scene_name} | {mode}{clip} | CPU encode {:.2} ms | {frame_label} {:.2} ms | {} | [1/2/3 Q C M R]",
+            "iletki-demo | {scene_name} | {mode}{clip}{gtao}{oit}{style_tag} | CPU {:.2} ms | {frame_label} {:.2} ms | {} | [A:GTAO K:Cap S:Style D:Diag G:Ghost O:OIT C:Clip Q:Quad]",
             self.smoothed_encode_ms, self.smoothed_frame_ms, self.last_pick_text
         ));
     }
@@ -2090,6 +2204,111 @@ impl ApplicationHandler for DemoApp {
                             s.clip_enabled = !s.clip_enabled;
                             s.apply_clip_planes();
                         }
+                        KeyCode::KeyK => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                let spacing = s.bench_fit.map_or(0.28_f32, |(_, r)| {
+                                    ((r as f32) * 0.008).clamp(0.15, 2.0)
+                                });
+                                let cur = s.scene_3d.section_caps();
+                                let next = if !cur.enabled {
+                                    SectionCapConfig::solid([0.85, 0.28, 0.22, 1.0])
+                                } else {
+                                    match cur.pattern {
+                                        SectionCapPattern::Solid => SectionCapConfig::hatch(
+                                            [0.92, 0.90, 0.86, 1.0],
+                                            [0.16, 0.19, 0.24, 1.0],
+                                            spacing,
+                                        ),
+                                        SectionCapPattern::Hatch => SectionCapConfig::cross_hatch(
+                                            [0.92, 0.90, 0.86, 1.0],
+                                            [0.16, 0.19, 0.24, 1.0],
+                                            spacing,
+                                        ),
+                                        SectionCapPattern::CrossHatch => {
+                                            SectionCapConfig::default()
+                                        }
+                                    }
+                                };
+                                s.scene_3d.set_section_caps(next);
+                                if next.enabled && !s.clip_enabled {
+                                    s.clip_enabled = true;
+                                    s.apply_clip_planes();
+                                }
+                                s.mark_3d_dirty();
+                            }
+                        }
+                        KeyCode::KeyA => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                let cur = s.scene_3d.gtao();
+                                if cur.enabled {
+                                    s.scene_3d.set_gtao(GtaoConfig::default());
+                                } else {
+                                    let radius = s.bench_fit.map_or(0.65_f32, |(_, r)| {
+                                        ((r as f32) * 0.02).clamp(0.35, 2.0)
+                                    });
+                                    let mut cfg = GtaoConfig::with_radius(radius);
+                                    cfg.intensity = 1.15;
+                                    s.scene_3d.set_gtao(cfg);
+                                }
+                                s.mark_3d_dirty();
+                            }
+                        }
+                        KeyCode::KeyS => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                s.scene_3d.set_diagnostic_view(DiagnosticView::None);
+                                let next = match s.scene_3d.visual_style() {
+                                    VisualStyle::ShadedWithEdges => VisualStyle::Shaded,
+                                    VisualStyle::Shaded => VisualStyle::Technical,
+                                    VisualStyle::Technical => VisualStyle::Wireframe,
+                                    VisualStyle::Wireframe => VisualStyle::XRay,
+                                    VisualStyle::XRay => VisualStyle::ShadedWithEdges,
+                                };
+                                s.scene_3d.set_visual_style(next);
+                                s.mark_3d_dirty();
+                            }
+                        }
+                        KeyCode::KeyD => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                let next = match s.scene_3d.diagnostic_view() {
+                                    DiagnosticView::None => DiagnosticView::Normals,
+                                    DiagnosticView::Normals => DiagnosticView::Facets,
+                                    DiagnosticView::Facets => DiagnosticView::Backfaces,
+                                    DiagnosticView::Backfaces => DiagnosticView::Overdraw,
+                                    DiagnosticView::Overdraw => DiagnosticView::Chunks,
+                                    DiagnosticView::Chunks => DiagnosticView::Depth,
+                                    DiagnosticView::Depth => DiagnosticView::None,
+                                };
+                                s.scene_3d.set_diagnostic_view(next);
+                                s.mark_3d_dirty();
+                            }
+                        }
+                        KeyCode::KeyG => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                let targets: Vec<Chunk3DId> = if !s.committed_selection.is_empty() {
+                                    s.committed_selection.iter().copied().collect()
+                                } else {
+                                    s.chunks_3d
+                                        .first()
+                                        .map(|meta| meta.chunk_id)
+                                        .into_iter()
+                                        .collect()
+                                };
+                                if let Some(&first) = targets.first() {
+                                    let next_ghost = !s.scene_3d.is_chunk_ghost(first);
+                                    for id in targets {
+                                        s.scene_3d.set_chunk_ghost(id, next_ghost);
+                                    }
+                                    s.mark_3d_dirty();
+                                }
+                            }
+                        }
+                        KeyCode::KeyO => {
+                            if s.active_scene == DemoScene::Arch3D {
+                                let next = !s.scene_3d.oit_enabled();
+                                s.scene_3d.set_oit_enabled(next);
+                                s.mark_3d_dirty();
+                            }
+                        }
                         KeyCode::KeyM => {
                             let next = match s.vp_main.mode() {
                                 ViewportMode::OnDemand => ViewportMode::Continuous,
@@ -2406,7 +2625,7 @@ fn build_cad_2d(origin: Vec2, linear: bool) -> Mesh2D {
 
 fn main() {
     println!(
-        "iletki-demo controls:\n  Middle/Right drag: Orbit (3D) / Pan (2D), Shift+drag: Pan 3D\n  Scroll: Zoom/Dolly | Left-click: 64-bit GPU Pick + JFA Outline\n  [1] 3D Arch  [2] 2D 500k UTM CAD  [3] 100k 3D Instances\n  [Q] 4-Way Quad-View  [C] Section Clip  [M] OnDemand/Continuous  [R] Reset"
+        "iletki-demo controls:\n  Middle/Right drag: Orbit (3D) / Pan (2D), Shift+drag: Pan 3D\n  Scroll: Zoom/Dolly | Left-click: 64-bit GPU Pick + JFA Outline | Shift+Left drag: Marquee select\n  [1] 3D Arch  [2] 2D 500k UTM CAD  [3] 100k 3D Instances\n  [Q] 4-Way Quad-View  [C] Section Clip  [K] Section Caps (Solid/Hatch/Cross)  [A] GTAO\n  [S] VisualStyle (Shaded+Edges/Shaded/Technical/Wireframe/XRay)  [D] DiagnosticView\n  [G] Ghost Selected (WBOIT)  [O] WBOIT Translucency  [M] OnDemand/Continuous  [R] Reset"
     );
     let Ok(event_loop) = EventLoop::new() else {
         eprintln!("failed to create winit event loop");

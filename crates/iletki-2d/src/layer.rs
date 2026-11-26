@@ -159,6 +159,7 @@ struct ChunkSlots {
 
 struct Pipelines {
     format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
     msaa: u32,
     fill_color: wgpu::RenderPipeline,
     wide_color: wgpu::RenderPipeline,
@@ -358,11 +359,11 @@ impl Scene2DLayer {
     }
 
     fn ensure_pipelines<W>(&mut self, ctx: &PrepareCtx<'_, W>) {
-        if self
-            .pipelines
-            .as_ref()
-            .is_some_and(|p| p.format == ctx.color_format && p.msaa == ctx.msaa_samples)
-        {
+        if self.pipelines.as_ref().is_some_and(|p| {
+            p.format == ctx.color_format
+                && p.depth_format == ctx.depth_format
+                && p.msaa == ctx.msaa_samples
+        }) {
             return;
         }
         let wgsl = format!("{CAMERA_WGSL}\n{}", include_str!("shaders/cad2d.wgsl"));
@@ -415,6 +416,7 @@ impl Scene2DLayer {
                     fs: &str,
                     buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
                     format: wgpu::TextureFormat,
+                    depth_format: wgpu::TextureFormat,
                     blend: Option<wgpu::BlendState>,
                     msaa: u32| {
             ctx.device
@@ -442,7 +444,7 @@ impl Scene2DLayer {
                         ..wgpu::PrimitiveState::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
+                        format: depth_format,
                         depth_write_enabled: Some(true),
                         depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                         stencil: wgpu::StencilState::default(),
@@ -465,6 +467,7 @@ impl Scene2DLayer {
 
         self.pipelines = Some(Pipelines {
             format: ctx.color_format,
+            depth_format: ctx.depth_format,
             msaa: ctx.msaa_samples,
             fill_color: make(
                 "iletki-2d fill",
@@ -473,6 +476,7 @@ impl Scene2DLayer {
                 "fs_color",
                 &plain_only,
                 ctx.color_format,
+                ctx.depth_format,
                 alpha,
                 ctx.msaa_samples,
             ),
@@ -483,6 +487,7 @@ impl Scene2DLayer {
                 "fs_color",
                 &wide_only,
                 ctx.color_format,
+                ctx.depth_format,
                 alpha,
                 ctx.msaa_samples,
             ),
@@ -493,6 +498,7 @@ impl Scene2DLayer {
                 "fs_color",
                 &plain_only,
                 ctx.color_format,
+                ctx.depth_format,
                 alpha,
                 ctx.msaa_samples,
             ),
@@ -503,6 +509,7 @@ impl Scene2DLayer {
                 "fs_pick",
                 &plain_and_pick,
                 PICK_ID_FORMAT,
+                DEPTH_FORMAT,
                 None,
                 1,
             ),
@@ -513,6 +520,7 @@ impl Scene2DLayer {
                 "fs_pick",
                 &wide_and_pick,
                 PICK_ID_FORMAT,
+                DEPTH_FORMAT,
                 None,
                 1,
             ),
@@ -523,6 +531,7 @@ impl Scene2DLayer {
                 "fs_pick",
                 &plain_and_pick,
                 PICK_ID_FORMAT,
+                DEPTH_FORMAT,
                 None,
                 1,
             ),

@@ -7,10 +7,18 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use iletki_3d::{
-    GizmoAxis, Grid3DConfig, InfiniteGrid3DLayer, Mesh3D, Scene3DLayer, TransformGizmoLayer,
+    DiagnosticView, GizmoAxis, Grid3DConfig, GtaoConfig, InfiniteGrid3DLayer, Material3D,
+    MaterialFlags, MaterialId, Mesh3D, Scene3DLayer, SectionCapConfig, SectionCapPattern,
+    TransformGizmoLayer, VisualStyle,
 };
-use iletki_core::{Bounds3, Camera, DirtyFlags, PickId, Plane, Vec3, ViewportMode};
-use iletki_wgpu::{ViewportConfig, ViewportHost, ViewportLayer, wgpu};
+use iletki_core::{
+    Bounds3, Camera, DirtyFlags, DrawPhase, DrawPhaseMask, PickId, Plane, Vec3, ViewportId,
+    ViewportMode,
+};
+use iletki_wgpu::{
+    DEPTH_FORMAT, DEPTH_STENCIL_FORMAT, PaintCtx, PrepareCtx, ViewportConfig, ViewportHost,
+    ViewportLayer, wgpu,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -48,8 +56,10 @@ fn create_device_with_limits(limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu
         }))
     })
     .ok()?;
+    let required_features = adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki-3d test device"),
+        required_features,
         required_limits: limits,
         ..wgpu::DeviceDescriptor::default()
     }))
@@ -1620,5 +1630,1557 @@ fn operational_resilience_optional_features_block_resizes_and_teardown() {
     assert!(
         !hits.is_empty(),
         "surviving viewport must continue picking after sibling teardown"
+    );
+}
+
+#[test]
+fn material_ssbo_and_fallback_shade_update_section_and_pick() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.06, 1.0],
+            mode: ViewportMode::OnDemand,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [240, 120],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, -10.0, 0.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        4.5,
+        0.1,
+        50.0,
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let make_white_box = |x: f64, obj: u32| {
+        let mut m = Mesh3D::at_origin(Vec3::new(x, 0.0, 0.0));
+        m.push_box(
+            Vec3::new(-0.9, -0.9, -0.9),
+            Vec3::new(0.9, 0.9, 0.9),
+            [230, 230, 230, 255],
+            PickId::new(1, obj, 0),
+            false,
+        );
+        m
+    };
+    let left_id = scene.insert(make_white_box(-3.0, 10));
+    let center_id = scene.insert(make_white_box(0.0, 20));
+    let right_id = scene.insert(make_white_box(3.0, 30));
+
+    let red_mat = scene.insert_material(Material3D::tinted([1.0, 0.1, 0.1, 1.0]));
+    let green_unlit = scene.insert_material(Material3D {
+        emissive: [0.0, 0.15, 0.0],
+        ..Material3D::unlit([0.05, 0.9, 0.1])
+    });
+    assert_eq!(scene.chunk_material(left_id), Some(MaterialId::DEFAULT));
+    scene.set_chunk_material(center_id, red_mat);
+    scene.set_chunk_material(right_id, green_unlit);
+    assert_eq!(scene.chunk_material(center_id), Some(red_mat));
+    assert_eq!(scene.chunk_material(right_id), Some(green_unlit));
+
+    // Hostile material updates/removals on default or out-of-bounds handles are safely ignored.
+    assert!(!scene.update_material(MaterialId::DEFAULT, Material3D::unlit([1.0, 0.0, 0.0])));
+    assert!(!scene.remove_material(MaterialId::DEFAULT));
+    let hostile = scene.insert_material(Material3D {
+        base_color_factor: [f32::NAN, f32::INFINITY, -1.0, f32::NAN],
+        roughness: f32::NAN,
+        metallic: f32::INFINITY,
+        opacity: f32::NAN,
+        backface_tint: f32::NEG_INFINITY,
+        emissive: [f32::NAN, 0.0, 0.0],
+        flags: MaterialFlags::NONE,
+    });
+    assert!(scene.remove_material(hostile));
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    // Frame 1: left neutral gray/white, center red-tinted, right unlit green.
+    let img1 = render(&mut host, &mut scene);
+    let left_px = img1.pixel(50, 60).unwrap();
+    let center_px = img1.pixel(120, 60).unwrap();
+    let right_px = img1.pixel(190, 60).unwrap();
+    assert!(
+        left_px[0].abs_diff(left_px[1]) <= 6
+            && left_px[1].abs_diff(left_px[2]) <= 6
+            && left_px[0] > 90,
+        "default material box must remain neutral gray/white, got {left_px:?}"
+    );
+    assert!(
+        center_px[0] > center_px[1].saturating_add(70)
+            && center_px[0] > center_px[2].saturating_add(70),
+        "red material box must shade red, got {center_px:?}"
+    );
+    assert!(
+        right_px[1] > right_px[0].saturating_add(120)
+            && right_px[1] > right_px[2].saturating_add(120),
+        "unlit green material box must shade green, got {right_px:?}"
+    );
+
+    // Frame 2: live in-place update_material switches center from red to blue without geometry rebuild.
+    assert!(scene.update_material(red_mat, Material3D::tinted([0.1, 0.2, 1.0, 1.0])));
+    let img2 = render(&mut host, &mut scene);
+    let center_blue = img2.pixel(120, 60).unwrap();
+    assert!(
+        center_blue[2] > center_blue[0].saturating_add(70)
+            && center_blue[2] > center_blue[1].saturating_add(50),
+        "updated material box must shade blue, got {center_blue:?}"
+    );
+
+    // Frame 3: live section clip plane + MRT preview (when supported) + exact 64-bit pick.
+    if let Some(plane) = Plane::from_normal_point(Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane]);
+    }
+    let supports_mrt = host.supports_color_frame_selection(&device);
+    if supports_mrt {
+        host.set_color_frame_selection_rect(Some([10, 10, 220, 100]));
+    }
+    let img3 = render(&mut host, &mut scene);
+    // Upper half (z > 0) stays rendered, lower half (z < 0) is cleanly clipped to background.
+    let upper_center = img3.pixel(120, 45).unwrap();
+    let lower_center = img3.pixel(120, 75).unwrap();
+    assert!(
+        upper_center[2] > upper_center[0].saturating_add(50),
+        "unclipped upper half of blue box must remain blue, got {upper_center:?}"
+    );
+    assert!(
+        lower_center[0] < 30 && lower_center[1] < 30 && lower_center[2] < 35,
+        "clipped lower half must reveal background, got {lower_center:?}"
+    );
+    if supports_mrt {
+        let mut pending = host.take_color_frame_selection_preview(&device).unwrap();
+        let slots = loop {
+            match pending.try_read() {
+                Poll::Ready(res) => break res.unwrap(),
+                Poll::Pending => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(
+            slots.len(),
+            3,
+            "MRT preview with custom materials must report all 3 visible boxes, got {slots:?}"
+        );
+        host.set_color_frame_selection_rect(None);
+    }
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [10, 10, 220, 50])
+        .unwrap();
+    let hit_objs: Vec<u32> = hits.iter().map(|h| h.id.object).collect();
+    assert!(
+        hit_objs.contains(&10) && hit_objs.contains(&20) && hit_objs.contains(&30),
+        "exact pick must find all 3 boxes under custom materials, got {hit_objs:?}"
+    );
+
+    // Frame 4: removing material resets center chunk cleanly back to default neutral shading.
+    host.camera_mut().set_clip_planes(&[]);
+    assert!(scene.remove_material(red_mat));
+    assert_eq!(scene.chunk_material(center_id), Some(MaterialId::DEFAULT));
+    let img4 = render(&mut host, &mut scene);
+    let center_reset = img4.pixel(120, 60).unwrap();
+    assert!(
+        center_reset[0].abs_diff(center_reset[1]) <= 6
+            && center_reset[1].abs_diff(center_reset[2]) <= 6
+            && center_reset[0] > 90,
+        "center box must revert to neutral default shading after remove_material, got {center_reset:?}"
+    );
+}
+
+struct StencilToggleLayer {
+    enabled: bool,
+}
+
+impl ViewportLayer<()> for StencilToggleLayer {
+    fn id(&self) -> u16 {
+        42
+    }
+
+    fn phases(&self) -> DrawPhaseMask {
+        DrawPhaseMask::NONE
+    }
+
+    fn requires_stencil(&self, _viewport_id: ViewportId) -> bool {
+        self.enabled
+    }
+
+    fn prepare(&mut self, _ctx: &mut PrepareCtx<'_, ()>) -> bool {
+        false
+    }
+
+    fn paint(&self, _phase: DrawPhase, _pass: &mut wgpu::RenderPass<'_>, _ctx: &PaintCtx<'_, ()>) {}
+}
+
+#[test]
+fn lazy_stencil_depth_format_works_with_3d_scene_grid_and_gizmo() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [160, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(4.0, -5.0, 4.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        45_f64.to_radians(),
+        0.1,
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+    mesh.push_box_with_edges(
+        Vec3::new(-1.0, -1.0, -1.0),
+        Vec3::new(1.0, 1.0, 1.0),
+        [180, 200, 220, 255],
+        [20, 25, 30, 255],
+        PickId::new(1, 77, 0),
+        true,
+    );
+    let chunk = scene.insert(mesh);
+    let mat = scene.insert_material(Material3D::tinted([0.9, 0.5, 0.2, 1.0]));
+    scene.set_chunk_material(chunk, mat);
+    scene.set_selected(chunk, true);
+    let mut grid = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
+    let mut gizmo = TransformGizmoLayer::new(3, 900);
+    gizmo.origin = Some(Vec3::ZERO);
+    let mut toggle = StencilToggleLayer { enabled: false };
+
+    let render_all = |host: &mut ViewportHost,
+                      scene: &mut Scene3DLayer,
+                      grid: &mut InfiniteGrid3DLayer,
+                      gizmo: &mut TransformGizmoLayer,
+                      toggle: &mut StencilToggleLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut layers: [&mut dyn ViewportLayer<()>; 4] = [scene, grid, gizmo, toggle];
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut layers);
+        }
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    // Pass 1: plain Depth32Float.
+    let img_depth = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+
+    // Pass 2: lazily upgrade to Depth32FloatStencil8 across Scene3D + Grid + Gizmo + Outline.
+    toggle.enabled = true;
+    let img_stencil = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    if host.supports_stencil(&device) {
+        assert_eq!(host.depth_format(), DEPTH_STENCIL_FORMAT);
+    }
+    assert_eq!([img_depth.width, img_depth.height], [160, 160]);
+    assert_eq!(img_depth.pixels.len(), img_stencil.pixels.len());
+
+    // Exact 64-bit picking remains healthy while viewport is on Depth32FloatStencil8.
+    let hits = {
+        let mut layers: [&mut dyn ViewportLayer<()>; 4] =
+            [&mut scene, &mut grid, &mut gizmo, &mut toggle];
+        host.pick_rect_blocking(&device, &queue, &(), &mut layers, [40, 40, 80, 80])
+            .unwrap()
+    };
+    assert!(
+        hits.iter().any(|h| h.id.object == 77),
+        "scene box must remain pickable while viewport depth format is stencil-enabled"
+    );
+
+    // Pass 3: downgrade back to Depth32Float cleanly.
+    toggle.enabled = false;
+    let _img_back = render_all(&mut host, &mut scene, &mut grid, &mut gizmo, &mut toggle);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT);
+}
+
+fn create_device_with_clip_distances() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..wgpu::RequestAdapterOptions::default()
+    }))
+    .or_else(|_| {
+        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+            ..wgpu::RequestAdapterOptions::default()
+        }))
+    })
+    .ok()?;
+    if !adapter.features().contains(wgpu::Features::CLIP_DISTANCES) {
+        return None;
+    }
+    let required_features = wgpu::Features::CLIP_DISTANCES
+        | (adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8);
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("iletki-3d clip_distances test device"),
+        required_features,
+        required_limits: wgpu::Limits::default(),
+        ..wgpu::DeviceDescriptor::default()
+    }))
+    .ok()
+}
+
+fn verify_section_caps_on_device(device: &wgpu::Device, queue: &wgpu::Queue, label: &str) {
+    let mut host = ViewportHost::new(
+        device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [200, 200],
+            ..ViewportConfig::default()
+        },
+    )
+    .ok()
+    .into_iter()
+    .next();
+    let Some(mut host) = host.take() else {
+        return;
+    };
+    if !host.supports_stencil(device) {
+        return;
+    }
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut box_mesh = Mesh3D::at_origin(Vec3::ZERO);
+    box_mesh.push_box(
+        Vec3::new(-1.5, -1.5, -2.0),
+        Vec3::new(1.5, 1.5, 2.0),
+        [185, 185, 185, 255],
+        PickId::new(1, 501, 0),
+        false,
+    );
+    let chunk = scene.insert(box_mesh);
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(device, queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(device, queue).ok()
+    };
+
+    // View from +Z looking down into a Z <= 0 cut plane (kept side is -Z).
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+
+    // 1. Caps disabled (zero-tax default): stays Depth32Float and interior shows neutral gray.
+    let img_off = render(&mut host, &mut scene);
+    assert_eq!(host.depth_format(), DEPTH_FORMAT, "{label}: caps off depth");
+    if let Some(img) = img_off
+        && let Some(px) = img.pixel(100, 100)
+    {
+        assert!(
+            px[0].abs_diff(px[1]) <= 8 && px[1].abs_diff(px[2]) <= 8 && px[0] > 50,
+            "{label}: uncapped cut interior must show neutral gray back-face, got {px:?}"
+        );
+    }
+
+    // 2. Enable solid red section cap: upgrades to Depth32FloatStencil8 and fills center red.
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    let img_solid = render(&mut host, &mut scene);
+    assert_eq!(
+        host.depth_format(),
+        DEPTH_STENCIL_FORMAT,
+        "{label}: caps on depth"
+    );
+    if let Some(img) = img_solid {
+        if let Some(center) = img.pixel(100, 100) {
+            assert!(
+                center[0] > 200 && center[1] < 55 && center[2] < 55,
+                "{label}: solid red cap must fill cut center, got {center:?}"
+            );
+        }
+        if let Some(corner) = img.pixel(5, 5) {
+            assert!(
+                corner[0] < 30 && corner[1] < 30 && corner[2] < 35,
+                "{label}: background outside solid must stay dark, got {corner:?}"
+            );
+        }
+    }
+
+    // 3. View from the KEPT side (-Z looking toward +Z): cut face is not viewer-facing -> no cap.
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, -5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+    if let Some(img_back) = render(&mut host, &mut scene)
+        && let Some(center) = img_back.pixel(100, 100)
+    {
+        assert!(
+            center[0].abs_diff(center[2]) <= 12 && center[0] > 60,
+            "{label}: kept-side exterior face must not be capped red, got {center:?}"
+        );
+    }
+
+    // 4. Opposing parallel clip planes (slab cut: -0.5 <= z <= +0.5).
+    //    Pass A must clip ONLY by the active plane so the far back face at z=-2 still stamps stencil!
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let (Some(p_hi), Some(p_lo)) = (
+        Plane::from_normal_point(-Vec3::Z, Vec3::new(0.0, 0.0, 0.5)),
+        Plane::from_normal_point(Vec3::Z, Vec3::new(0.0, 0.0, -0.5)),
+    ) {
+        host.camera_mut().set_clip_planes(&[p_hi, p_lo]);
+    }
+    if let Some(img_slab) = render(&mut host, &mut scene)
+        && let Some(center) = img_slab.pixel(100, 100)
+    {
+        assert!(
+            center[0] > 200 && center[1] < 55 && center[2] < 55,
+            "{label}: opposing parallel slab cut must still cap cleanly, got {center:?}"
+        );
+    }
+
+    // 5. Two perpendicular clip planes (corner cutaway: x >= 0 AND y >= 0, viewed from (-4, -4, 0)).
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(-4.5, -4.5, 0.0),
+        Vec3::new(0.5, 0.5, 0.0),
+        Vec3::Z,
+        55_f64.to_radians(),
+        0.1,
+    );
+    if let (Some(px_plane), Some(py_plane)) = (
+        Plane::from_normal_point(Vec3::X, Vec3::ZERO),
+        Plane::from_normal_point(Vec3::Y, Vec3::ZERO),
+    ) {
+        host.camera_mut().set_clip_planes(&[px_plane, py_plane]);
+    }
+    if let Some(img_corner) = render(&mut host, &mut scene) {
+        let mut red_left = 0usize;
+        let mut red_right = 0usize;
+        for y in 70..130 {
+            for x in 30..98 {
+                if let Some(p) = img_corner.pixel(x, y)
+                    && p[0] > 190
+                    && p[1] < 60
+                    && p[2] < 60
+                {
+                    red_left += 1;
+                }
+            }
+            for x in 102..170 {
+                if let Some(p) = img_corner.pixel(x, y)
+                    && p[0] > 190
+                    && p[1] < 60
+                    && p[2] < 60
+                {
+                    red_right += 1;
+                }
+            }
+        }
+        assert!(
+            red_left > 100 && red_right > 100,
+            "{label}: corner cutaway must cap both x=0 and y=0 faces (left={red_left}, right={red_right})"
+        );
+    }
+
+    // 6. Hatch vs CrossHatch patterns on a clean Z <= 0 cut.
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    if let Some(plane_top) = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO) {
+        host.camera_mut().set_clip_planes(&[plane_top]);
+    }
+    let count_white_and_blue = |img: &iletki_wgpu::RgbaImage| -> (usize, usize) {
+        let mut white = 0usize;
+        let mut blue = 0usize;
+        for y in 60..140 {
+            for x in 60..140 {
+                if let Some(p) = img.pixel(x, y) {
+                    if p[0] > 210 && p[1] > 210 && p[2] > 210 {
+                        white += 1;
+                    } else if p[2] > p[0].saturating_add(80) && p[2] > 150 {
+                        blue += 1;
+                    }
+                }
+            }
+        }
+        (white, blue)
+    };
+    scene.set_section_caps(SectionCapConfig {
+        hatch_width_px: 2.5,
+        ..SectionCapConfig::hatch([0.96, 0.96, 0.96, 1.0], [0.05, 0.1, 0.96, 1.0], 0.35)
+    });
+    let (hatch_white, hatch_blue) = render(&mut host, &mut scene)
+        .map(|img| count_white_and_blue(&img))
+        .unwrap_or((0, 0));
+    assert!(
+        hatch_white > 1000 && hatch_blue > 150,
+        "{label}: hatch cap must show both white base ({hatch_white}) and blue hatch lines ({hatch_blue})"
+    );
+
+    scene.set_section_caps(SectionCapConfig {
+        hatch_width_px: 2.5,
+        ..SectionCapConfig::cross_hatch([0.96, 0.96, 0.96, 1.0], [0.05, 0.1, 0.96, 1.0], 0.35)
+    });
+    assert_eq!(scene.section_caps().pattern, SectionCapPattern::CrossHatch);
+    let (cross_white, cross_blue) = render(&mut host, &mut scene)
+        .map(|img| count_white_and_blue(&img))
+        .unwrap_or((0, 0));
+    assert!(
+        cross_white > 500 && cross_blue > hatch_blue,
+        "{label}: cross-hatch must add perpendicular blue lines ({cross_blue} > {hatch_blue}, white={cross_white})"
+    );
+
+    // 6b. Hollow thick-walled room (outer CCW box + inner inward-facing cavity):
+    //     Two-sided stencil wrap must cap ONLY the solid walls and leave the hollow interior open!
+    let mut hollow = Mesh3D::at_origin(Vec3::ZERO);
+    hollow.push_box(
+        Vec3::new(-1.5, -1.5, -2.0),
+        Vec3::new(1.5, 1.5, 2.0),
+        [185, 185, 185, 255],
+        PickId::new(1, 502, 0),
+        false,
+    );
+    let inner_start = hollow.vertices.len();
+    hollow.push_box(
+        Vec3::new(-0.7, -0.7, -1.5),
+        Vec3::new(0.7, 0.7, 1.5),
+        [160, 160, 160, 255],
+        PickId::new(1, 503, 0),
+        false,
+    );
+    // Flip inner cavity triangles to inward-facing (hollow void inside solid shell).
+    if let Some(inner) = hollow.vertices.get_mut(inner_start..) {
+        for tri in inner.as_chunks_mut::<3>().0 {
+            tri.swap(1, 2);
+            for v in tri.iter_mut() {
+                v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+            }
+        }
+    }
+    scene.remove(chunk);
+    let hollow_chunk = scene.insert(hollow);
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    if let Some(img_hollow) = render(&mut host, &mut scene) {
+        // Center (x=0, y=0) is inside the hollow cavity -> stencil == 0 -> NOT capped red.
+        if let Some(cavity) = img_hollow.pixel(100, 100) {
+            assert!(
+                cavity[0].abs_diff(cavity[2]) <= 15 && cavity[0] < 200,
+                "{label}: hollow cavity interior must stay uncapped gray, got {cavity:?}"
+            );
+        }
+        // Solid wall cross-section (between 0.7 and 1.5 -> ~35 px off center) MUST be capped red.
+        let wall_red = (128..146)
+            .filter_map(|x| img_hollow.pixel(x, 100))
+            .filter(|p| p[0] > 200 && p[1] < 55 && p[2] < 55)
+            .count();
+        assert!(
+            wall_red >= 8,
+            "{label}: solid wall cross-section around hollow cavity must be capped red, got {wall_red} px"
+        );
+    }
+
+    // 7. Large-world UTM coordinates + Ortho3D + Transparent InfiniteGrid3DLayer + MRT + Pick.
+    scene.remove(hollow_chunk);
+    let utm = Vec3::new(661_858.0, 4_491_159.0, 120.0);
+    let mut utm_mesh = Mesh3D::at_origin(utm);
+    utm_mesh.push_box(
+        Vec3::new(-2.0, -2.0, -2.0),
+        Vec3::new(2.0, 2.0, 2.0),
+        [180, 180, 180, 255],
+        PickId::new(1, 777, 0),
+        false,
+    );
+    let _utm_chunk = scene.insert(utm_mesh);
+    scene.set_section_caps(SectionCapConfig::solid([0.1, 0.92, 0.2, 1.0]));
+    *host.camera_mut() = Camera::ortho_3d(utm + Vec3::Z * 10.0, utm, Vec3::Y, 6.0, 0.1, 50.0);
+    if let Some(utm_plane) = Plane::from_normal_point(-Vec3::Z, utm) {
+        host.camera_mut().set_clip_planes(&[utm_plane]);
+    }
+    let mut grid = InfiniteGrid3DLayer::new(2, Grid3DConfig::default());
+    let supports_mrt = host.supports_color_frame_selection(device);
+    if supports_mrt {
+        host.set_color_frame_selection_rect(Some([50, 50, 100, 100]));
+    }
+    {
+        let mut enc = device.create_command_encoder(&Default::default());
+        let mut layers: [&mut dyn ViewportLayer<()>; 2] = [&mut scene, &mut grid];
+        host.render_to_texture(device, queue, &mut enc, &(), &mut layers);
+        queue.submit([enc.finish()]);
+    }
+    if let Ok(img_utm) = host.readback_rgba_blocking(device, queue)
+        && let Some(center) = img_utm.pixel(100, 100)
+    {
+        assert!(
+            center[1] > 190 && center[0] < 60 && center[2] < 80,
+            "{label}: UTM Ortho3D cap must fill cut center green, got {center:?}"
+        );
+    }
+    if supports_mrt {
+        if let Some(mut pending) = host.take_color_frame_selection_preview(device) {
+            let slots = loop {
+                match pending.try_read() {
+                    Poll::Ready(res) => break res.ok(),
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            };
+            assert!(
+                slots.as_ref().is_some_and(|s| !s.is_empty()),
+                "{label}: MRT preview with active section caps must still report visible chunk"
+            );
+        }
+        host.set_color_frame_selection_rect(None);
+    }
+    if let Ok(hits) =
+        host.pick_rect_blocking(device, queue, &(), &mut [&mut scene], [80, 80, 40, 40])
+    {
+        assert!(
+            hits.iter().any(|h| h.id.object == 777),
+            "{label}: exact 64-bit pick must still hit UTM box under active section caps"
+        );
+    }
+
+    // 8. Disabling section caps cleanly downgrades viewport back to Depth32Float.
+    scene.set_section_caps(SectionCapConfig::default());
+    let _img_disabled = render(&mut host, &mut scene);
+    assert_eq!(
+        host.depth_format(),
+        DEPTH_FORMAT,
+        "{label}: disabling caps must downgrade depth format back to Depth32Float"
+    );
+}
+
+#[test]
+fn section_caps_solid_hatch_multiplane_and_utm_precision() {
+    if let Some((device, queue)) = create_headless_device() {
+        verify_section_caps_on_device(&device, &queue, "discard_fallback");
+    }
+    if let Some((device, queue)) = create_device_with_clip_distances() {
+        verify_section_caps_on_device(&device, &queue, "clip_distances");
+    }
+}
+
+#[test]
+fn section_caps_multi_viewport_and_continuous_mode_isolated() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host_a = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            mode: ViewportMode::Continuous,
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    let mut host_b = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            mode: ViewportMode::OnDemand,
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [128, 128],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    if !host_a.supports_stencil(&device) {
+        return;
+    }
+
+    // Viewport A: sliced at z <= 0, viewing cut face from +Z (should show bright red cap).
+    *host_a.camera_mut() = Camera::perspective_3d(
+        Vec3::new(0.0, 0.0, 5.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        50_f64.to_radians(),
+        0.1,
+    );
+    host_a
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap()]);
+
+    // Viewport B: sliced at x >= 0, viewing from -X (different clip plane in the same encoder!).
+    *host_b.camera_mut() = Camera::perspective_3d(
+        Vec3::new(-5.0, 0.0, 0.0),
+        Vec3::ZERO,
+        Vec3::Z,
+        50_f64.to_radians(),
+        0.1,
+    );
+    host_b
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(Vec3::X, Vec3::ZERO).unwrap()]);
+
+    let mut scene = Scene3DLayer::new(1);
+    let mut mesh = Mesh3D::at_origin(Vec3::ZERO);
+    mesh.push_box(
+        Vec3::new(-1.5, -1.5, -1.5),
+        Vec3::new(1.5, 1.5, 1.5),
+        [185, 185, 185, 255],
+        PickId::new(1, 900, 0),
+        false,
+    );
+    scene.insert(mesh);
+    scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+
+    // Render BOTH viewports into one shared CommandEncoder (quad-view pattern).
+    let mut encoder = device.create_command_encoder(&Default::default());
+    host_a.render_to_texture(&device, &queue, &mut encoder, &(), &mut [&mut scene]);
+    host_b.render_to_texture(&device, &queue, &mut encoder, &(), &mut [&mut scene]);
+    queue.submit([encoder.finish()]);
+
+    let img_a = host_a.readback_rgba_blocking(&device, &queue).unwrap();
+    let img_b = host_b.readback_rgba_blocking(&device, &queue).unwrap();
+    let px_a = img_a.pixel(64, 64).unwrap();
+    let px_b = img_b.pixel(64, 64).unwrap();
+    assert!(
+        px_a[0] > 200 && px_a[1] < 55 && px_a[2] < 55,
+        "Continuous MSAA viewport A must show solid red cap, got {px_a:?}"
+    );
+    assert!(
+        px_b[0] > 200 && px_b[1] < 55 && px_b[2] < 55,
+        "OnDemand viewport B with distinct clip plane in same encoder must also cap cleanly, got {px_b:?}"
+    );
+    assert_eq!(host_a.depth_format(), DEPTH_STENCIL_FORMAT);
+    assert_eq!(host_b.depth_format(), DEPTH_STENCIL_FORMAT);
+
+    // Also verify 1x MSAA + 144 repeated packed boxes (exercises packed/repeated/GPU-cull stencil paths).
+    let mut host_1x = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 1,
+            clear_color: [0.05, 0.05, 0.07, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [160, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host_1x.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, 0.0, 12.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        16.0,
+        0.1,
+        50.0,
+    );
+    host_1x
+        .camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap()]);
+    let mut packed_scene = Scene3DLayer::new(2);
+    for idx in 0..144 {
+        let gx = f64::from(idx % 12) * 1.2 - 6.6;
+        let gy = f64::from(idx / 12) * 1.2 - 6.6;
+        let mut m = Mesh3D::at_origin(Vec3::new(gx, gy, 0.0));
+        m.push_box(
+            Vec3::new(-0.45, -0.45, -1.0),
+            Vec3::new(0.45, 0.45, 1.0),
+            [180, 180, 180, 255],
+            PickId::new(1, idx + 1, 0),
+            false,
+        );
+        packed_scene.insert(m);
+    }
+    packed_scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+    let mut enc = device.create_command_encoder(&Default::default());
+    host_1x.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut packed_scene]);
+    queue.submit([enc.finish()]);
+    let img_1x = host_1x.readback_rgba_blocking(&device, &queue).unwrap();
+    let red_pixels = img_1x
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] > 200 && p[1] < 55 && p[2] < 55)
+        .count();
+    assert!(
+        red_pixels > 2000,
+        "1x MSAA 144-box repeated/packed scene must cap cross-sections cleanly, got {red_pixels} red pixels"
+    );
+}
+
+#[test]
+fn wboit_order_independent_blending_ghost_and_opacity_at_4x_and_1x_msaa() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+
+    for msaa in [4u32, 1u32] {
+        let make_host = || {
+            let mut host = ViewportHost::new(
+                &device,
+                ViewportConfig {
+                    color_format: wgpu::TextureFormat::Rgba8Unorm,
+                    msaa_samples: msaa,
+                    clear_color: [0.04, 0.04, 0.05, 1.0],
+                    upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                    initial_px: [160, 160],
+                    ..ViewportConfig::default()
+                },
+            )
+            .unwrap();
+            *host.camera_mut() = Camera::perspective_3d(
+                Vec3::new(0.0, 0.0, 6.0),
+                Vec3::ZERO,
+                Vec3::Y,
+                48_f64.to_radians(),
+                0.1,
+            );
+            host
+        };
+        let make_pane = |z: f64, color: [u8; 4], obj: u32| {
+            let mut m = Mesh3D::at_origin(Vec3::new(0.0, 0.0, z));
+            m.push_box(
+                Vec3::new(-1.4, -1.4, -0.1),
+                Vec3::new(1.4, 1.4, 0.1),
+                color,
+                PickId::new(1, obj, 0),
+                false,
+            );
+            m
+        };
+
+        // 1. Order independence: (Front Red, Back Blue) vs (Back Blue, Front Red) must match!
+        let render_pair = |front_first: bool| {
+            let mut host = make_host();
+            let mut scene = Scene3DLayer::new(1);
+            scene.set_oit_enabled(true);
+            assert!(scene.oit_enabled());
+            if front_first {
+                scene.insert(make_pane(0.5, [240, 30, 30, 130], 1));
+                scene.insert(make_pane(-1.8, [30, 50, 245, 130], 2));
+            } else {
+                scene.insert(make_pane(-1.8, [30, 50, 245, 130], 2));
+                scene.insert(make_pane(0.5, [240, 30, 30, 130], 1));
+            }
+            let mut enc = device.create_command_encoder(&Default::default());
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+            queue.submit([enc.finish()]);
+            host.readback_rgba_blocking(&device, &queue).unwrap()
+        };
+        let img_ab = render_pair(true);
+        let img_ba = render_pair(false);
+        let px_ab = img_ab.pixel(80, 80).unwrap();
+        let px_ba = img_ba.pixel(80, 80).unwrap();
+        for ch in 0..3 {
+            assert!(
+                px_ab[ch].abs_diff(px_ba[ch]) <= 2,
+                "msaa={msaa}: WBOIT must be order-independent (ab={px_ab:?}, ba={px_ba:?})"
+            );
+        }
+        assert!(
+            px_ab[0] > px_ab[2] && px_ab[0] > 90 && px_ab[2] > 18,
+            "msaa={msaa}: front red must dominate while back blue shines through, got {px_ab:?}"
+        );
+
+        // 2. Opaque occlusion + per-chunk ghost & opacity + live toggle back to opaque + picking.
+        let mut host = make_host();
+        let mut scene = Scene3DLayer::new(2);
+        let front_id = scene.insert(make_pane(0.8, [230, 230, 230, 255], 10));
+        let back_id = scene.insert(make_pane(-1.2, [20, 235, 30, 255], 20));
+        assert!(!scene.is_chunk_ghost(front_id));
+        assert_eq!(scene.chunk_opacity(front_id), Some(1.0));
+
+        let render_scene = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+            queue.submit([enc.finish()]);
+            host.readback_rgba_blocking(&device, &queue).unwrap()
+        };
+
+        // Baseline opaque: front gray completely hides back green.
+        let px_opaque = render_scene(&mut host, &mut scene).pixel(80, 80).unwrap();
+        assert!(
+            px_opaque[0].abs_diff(px_opaque[1]) <= 8 && px_opaque[0] > 80,
+            "msaa={msaa}: opaque front must hide back green, got {px_opaque:?}"
+        );
+
+        // Per-chunk ghost: back green shines clearly through ghosted front box!
+        scene.set_chunk_ghost(front_id, true);
+        assert!(scene.is_chunk_ghost(front_id));
+        let px_ghost = render_scene(&mut host, &mut scene).pixel(80, 80).unwrap();
+        assert!(
+            px_ghost[1] > px_ghost[0].saturating_add(15),
+            "msaa={msaa}: ghosted front box must reveal green box behind it, got {px_ghost:?}"
+        );
+
+        // Exact 64-bit pick still hits the ghosted front chunk.
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [70, 70, 20, 20])
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.id.object == 10),
+            "msaa={msaa}: ghosted chunk must remain pickable"
+        );
+
+        // Per-chunk opacity: 0.3 -> green visible; 0.0 -> full green; 1.0 -> restores opaque gray.
+        scene.set_chunk_ghost(front_id, false);
+        scene.set_chunk_opacity(front_id, 0.3);
+        let px_op30 = render_scene(&mut host, &mut scene).pixel(80, 80).unwrap();
+        assert!(
+            px_op30[1] > px_op30[0].saturating_add(25),
+            "msaa={msaa}: 0.3 opacity front must reveal back green, got {px_op30:?}"
+        );
+
+        scene.set_chunk_opacity(front_id, 0.0);
+        let px_op0 = render_scene(&mut host, &mut scene).pixel(80, 80).unwrap();
+        assert!(
+            px_op0[1] > 120 && px_op0[0] < 40,
+            "msaa={msaa}: 0.0 opacity front must vanish completely, got {px_op0:?}"
+        );
+
+        // Also test opaque occlusion in front of a translucent chunk.
+        scene.set_chunk_opacity(front_id, 1.0);
+        scene.set_chunk_opacity(back_id, 0.4);
+        let px_restored = render_scene(&mut host, &mut scene).pixel(80, 80).unwrap();
+        assert!(
+            px_restored[0].abs_diff(px_restored[1]) <= 8 && px_restored[0] > 80,
+            "msaa={msaa}: restored opaque front must occlude translucent back, got {px_restored:?}"
+        );
+        scene.set_chunk_opacity(back_id, 1.0);
+        let _px_clean = render_scene(&mut host, &mut scene);
+    }
+
+    // 3. Coexistence: Section Caps + WBOIT in the same frame & PostOpaque hook.
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.04, 0.04, 0.05, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [200, 140],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    if host.supports_stencil(&device) {
+        *host.camera_mut() = Camera::ortho_3d(
+            Vec3::new(0.0, 0.0, 8.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            4.5,
+            0.1,
+            30.0,
+        );
+        host.camera_mut()
+            .set_clip_planes(&[Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap()]);
+        let mut scene = Scene3DLayer::new(3);
+        // Left: solid gray box sliced at z <= 0 -> capped bright red.
+        let mut left = Mesh3D::at_origin(Vec3::new(-1.4, 0.0, 0.0));
+        left.push_box(
+            Vec3::new(-1.0, -1.0, -1.5),
+            Vec3::new(1.0, 1.0, 1.5),
+            [180, 180, 180, 255],
+            PickId::new(1, 31, 0),
+            false,
+        );
+        scene.insert(left);
+        // Right: translucent blue box sliced at z <= 0 -> NOT capped, rendered via WBOIT blue.
+        let mut right = Mesh3D::at_origin(Vec3::new(1.4, 0.0, 0.0));
+        right.push_box(
+            Vec3::new(-1.0, -1.0, -1.5),
+            Vec3::new(1.0, 1.0, 1.5),
+            [40, 80, 245, 255],
+            PickId::new(1, 32, 0),
+            false,
+        );
+        let right_id = scene.insert(right);
+        let glass = scene.insert_material(Material3D::translucent([0.2, 0.4, 1.0, 0.45]));
+        scene.set_chunk_material(right_id, glass);
+        scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+        let img = host.readback_rgba_blocking(&device, &queue).unwrap();
+        let left_px = img.pixel(55, 70).unwrap();
+        let right_px = img.pixel(145, 70).unwrap();
+        assert!(
+            left_px[0] > 200 && left_px[1] < 55 && left_px[2] < 55,
+            "left cut solid must receive red stencil cap alongside WBOIT, got {left_px:?}"
+        );
+        assert!(
+            right_px[2] > right_px[0].saturating_add(40),
+            "right translucent box must render blue via WBOIT without red cap, got {right_px:?}"
+        );
+    }
+}
+
+#[test]
+fn cad_visual_styles_and_diagnostic_views_render_and_pick_cleanly() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.05, 0.06, 0.08, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [240, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, 0.0, 10.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        5.0,
+        0.1,
+        30.0,
+    );
+
+    let mut scene = Scene3DLayer::new(1);
+    let make_edged_box = |x: f64, z: f64, color: [u8; 4], obj: u32| {
+        let mut m = Mesh3D::at_origin(Vec3::new(x, 0.0, z));
+        m.push_box_with_edges(
+            Vec3::new(-0.9, -0.9, -0.5),
+            Vec3::new(0.9, 0.9, 0.5),
+            color,
+            [15, 15, 20, 255],
+            PickId::new(1, obj, 0),
+            true,
+        );
+        m
+    };
+    // Left box (near z=+1.5), center box (z=0.0) with a second overlapping box directly behind it
+    // (for XRay & Overdraw), and an inverted back-facing quad on the right (for Backfaces).
+    let _left = scene.insert(make_edged_box(-2.4, 1.5, [210, 180, 140, 255], 101));
+    let _center_front = scene.insert(make_edged_box(0.0, 0.2, [190, 200, 210, 255], 102));
+    let _center_back = scene.insert(make_edged_box(0.0, -2.5, [25, 230, 40, 255], 103));
+
+    // Right chunk: back-facing (CW when viewed from +Z) quad spanning x in [1.5, 3.3], y in [-0.9, 0.9].
+    let mut back_quad = Mesh3D::at_origin(Vec3::new(2.4, 0.0, -1.5));
+    let c = [200, 200, 200, 255];
+    let pid = PickId::new(1, 104, 0);
+    // CW order viewed from +Z -> front_facing == false!
+    back_quad.push_triangle(
+        Vec3::new(-0.9, -0.9, 0.0),
+        Vec3::new(-0.9, 0.9, 0.0),
+        Vec3::new(0.9, 0.9, 0.0),
+        c,
+        pid,
+    );
+    back_quad.push_triangle(
+        Vec3::new(-0.9, -0.9, 0.0),
+        Vec3::new(0.9, 0.9, 0.0),
+        Vec3::new(0.9, -0.9, 0.0),
+        c,
+        pid,
+    );
+    let _right_back = scene.insert(back_quad);
+
+    let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+        queue.submit([enc.finish()]);
+        host.readback_rgba_blocking(&device, &queue).unwrap()
+    };
+
+    // Pixel columns in 240x160 ortho (view_height=5.0 -> 32 px/unit, width=7.5 units):
+    // x=-2.4 -> px ~43, x=0.0 -> px 120, x=+2.4 -> px ~197; y=0 -> py 80.
+    // 1. ShadedWithEdges vs Shaded (edges present on perimeter of center box).
+    assert_eq!(scene.visual_style(), VisualStyle::ShadedWithEdges);
+    assert_eq!(scene.diagnostic_view(), DiagnosticView::None);
+    let img_edges = render(&mut host, &mut scene);
+    scene.set_visual_style(VisualStyle::Shaded);
+    let img_shaded = render(&mut host, &mut scene);
+    assert_ne!(
+        img_edges.pixels, img_shaded.pixels,
+        "ShadedWithEdges and Shaded must differ along CAD edges"
+    );
+
+    // 2. Technical (Hidden-Line): bright paper face fill + dark ink edges.
+    scene.set_visual_style(VisualStyle::Technical);
+    let img_tech = render(&mut host, &mut scene);
+    let tech_face = img_tech.pixel(120, 80).unwrap();
+    assert!(
+        tech_face[0] > 180 && tech_face[1] > 180 && tech_face[2] > 180,
+        "Technical style face must render bright architectural paper, got {tech_face:?}"
+    );
+
+    // 3. Wireframe: interior of center box opens to dark background while border has bright wire edges.
+    scene.set_visual_style(VisualStyle::Wireframe);
+    let img_wire = render(&mut host, &mut scene);
+    let wire_interior = img_wire.pixel(120, 80).unwrap();
+    assert!(
+        wire_interior[0] < 35 && wire_interior[1] < 35 && wire_interior[2] < 40,
+        "Wireframe interior must stay transparent background, got {wire_interior:?}"
+    );
+    let wire_bright_px = img_wire
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[2] > 130 && p[0] > 100)
+        .count();
+    assert!(
+        wire_bright_px > 40,
+        "Wireframe style must draw visible bright wireframe edges, got {wire_bright_px} px"
+    );
+
+    // 4. XRay: translucent front box reveals bright green box directly behind it!
+    scene.set_visual_style(VisualStyle::XRay);
+    scene.set_xray_opacity(0.32);
+    let img_xray = render(&mut host, &mut scene);
+    let xray_center = img_xray.pixel(120, 80).unwrap();
+    assert!(
+        xray_center[1] > 60 && xray_center[1] > xray_center[0],
+        "XRay must reveal rear green box through front gray box, got {xray_center:?}"
+    );
+
+    // 5. DiagnosticView::Normals: +Z facing face maps normal (0, 0, 1) -> (0.5, 0.5, 1.0) = blue-dominant!
+    scene.set_diagnostic_view(DiagnosticView::Normals);
+    let img_norm = render(&mut host, &mut scene);
+    let norm_px = img_norm.pixel(120, 80).unwrap();
+    assert!(
+        norm_px[2] > 200 && norm_px[0].abs_diff(128) <= 20 && norm_px[1].abs_diff(128) <= 20,
+        "Normals view on +Z face must encode (0.5, 0.5, 1.0), got {norm_px:?}"
+    );
+
+    // 6. DiagnosticView::Facets: renders crisp geometric normals without panics or blank output.
+    scene.set_diagnostic_view(DiagnosticView::Facets);
+    let img_facets = render(&mut host, &mut scene);
+    let facet_px = img_facets.pixel(120, 80).unwrap();
+    assert!(
+        facet_px[0] > 80 && facet_px[1] > 80 && facet_px[2] > 80,
+        "Facets view must shade geometric facets cleanly, got {facet_px:?}"
+    );
+
+    // 7. DiagnosticView::Backfaces: front box = blue, inverted CW right quad = red-orange!
+    scene.set_diagnostic_view(DiagnosticView::Backfaces);
+    let img_bf = render(&mut host, &mut scene);
+    let bf_front = img_bf.pixel(43, 80).unwrap();
+    let bf_back = img_bf.pixel(197, 80).unwrap();
+    assert!(
+        bf_front[2] > bf_front[0].saturating_add(40),
+        "Backfaces view must shade front-facing CCW box blue, got {bf_front:?}"
+    );
+    assert!(
+        bf_back[0] > bf_back[2].saturating_add(50),
+        "Backfaces view must shade back-facing CW quad red-orange, got {bf_back:?}"
+    );
+
+    // 8. DiagnosticView::Overdraw: 2 stacked boxes at center (4 surfaces) > 1 box at left (2 surfaces) > background!
+    scene.set_diagnostic_view(DiagnosticView::Overdraw);
+    let img_od = render(&mut host, &mut scene);
+    let od_bg = img_od.pixel(4, 4).unwrap();
+    let od_single = img_od.pixel(43, 80).unwrap();
+    let od_double = img_od.pixel(120, 80).unwrap();
+    assert!(
+        od_double[0] > od_single[0] && od_single[0] > od_bg[0],
+        "Overdraw intensity must increase strictly with layer count (bg={od_bg:?}, single={od_single:?}, double={od_double:?})"
+    );
+
+    // 9. DiagnosticView::Chunks: distinct chunks render distinct hashed palette colors.
+    scene.set_diagnostic_view(DiagnosticView::Chunks);
+    let img_chunks = render(&mut host, &mut scene);
+    let ch_left = img_chunks.pixel(43, 80).unwrap();
+    let ch_center = img_chunks.pixel(120, 80).unwrap();
+    let color_diff = ch_left[0].abs_diff(ch_center[0]) as u32
+        + ch_left[1].abs_diff(ch_center[1]) as u32
+        + ch_left[2].abs_diff(ch_center[2]) as u32;
+    assert!(
+        color_diff > 30,
+        "Chunks view must assign distinct palette colors (left={ch_left:?}, center={ch_center:?})"
+    );
+
+    // 10. DiagnosticView::Depth: near left box (z=+1.5) strictly brighter than far right quad (z=-1.5).
+    scene.set_diagnostic_view(DiagnosticView::Depth);
+    let img_depth = render(&mut host, &mut scene);
+    let d_near = img_depth.pixel(43, 80).unwrap();
+    let d_far = img_depth.pixel(197, 80).unwrap();
+    assert!(
+        d_near[0] > d_far[0].saturating_add(12),
+        "Depth view must shade nearer geometry brighter than farther geometry (near={d_near:?}, far={d_far:?})"
+    );
+
+    // Exact 64-bit picking remains fully operational while in diagnostic/style modes.
+    let hits = host
+        .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [10, 40, 220, 80])
+        .unwrap();
+    let hit_ids: Vec<u32> = hits.iter().map(|h| h.id.object).collect();
+    assert!(
+        hit_ids.contains(&101) && hit_ids.contains(&102) && hit_ids.contains(&104),
+        "exact pick must work cleanly across visual styles and diagnostics, got {hit_ids:?}"
+    );
+
+    // Returning to defaults restores MRT color-frame selection capability cleanly.
+    scene.set_diagnostic_view(DiagnosticView::None);
+    scene.set_visual_style(VisualStyle::ShadedWithEdges);
+    assert!(ViewportLayer::<()>::supports_color_frame_selection(&scene));
+    let _img_default = render(&mut host, &mut scene);
+
+    // Multi-viewport X-Ray isolation + repeated-geometry OIT (24 identical boxes at different
+    // sizes across two ViewportHosts sharing one Scene3DLayer).
+    let mut host_b = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 1,
+            clear_color: [0.05, 0.06, 0.08, 1.0],
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [128, 96],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host_b.camera_mut() = Camera::ortho_3d(
+        Vec3::new(0.0, 0.0, 12.0),
+        Vec3::ZERO,
+        Vec3::Y,
+        6.0,
+        0.1,
+        30.0,
+    );
+    let mut rep_scene = Scene3DLayer::new(7);
+    for i in 0..24u32 {
+        let mut b = Mesh3D::at_origin(Vec3::new(
+            (i % 6) as f64 * 0.9 - 2.25,
+            (i / 6) as f64 * 0.9 - 1.35,
+            if i % 2 == 0 { 0.4 } else { -0.4 },
+        ));
+        b.push_box(
+            Vec3::new(-0.35, -0.35, -0.25),
+            Vec3::new(0.35, 0.35, 0.25),
+            [180, 210, 240, 255],
+            PickId::new(7, i + 1, 0),
+            false,
+        );
+        rep_scene.insert(b);
+    }
+    rep_scene.set_visual_style(VisualStyle::XRay);
+    let img_a = render(&mut host, &mut rep_scene);
+    let img_b = render(&mut host_b, &mut rep_scene);
+    let lit_a = img_a
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[2] > 35)
+        .count();
+    let lit_b = img_b
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[2] > 35)
+        .count();
+    assert!(
+        lit_a > 200 && lit_b > 100,
+        "shared Scene3DLayer XRay must render cleanly in both 4x and 1x viewports (lit_a={lit_a}, lit_b={lit_b})"
+    );
+}
+
+#[test]
+fn gtao_darkens_concave_corners_preserves_background_and_coexists_with_caps_and_oit() {
+    let Some((device, queue)) = create_headless_device() else {
+        return;
+    };
+    let is_gl = device.adapter_info().backend == wgpu::Backend::Gl;
+
+    // Build an open trihedral concave CAD corner (floor + back wall + left wall) with visible sky.
+    let build_corner_scene = || {
+        let mut scene = Scene3DLayer::new(1);
+        let mat_color = [215, 215, 215, 255];
+        let mut floor = Mesh3D::at_origin(Vec3::ZERO);
+        floor.push_box(
+            Vec3::new(-0.4, -0.25, -0.4),
+            Vec3::new(3.6, 0.0, 3.6),
+            mat_color,
+            PickId::new(1, 501, 0),
+            false,
+        );
+        let mut back_wall = Mesh3D::at_origin(Vec3::ZERO);
+        back_wall.push_box(
+            Vec3::new(-0.4, 0.0, -0.4),
+            Vec3::new(3.6, 2.2, 0.0),
+            mat_color,
+            PickId::new(1, 502, 0),
+            false,
+        );
+        let mut left_wall = Mesh3D::at_origin(Vec3::ZERO);
+        left_wall.push_box(
+            Vec3::new(-0.4, 0.0, 0.0),
+            Vec3::new(0.0, 2.2, 3.6),
+            mat_color,
+            PickId::new(1, 503, 0),
+            false,
+        );
+        let floor_id = scene.insert(floor);
+        let _back_id = scene.insert(back_wall);
+        let _left_id = scene.insert(left_wall);
+        (scene, floor_id)
+    };
+
+    let project_px = |cam: &Camera, world: Vec3, w: u32, h: u32| -> (u32, u32) {
+        let vp = cam.view_proj_relative(iletki_core::Vec2::new(f64::from(w), f64::from(h)));
+        let rel = world - cam.position_3d();
+        let clip = vp.mul_vec4(iletki_core::Vec4::new(rel.x, rel.y, rel.z, 1.0));
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        let px = (((ndc_x + 1.0) * 0.5) * f64::from(w))
+            .round()
+            .clamp(0.0, f64::from(w - 1)) as u32;
+        let py = (((1.0 - ndc_y) * 0.5) * f64::from(h))
+            .round()
+            .clamp(0.0, f64::from(h - 1)) as u32;
+        (px, py)
+    };
+
+    let avg_luma = |img: &iletki_wgpu::RgbaImage, cx: u32, cy: u32| -> f32 {
+        let mut sum = 0.0f32;
+        let mut count = 0.0f32;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let x = (cx as i32 + dx).clamp(0, img.width as i32 - 1) as u32;
+                let y = (cy as i32 + dy).clamp(0, img.height as i32 - 1) as u32;
+                if let Some(px) = img.pixel(x, y) {
+                    sum += f32::from(px[0]) * 0.299
+                        + f32::from(px[1]) * 0.587
+                        + f32::from(px[2]) * 0.114;
+                    count += 1.0;
+                }
+            }
+        }
+        sum / count.max(1.0)
+    };
+
+    let configs = [
+        (
+            "persp_4x",
+            4u32,
+            Camera::perspective_3d(
+                Vec3::new(3.8, 3.0, 4.4),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                std::f64::consts::FRAC_PI_4,
+                0.1,
+            ),
+        ),
+        (
+            "persp_1x",
+            1u32,
+            Camera::perspective_3d(
+                Vec3::new(3.8, 3.0, 4.4),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                std::f64::consts::FRAC_PI_4,
+                0.1,
+            ),
+        ),
+        (
+            "ortho_4x",
+            4u32,
+            Camera::ortho_3d(
+                Vec3::new(4.2, 3.4, 4.8),
+                Vec3::new(1.0, 0.5, 1.0),
+                Vec3::Y,
+                5.4,
+                0.1,
+                40.0,
+            ),
+        ),
+    ];
+
+    for (label, msaa, cam) in configs {
+        let mut host = ViewportHost::new(
+            &device,
+            ViewportConfig {
+                color_format: wgpu::TextureFormat::Rgba8Unorm,
+                msaa_samples: msaa,
+                clear_color: [0.06, 0.08, 0.12, 1.0],
+                upload_budget: iletki_core::UploadBudget::UNLIMITED,
+                initial_px: [240, 160],
+                ..ViewportConfig::default()
+            },
+        )
+        .unwrap();
+        *host.camera_mut() = cam.clone();
+        let (mut scene, _floor_id) = build_corner_scene();
+        assert!(!scene.gtao().enabled);
+
+        let render = |host: &mut ViewportHost, scene: &mut Scene3DLayer| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            host.render_to_texture(&device, &queue, &mut enc, &(), &mut [scene]);
+            queue.submit([enc.finish()]);
+            host.readback_rgba_blocking(&device, &queue).unwrap()
+        };
+
+        let img_base = render(&mut host, &mut scene);
+
+        let mut gtao_cfg = GtaoConfig::with_radius(1.4);
+        gtao_cfg.intensity = 1.25;
+        gtao_cfg.power = 1.6;
+        scene.set_gtao(gtao_cfg);
+        assert!(scene.gtao().enabled);
+        let img_ao = render(&mut host, &mut scene);
+
+        let corner_px = project_px(&cam, Vec3::new(0.18, 0.02, 0.18), 240, 160);
+        let open_px = project_px(&cam, Vec3::new(2.9, 0.02, 2.9), 240, 160);
+        let bg_base = img_base.pixel(4, 4).unwrap();
+        let bg_ao = img_ao.pixel(4, 4).unwrap();
+        assert_eq!(
+            bg_base, bg_ao,
+            "{label}: GTAO must preserve background pixels bit-for-bit"
+        );
+
+        let corner_base = avg_luma(&img_base, corner_px.0, corner_px.1);
+        let corner_ao = avg_luma(&img_ao, corner_px.0, corner_px.1);
+        let open_base = avg_luma(&img_base, open_px.0, open_px.1);
+        let open_ao = avg_luma(&img_ao, open_px.0, open_px.1);
+
+        if !is_gl {
+            let corner_drop = corner_base - corner_ao;
+            let open_drop = open_base - open_ao;
+            assert!(
+                corner_drop > 18.0,
+                "{label}: GTAO must clearly darken concave corner (base={corner_base:.1}, ao={corner_ao:.1}, px={corner_px:?})"
+            );
+            assert!(
+                open_drop < 12.0 && corner_drop > open_drop * 2.0,
+                "{label}: open flat floor must remain bright without false self-shadowing (open_drop={open_drop:.1}, corner_drop={corner_drop:.1})"
+            );
+        } else {
+            assert_eq!(
+                img_base.pixels, img_ao.pixels,
+                "{label}: GL fallback must gracefully no-op without corrupting output"
+            );
+        }
+
+        // Exact 64-bit picking remains intact with GTAO active.
+        let hits = host
+            .pick_rect_blocking(&device, &queue, &(), &mut [&mut scene], [0, 0, 240, 160])
+            .unwrap();
+        let hit_ids: Vec<u32> = hits.iter().map(|h| h.id.object).collect();
+        assert!(
+            hit_ids.contains(&501) && hit_ids.contains(&502) && hit_ids.contains(&503),
+            "{label}: picking must succeed with GTAO enabled, got {hit_ids:?}"
+        );
+
+        // Toggling GTAO off restores exact baseline pixels and releases GPU resources.
+        scene.set_gtao(GtaoConfig::default());
+        assert!(!scene.gtao().enabled);
+        let img_off = render(&mut host, &mut scene);
+        assert_eq!(
+            img_base.pixels, img_off.pixels,
+            "{label}: disabling GTAO must restore baseline pixels exactly"
+        );
+    }
+
+    // Resilience & Coexistence: block-boundary resizes (including 1x1), Continuous mode,
+    // Section Caps + WBOIT + GTAO all enabled simultaneously in one frame.
+    let mut host = ViewportHost::new(
+        &device,
+        ViewportConfig {
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            msaa_samples: 4,
+            clear_color: [0.06, 0.08, 0.12, 1.0],
+            mode: ViewportMode::Continuous,
+            upload_budget: iletki_core::UploadBudget::UNLIMITED,
+            initial_px: [240, 160],
+            ..ViewportConfig::default()
+        },
+    )
+    .unwrap();
+    *host.camera_mut() = Camera::perspective_3d(
+        Vec3::new(4.0, 3.0, 4.5),
+        Vec3::new(0.8, 0.5, 0.8),
+        Vec3::Y,
+        std::f64::consts::FRAC_PI_4,
+        0.1,
+    );
+    host.camera_mut()
+        .set_clip_planes(&[Plane::from_normal_point(
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(2.2, 0.0, 0.0),
+        )
+        .unwrap()]);
+    let (mut scene, _floor_id) = build_corner_scene();
+    let mut glass_pane = Mesh3D::at_origin(Vec3::new(1.2, 0.8, 1.2));
+    glass_pane.push_box(
+        Vec3::new(-0.3, -0.5, -0.05),
+        Vec3::new(0.3, 0.5, 0.05),
+        [40, 120, 240, 255],
+        PickId::new(1, 504, 0),
+        false,
+    );
+    let glass_id = scene.insert(glass_pane);
+    let glass_mat = scene.insert_material(Material3D::translucent([0.2, 0.5, 1.0, 0.45]));
+    scene.set_chunk_material(glass_id, glass_mat);
+    if host.supports_stencil(&device) {
+        scene.set_section_caps(SectionCapConfig::solid([0.9, 0.2, 0.15, 1.0]));
+    }
+    scene.set_gtao(GtaoConfig::with_radius(1.2));
+
+    for size in [[257, 193], [1, 1], [240, 160]] {
+        host.resize(&device, size, 1.0);
+        let mut enc = device.create_command_encoder(&Default::default());
+        host.render_to_texture(&device, &queue, &mut enc, &(), &mut [&mut scene]);
+        queue.submit([enc.finish()]);
+    }
+    let img_combo = host.readback_rgba_blocking(&device, &queue).unwrap();
+    assert_eq!((img_combo.width, img_combo.height), (240, 160));
+    let non_bg = img_combo
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] > 30 || px[1] > 30 || px[2] > 50)
+        .count();
+    assert!(
+        non_bg > 2000,
+        "combined Section Caps + WBOIT + GTAO in Continuous mode must render cleanly (non_bg={non_bg})"
     );
 }

@@ -10,11 +10,11 @@ pub use iletki_core::*;
 pub use iletki_wgpu as gpu;
 #[cfg(feature = "wgpu")]
 pub use iletki_wgpu::{
-    CAMERA_WGSL, CameraUniformsGpu, DEPTH_FORMAT, FrameOutput, FrameStats, GpuCullCtx,
-    LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx, PassTargetDesc, PendingPick,
-    PendingSlotPreview, PrepareCtx, RgbaImage, SELECTION_ID_FORMAT, SelectionPreviewSnapshot,
-    SelectionPreviewStats, UploadTracker, ViewportConfig, ViewportError, ViewportHost,
-    ViewportLayer, ViewportLifetime,
+    CAMERA_WGSL, CameraUniformsGpu, DEPTH_FORMAT, DEPTH_STENCIL_FORMAT, FrameOutput, FrameStats,
+    GpuCullCtx, LayerRevision, OUTLINE_MASK_FORMAT, PICK_ID_FORMAT, PaintCtx, PassHookCtx,
+    PassHookMask, PassHookStage, PassTargetDesc, PendingPick, PendingSlotPreview, PrepareCtx,
+    RgbaImage, SELECTION_ID_FORMAT, SelectionPreviewSnapshot, SelectionPreviewStats, UploadTracker,
+    ViewportConfig, ViewportError, ViewportHost, ViewportLayer, ViewportLifetime,
 };
 
 #[cfg(feature = "cad2d")]
@@ -29,6 +29,7 @@ pub use iletki_2d::{
 pub use iletki_3d as cad3d;
 #[cfg(feature = "cad3d")]
 pub use iletki_3d::{
-    Chunk3DId, GizmoAxis, Grid3DConfig, GridPlane, InfiniteGrid3DLayer, Instance3D,
-    InstancedMesh3DLayer, Mesh3D, Scene3DLayer, TransformGizmoLayer, Vertex3D,
+    Chunk3DId, DiagnosticView, GizmoAxis, Grid3DConfig, GridPlane, GtaoConfig, InfiniteGrid3DLayer,
+    Instance3D, InstancedMesh3DLayer, Material3D, MaterialFlags, MaterialId, Mesh3D, Scene3DLayer,
+    SectionCapConfig, SectionCapPattern, TransformGizmoLayer, Vertex3D, VisualStyle,
 };

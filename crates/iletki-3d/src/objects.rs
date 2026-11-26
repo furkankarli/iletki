@@ -1,6 +1,10 @@
 //! Per-viewport chunk draws and aligned object uniform pages.
 
 use crate::gpu_cull::GpuCullView;
+use crate::gtao::ViewGtaoState;
+use crate::oit::ViewOitState;
+use crate::section_cap::ViewSectionCaps;
+use crate::style::ViewStyleUniform;
 use crate::{
     Vertex3D,
     face_batch::PackedDraws,
@@ -115,6 +119,10 @@ pub(crate) struct ViewObjects {
     pub(crate) retained_full_scene: bool,
     pub(crate) retained_has_edges: bool,
     pub(crate) outline_bounds: OutlineBounds,
+    pub(crate) section_caps: Option<ViewSectionCaps>,
+    pub(crate) oit: Option<ViewOitState>,
+    pub(crate) gtao: Option<ViewGtaoState>,
+    pub(crate) style_uniform: Option<ViewStyleUniform>,
     pub(crate) direct_uniforms: Vec<ObjectUniforms>,
     pages: Vec<UniformPage>,
     staging: Vec<u8>,
@@ -152,6 +160,10 @@ impl ViewObjects {
             retained_full_scene: false,
             retained_has_edges: false,
             outline_bounds: OutlineBounds::default(),
+            section_caps: None,
+            oit: None,
+            gtao: None,
+            style_uniform: None,
             direct_uniforms: Vec::new(),
             pages: Vec::new(),
             staging: Vec::new(),
@@ -390,6 +402,11 @@ impl SectionGroup {
             return false;
         }
         !frustum.intersects_bounds_world(self.world, camera)
+    }
+
+    pub(crate) fn world_bounds(&self) -> Option<Bounds3> {
+        (!self.has_untrusted && !self.invalid_origin && !self.world.is_empty())
+            .then_some(self.world)
     }
 
     pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {

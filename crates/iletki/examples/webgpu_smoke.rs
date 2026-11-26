@@ -12,8 +12,9 @@ fn main() -> Result<(), iletki::gpu::wgpu::web_sys::wasm_bindgen::JsValue> {
 mod web {
     use iletki::gpu::wgpu;
     use iletki::{
-        Camera, DrawStyle2D, Mesh2D, Mesh3D, PassTargetDesc, PickId, Plane, Scene2DLayer,
-        Scene3DLayer, UploadBudget, Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer,
+        Camera, DiagnosticView, DrawStyle2D, GtaoConfig, Material3D, Mesh2D, Mesh3D,
+        PassTargetDesc, PickId, Plane, Scene2DLayer, Scene3DLayer, SectionCapConfig, UploadBudget,
+        Vec2, Vec3, ViewportConfig, ViewportHost, ViewportLayer, VisualStyle,
     };
     use std::collections::{BTreeSet, HashMap};
     use wgpu::web_sys::{
@@ -53,8 +54,12 @@ mod web {
         if info.backend != wgpu::Backend::BrowserWebGpu {
             return Err(format!("unexpected rendering backend: {:?}", info.backend));
         }
+        let required_features = adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8;
         let (device, queue) = adapter
-            .request_device(&Default::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features,
+                ..Default::default()
+            })
             .await
             .map_err(|e| e.to_string())?;
 
@@ -89,8 +94,9 @@ mod web {
         }
         check_section(&adapter, &device, &queue).await?;
         check_modern_3d_paths(&adapter, &device, &queue).await?;
+        check_render_architecture(&adapter, &device, &queue).await?;
         Ok(format!(
-            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline, flat indexing, Q32.32 UTM transforms and Rg16Uint MRT selection preview",
+            "{:?} ({}) rendered {COLOR:?}, picked {ID:?} and verified 4× section, outline, flat indexing, Q32.32 UTM transforms, Rg16Uint MRT preview, section caps, WBOIT, styles and GTAO",
             info.backend, info.name
         ))
     }
@@ -386,6 +392,162 @@ mod web {
         if stats.submitted != 2 || stats.ready != 2 {
             return Err(format!(
                 "unexpected WebGPU selection preview stats: {stats:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn check_render_architecture(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        let mut host = ViewportHost::new_with_adapter(
+            device,
+            adapter,
+            ViewportConfig {
+                color_format: FORMAT,
+                clear_color: [0.05, 0.06, 0.08, 1.0],
+                initial_px: [SIZE; 2],
+                msaa_samples: 4,
+                upload_budget: UploadBudget::UNLIMITED,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        *host.camera_mut() = Camera::ortho_3d(
+            Vec3::new(0.0, 0.0, 8.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            4.0,
+            0.1,
+            30.0,
+        );
+
+        // 1. WBOIT ghosting + translucent Material3D + VisualStyle / DiagnosticView.
+        let mut scene = Scene3DLayer::new(ID.layer);
+        let mut front = Mesh3D::at_origin(Vec3::new(0.0, 0.0, 0.8));
+        front.push_box_with_edges(
+            Vec3::new(-1.0, -1.0, -0.2),
+            Vec3::new(1.0, 1.0, 0.2),
+            [225, 225, 225, 255],
+            [20, 20, 25, 255],
+            PickId::new(ID.layer, 201, 0),
+            false,
+        );
+        let mut back = Mesh3D::at_origin(Vec3::new(0.0, 0.0, -0.8));
+        back.push_box(
+            Vec3::new(-1.0, -1.0, -0.2),
+            Vec3::new(1.0, 1.0, 0.2),
+            [20, 230, 30, 255],
+            PickId::new(ID.layer, 202, 0),
+            false,
+        );
+        let front_id = scene.insert(front);
+        let _back_id = scene.insert(back);
+
+        let opaque_px =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        scene.set_chunk_ghost(front_id, true);
+        let ghost_px =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if ghost_px.get(1).copied().unwrap_or(0)
+            <= ghost_px.first().copied().unwrap_or(255).saturating_add(12)
+        {
+            return Err(format!(
+                "WebGPU WBOIT ghost must reveal back green box (opaque={opaque_px:?}, ghost={ghost_px:?})"
+            ));
+        }
+
+        scene.set_chunk_ghost(front_id, false);
+        scene.set_visual_style(VisualStyle::Technical);
+        let tech_px =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if tech_px.first().copied().unwrap_or(0) < 160 {
+            return Err(format!(
+                "WebGPU Technical style pixel unexpected: {tech_px:?}"
+            ));
+        }
+        scene.set_diagnostic_view(DiagnosticView::Normals);
+        let norm_px =
+            render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+        if norm_px.get(2).copied().unwrap_or(0) < 200 {
+            return Err(format!(
+                "WebGPU Normals diagnostic pixel unexpected: {norm_px:?}"
+            ));
+        }
+        scene.set_diagnostic_view(DiagnosticView::None);
+        scene.set_visual_style(VisualStyle::ShadedWithEdges);
+
+        // 2. Stencil Section Caps (when Depth32FloatStencil8 is available).
+        if host.supports_stencil(device) {
+            let cut = Plane::from_normal_point(-Vec3::Z, Vec3::new(0.0, 0.0, 0.8))
+                .ok_or("invalid section cap plane")?;
+            host.camera_mut().set_clip_planes(&[cut]);
+            scene.set_section_caps(SectionCapConfig::solid([0.95, 0.1, 0.1, 1.0]));
+            let cap_px =
+                render_pixels(device, queue, &mut host, &mut [&mut scene], SIZE / 2, 1).await?;
+            if cap_px.first().copied().unwrap_or(0) < 200
+                || cap_px.get(1).copied().unwrap_or(255) > 55
+            {
+                return Err(format!("WebGPU stencil section cap unexpected: {cap_px:?}"));
+            }
+            scene.set_section_caps(SectionCapConfig::default());
+            host.camera_mut().clear_clip_planes();
+        }
+
+        // 3. Half-res depth-only GTAO on a concave 90-degree corner.
+        let mut ao_scene = Scene3DLayer::new(ID.layer);
+        let mat_color = [215, 215, 215, 255];
+        let mut floor = Mesh3D::at_origin(Vec3::ZERO);
+        floor.push_box(
+            Vec3::new(-0.4, -0.25, -0.4),
+            Vec3::new(3.6, 0.0, 3.6),
+            mat_color,
+            PickId::new(ID.layer, 301, 0),
+            false,
+        );
+        let mut back_wall = Mesh3D::at_origin(Vec3::ZERO);
+        back_wall.push_box(
+            Vec3::new(-0.4, 0.0, -0.4),
+            Vec3::new(3.6, 2.2, 0.0),
+            mat_color,
+            PickId::new(ID.layer, 302, 0),
+            false,
+        );
+        let mut left_wall = Mesh3D::at_origin(Vec3::ZERO);
+        left_wall.push_box(
+            Vec3::new(-0.4, 0.0, 0.0),
+            Vec3::new(0.0, 2.2, 3.6),
+            mat_color,
+            PickId::new(ID.layer, 303, 0),
+            false,
+        );
+        ao_scene.insert(floor);
+        ao_scene.insert(back_wall);
+        let _glass_mat = ao_scene.insert_material(Material3D::translucent([0.2, 0.5, 1.0, 0.5]));
+        ao_scene.insert(left_wall);
+
+        *host.camera_mut() = Camera::perspective_3d(
+            Vec3::new(3.8, 3.0, 4.4),
+            Vec3::new(0.18, 0.02, 0.18),
+            Vec3::Y,
+            std::f64::consts::FRAC_PI_4,
+            0.1,
+        );
+        let base_px =
+            render_pixels(device, queue, &mut host, &mut [&mut ao_scene], SIZE / 2, 1).await?;
+        let mut gtao_cfg = GtaoConfig::with_radius(1.4);
+        gtao_cfg.intensity = 1.25;
+        gtao_cfg.power = 1.6;
+        ao_scene.set_gtao(gtao_cfg);
+        let ao_px =
+            render_pixels(device, queue, &mut host, &mut [&mut ao_scene], SIZE / 2, 1).await?;
+        let base_r = base_px.first().copied().unwrap_or(0);
+        let ao_r = ao_px.first().copied().unwrap_or(255);
+        if base_r <= ao_r.saturating_add(12) {
+            return Err(format!(
+                "WebGPU GTAO must darken concave corner (base={base_px:?}, ao={ao_px:?})"
             ));
         }
         Ok(())
