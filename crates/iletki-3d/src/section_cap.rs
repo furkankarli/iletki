@@ -19,10 +19,12 @@
 use crate::face_batch::{PackedDraws, VertexLayout};
 use crate::provoking;
 use crate::scene::ObjectUniforms;
+use crate::storage_batch::StorageDraws;
 use bytemuck::{Pod, Zeroable};
 use iletki_core::{Bounds3, Camera, MAX_CLIP_PLANES, Plane, Projection, Vec3, Vec4};
 use iletki_wgpu::{CAMERA_WGSL, PrepareCtx, wgpu};
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 const OBJECT_BYTES: usize = size_of::<ObjectUniforms>();
 const DIRECT_PAGE_BYTES: usize = 256 * 1024;
@@ -221,6 +223,57 @@ pub(crate) fn is_cap_plane_visible(camera: &Camera, plane: Plane) -> bool {
     }
 }
 
+/// Returns whether world-space `bounds` crosses (or lies within tolerance of) `plane`.
+///
+/// Closed solids lying strictly on the kept side contribute zero net stencil wrap (every ray
+/// enters and exits equally), and solids strictly on the clipped side are discarded completely, so
+/// Pass A only needs to rasterize chunks that straddle `plane`. Returns `true` conservatively for
+/// empty or non-finite bounds.
+pub(crate) fn plane_crosses_bounds(plane: Plane, bounds: Bounds3) -> bool {
+    if bounds.is_empty() || !bounds.min.is_finite() || !bounds.max.is_finite() {
+        return true;
+    }
+    let n = plane.normal;
+    let lo = Vec3::new(
+        if n.x >= 0.0 {
+            bounds.min.x
+        } else {
+            bounds.max.x
+        },
+        if n.y >= 0.0 {
+            bounds.min.y
+        } else {
+            bounds.max.y
+        },
+        if n.z >= 0.0 {
+            bounds.min.z
+        } else {
+            bounds.max.z
+        },
+    );
+    let hi = Vec3::new(
+        if n.x >= 0.0 {
+            bounds.max.x
+        } else {
+            bounds.min.x
+        },
+        if n.y >= 0.0 {
+            bounds.max.y
+        } else {
+            bounds.min.y
+        },
+        if n.z >= 0.0 {
+            bounds.max.z
+        } else {
+            bounds.min.z
+        },
+    );
+    let min_d = plane.signed_distance(lo);
+    let max_d = plane.signed_distance(hi);
+    const EPS: f64 = 1e-3;
+    !min_d.is_finite() || !max_d.is_finite() || (min_d <= EPS && max_d >= -EPS)
+}
+
 /// Computes camera-relative uniforms for every viewer-facing active section clip plane (`0..=6`).
 pub(crate) fn compute_visible_cap_planes(
     camera: &Camera,
@@ -228,7 +281,7 @@ pub(crate) fn compute_visible_cap_planes(
     untrusted_bounds: bool,
     dpi_scale: f32,
     config: SectionCapConfig,
-) -> Vec<(CapPlaneUniform, CapQuadUniform)> {
+) -> Vec<(Plane, CapPlaneUniform, CapQuadUniform)> {
     if !config.enabled || camera.clip_planes().is_empty() {
         return Vec::new();
     }
@@ -321,7 +374,7 @@ pub(crate) fn compute_visible_cap_planes(
             hatch_phase: [phase_u, phase_v, 0.0, 0.0],
             meta: [idx as u32, cfg.pattern.to_u32(), 0, 0],
         };
-        result.push((plane_uniform, quad_uniform));
+        result.push((plane, plane_uniform, quad_uniform));
     }
     result
 }
@@ -721,12 +774,14 @@ pub(crate) struct ViewSectionCaps {
     visible_count: usize,
     pub(crate) use_storage: bool,
     pub(crate) direct_chunks: Vec<usize>,
+    plane_direct_ranges: [Range<usize>; MAX_CLIP_PLANES],
     direct_uniforms: Vec<ObjectUniforms>,
     direct_pages: Vec<DirectCapUniformPage>,
     direct_staging: Vec<u8>,
     direct_stride: usize,
     direct_slots_per_page: usize,
-    pub(crate) fallback_packed: PackedDraws,
+    pub(crate) plane_storage: [StorageDraws; MAX_CLIP_PLANES],
+    pub(crate) plane_fallback_packed: [PackedDraws; MAX_CLIP_PLANES],
 }
 
 impl ViewSectionCaps {
@@ -791,20 +846,20 @@ impl ViewSectionCaps {
             visible_count: 0,
             use_storage: false,
             direct_chunks: Vec::new(),
+            plane_direct_ranges: std::array::from_fn(|_| 0..0),
             direct_uniforms: Vec::new(),
             direct_pages: Vec::new(),
             direct_staging: Vec::new(),
             direct_stride,
             direct_slots_per_page,
-            fallback_packed: PackedDraws::default(),
+            plane_storage: std::array::from_fn(|_| StorageDraws::default()),
+            plane_fallback_packed: std::array::from_fn(|_| PackedDraws::default()),
         }
     }
 
     pub(crate) fn clear_active(&mut self) {
         self.visible_count = 0;
-        self.direct_chunks.clear();
-        self.direct_uniforms.clear();
-        self.fallback_packed.clear();
+        self.clear_draws();
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -823,14 +878,37 @@ impl ViewSectionCaps {
         self.quad_bgs.get(slot)
     }
 
+    pub(crate) fn set_plane_direct_range(&mut self, slot: usize, range: Range<usize>) {
+        if let Some(dst) = self.plane_direct_ranges.get_mut(slot) {
+            *dst = range;
+        }
+    }
+
+    pub(crate) fn plane_direct_range(&self, slot: usize) -> Range<usize> {
+        self.plane_direct_ranges.get(slot).cloned().unwrap_or(0..0)
+    }
+
+    pub(crate) fn plane_has_geometry(&self, slot: usize) -> bool {
+        let has_direct = !self.plane_direct_range(slot).is_empty();
+        let has_storage = self
+            .plane_storage
+            .get(slot)
+            .is_some_and(StorageDraws::has_packed);
+        let has_packed = self
+            .plane_fallback_packed
+            .get(slot)
+            .is_some_and(PackedDraws::has_packed);
+        has_direct || has_storage || has_packed
+    }
+
     pub(crate) fn upload_planes(
         &mut self,
         queue: &wgpu::Queue,
-        planes: &[(CapPlaneUniform, CapQuadUniform)],
+        planes: &[(Plane, CapPlaneUniform, CapQuadUniform)],
     ) {
         let count = planes.len().min(MAX_CLIP_PLANES);
         self.visible_count = count;
-        for (slot, (plane_u, quad_u)) in planes.iter().take(count).enumerate() {
+        for (slot, (_, plane_u, quad_u)) in planes.iter().take(count).enumerate() {
             if let Some(buf) = self.plane_bufs.get(slot) {
                 queue.write_buffer(buf, 0, bytemuck::bytes_of(plane_u));
             }
@@ -843,7 +921,15 @@ impl ViewSectionCaps {
     pub(crate) fn clear_draws(&mut self) {
         self.direct_chunks.clear();
         self.direct_uniforms.clear();
-        self.fallback_packed.clear();
+        for range in &mut self.plane_direct_ranges {
+            *range = 0..0;
+        }
+        for draws in &mut self.plane_storage {
+            draws.clear();
+        }
+        for draws in &mut self.plane_fallback_packed {
+            draws.clear();
+        }
     }
 
     pub(crate) fn push_direct(&mut self, chunk_index: usize, uniforms: ObjectUniforms) {
@@ -1073,13 +1159,31 @@ mod tests {
         assert_eq!(caps_a.len(), 1);
         assert_eq!(caps_b.len(), 1);
         // Hatch phase depends solely on world anchor + plane, never camera position.
-        assert_eq!(caps_a[0].1.hatch_phase, caps_b[0].1.hatch_phase);
-        assert!(caps_a[0].1.hatch_phase[0] >= 0.0 && caps_a[0].1.hatch_phase[0] < 1.0);
-        assert!(caps_a[0].1.hatch_phase[1] >= 0.0 && caps_a[0].1.hatch_phase[1] < 1.0);
+        assert_eq!(caps_a[0].2.hatch_phase, caps_b[0].2.hatch_phase);
+        assert!(caps_a[0].2.hatch_phase[0] >= 0.0 && caps_a[0].2.hatch_phase[0] < 1.0);
+        assert!(caps_a[0].2.hatch_phase[1] >= 0.0 && caps_a[0].2.hatch_phase[1] < 1.0);
         // Quad origin sits precisely on the camera-relative clip plane.
-        let p = caps_a[0].0.plane;
-        let o = caps_a[0].1.origin_extent;
+        let p = caps_a[0].1.plane;
+        let o = caps_a[0].2.origin_extent;
         let residual = p[0] * o[0] + p[1] * o[1] + p[2] * o[2] + p[3];
         assert!(residual.abs() < 1e-4, "residual={residual}");
+    }
+
+    #[test]
+    fn plane_crosses_bounds_rejects_strictly_kept_and_clipped_chunks() {
+        let plane = Plane::from_normal_point(-Vec3::Z, Vec3::ZERO).unwrap();
+        let straddling =
+            Bounds3::from_corners(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        let strictly_kept =
+            Bounds3::from_corners(Vec3::new(-1.0, -1.0, -5.0), Vec3::new(1.0, 1.0, -0.5));
+        let strictly_clipped =
+            Bounds3::from_corners(Vec3::new(-1.0, -1.0, 0.5), Vec3::new(1.0, 1.0, 5.0));
+        let coplanar = Bounds3::from_corners(Vec3::new(-1.0, -1.0, -2.0), Vec3::new(1.0, 1.0, 0.0));
+
+        assert!(plane_crosses_bounds(plane, straddling));
+        assert!(plane_crosses_bounds(plane, coplanar));
+        assert!(!plane_crosses_bounds(plane, strictly_kept));
+        assert!(!plane_crosses_bounds(plane, strictly_clipped));
+        assert!(plane_crosses_bounds(plane, Bounds3::EMPTY));
     }
 }

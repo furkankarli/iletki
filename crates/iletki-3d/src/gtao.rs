@@ -781,10 +781,16 @@ impl ViewGtaoTargets {
         let hh = ah.div_ceil(2).max(1);
 
         let run_half = |encoder: &mut wgpu::CommandEncoder,
-                        label: &str,
+                        label: &'static str,
                         target: &wgpu::TextureView,
                         pipeline: &wgpu::RenderPipeline,
                         bg: &wgpu::BindGroup| {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let gpu_timer = iletki_wgpu::profiling::pass(label);
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.render_writes());
+            #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+            let timestamp_writes = None;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -797,7 +803,7 @@ impl ViewGtaoTargets {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -830,6 +836,12 @@ impl ViewGtaoTargets {
             &self.blur_bg,
         );
 
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let upsample_timer = iletki_wgpu::profiling::pass("iletki-3d gtao bilateral upsample");
+        #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+        let upsample_ts = upsample_timer.as_ref().and_then(|t| t.render_writes());
+        #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+        let upsample_ts = None;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iletki-3d gtao bilateral upsample"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -842,7 +854,7 @@ impl ViewGtaoTargets {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: upsample_ts,
             occlusion_query_set: None,
             multiview_mask: None,
         });

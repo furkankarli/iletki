@@ -56,8 +56,10 @@ fn create_device_with_limits(limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu
         }))
     })
     .ok()?;
+    let required_features = adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki-3d test device"),
+        required_features,
         required_limits: limits,
         ..wgpu::DeviceDescriptor::default()
     }))
@@ -1931,9 +1933,11 @@ fn create_device_with_clip_distances() -> Option<(wgpu::Device, wgpu::Queue)> {
     if !adapter.features().contains(wgpu::Features::CLIP_DISTANCES) {
         return None;
     }
+    let required_features = wgpu::Features::CLIP_DISTANCES
+        | (adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8);
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki-3d clip_distances test device"),
-        required_features: wgpu::Features::CLIP_DISTANCES,
+        required_features,
         required_limits: wgpu::Limits::default(),
         ..wgpu::DeviceDescriptor::default()
     }))

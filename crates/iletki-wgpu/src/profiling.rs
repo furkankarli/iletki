@@ -272,6 +272,12 @@ pub struct Pass {
 
 impl Pass {
     pub(crate) fn writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.render_writes()
+    }
+
+    /// Returns timestamp writes for a render pass when timestamp queries are active.
+    #[must_use]
+    pub fn render_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         self.queries
             .as_ref()
             .map(|query_set| wgpu::RenderPassTimestampWrites {

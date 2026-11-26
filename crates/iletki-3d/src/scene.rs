@@ -22,6 +22,7 @@ use crate::provoking::{self, DedupScratch};
 use crate::section::SectionAa;
 use crate::section_cap::{
     SectionCapConfig, SectionCapPipelines, ViewSectionCaps, compute_visible_cap_planes,
+    plane_crosses_bounds,
 };
 use crate::shading::ScenePipelines;
 use crate::storage_batch::{self, ChunkTransformTable, StorageDraws, StorageViewBinding};
@@ -255,9 +256,6 @@ pub struct Scene3DLayer {
     section_cap_pipelines: Option<SectionCapPipelines>,
     gtao: GtaoConfig,
     gtao_pipelines: Option<GtaoPipelines>,
-    shared_stencil_draws: StorageDraws,
-    shared_stencil_direct: Vec<usize>,
-    shared_stencil_rev: u64,
     cap_bounds_cache: (Option<LayerRevision>, Option<Bounds3>, bool),
     use_antialiased_section: bool,
     chunks: Vec<Option<ChunkEntry>>,
@@ -356,9 +354,6 @@ impl Scene3DLayer {
             section_cap_pipelines: None,
             gtao: GtaoConfig::default(),
             gtao_pipelines: None,
-            shared_stencil_draws: StorageDraws::default(),
-            shared_stencil_direct: Vec::new(),
-            shared_stencil_rev: 0,
             cap_bounds_cache: (None, None, false),
             use_antialiased_section: false,
             chunks: Vec::new(),
@@ -782,9 +777,6 @@ impl Scene3DLayer {
             self.shared_mask_rev = 0;
             self.shared_mask_bounds_rev = 0;
             self.shared_selected_envelope = None;
-            self.shared_stencil_draws.clear();
-            self.shared_stencil_direct.clear();
-            self.shared_stencil_rev = 0;
             self.shared_oit_draws.clear();
             self.shared_oit_direct.clear();
             self.shared_oit_rev = 0;
@@ -1253,9 +1245,6 @@ impl Scene3DLayer {
         self.section_caps = config;
         if !config.enabled {
             self.section_cap_pipelines = None;
-            self.shared_stencil_draws.clear();
-            self.shared_stencil_direct.clear();
-            self.shared_stencil_rev = 0;
             for view in &mut self.views {
                 view.section_caps = None;
             }
@@ -1409,30 +1398,33 @@ impl Scene3DLayer {
             return;
         };
         let dynamic_uniforms = p.dynamic_uniforms;
+        let packed_layout = p.packed.as_ref().map(|pk| &pk.layout);
 
-        if use_storage && self.shared_stencil_rev != self.geometry_revision {
-            self.shared_stencil_direct.clear();
-            let chunks = &self.chunks;
-            let materials = &self.materials;
-            let direct = &mut self.shared_stencil_direct;
-            let packed_iter = chunks.iter().enumerate().filter_map(|(slot, entry)| {
-                let chunk = entry.as_ref()?;
-                if chunk.vertex_count == 0 || Self::chunk_is_translucent(chunk, materials) {
-                    return None;
+        // Ensure 32-chunk hierarchical AABB groups are populated so plane-crossing + frustum
+        // culling skips 90%+ of un-cut chunks in microseconds on large BIM scenes.
+        let group_count = self.chunks.len().div_ceil(SECTION_GROUP_SIZE);
+        if self.section_groups.len() != group_count {
+            self.section_groups.resize_with(group_count, || None);
+        }
+        for (group_idx, chunks) in self.chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
+            if let Some(slot) = self.section_groups.get_mut(group_idx)
+                && slot.is_none()
+            {
+                let mut bounds = SectionGroup::default();
+                for chunk in chunks.iter().flatten() {
+                    if chunk.section_bounds_trusted {
+                        bounds.include(chunk.origin, chunk.local_bounds);
+                    } else if chunk.vertex_count != 0 || chunk.edge_count != 0 {
+                        bounds.mark_untrusted();
+                    }
                 }
-                let geometry = chunk.vertex_buf.as_ref()?;
-                if geometry.is_direct() {
-                    direct.push(slot);
-                    return None;
-                }
-                Some((slot, geometry))
-            });
-            self.shared_stencil_draws
-                .rebuild_unordered(ctx.device, ctx.queue, packed_iter);
-            self.shared_stencil_rev = self.geometry_revision;
+                *slot = Some(bounds);
+            }
         }
 
         let cam_pos = ctx.camera.position_3d();
+        let projection = ctx.camera.view_proj_relative(ctx.logical_size);
+        let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
         let Some(view) = self.views.get_mut(view_index) else {
             return;
         };
@@ -1443,67 +1435,127 @@ impl Scene3DLayer {
         view_caps.upload_planes(ctx.queue, &visible_planes);
         view_caps.clear_draws();
 
-        if use_storage {
-            for &chunk_idx in &self.shared_stencil_direct {
-                if let Some(Some(chunk)) = self.chunks.get(chunk_idx)
-                    && chunk.visible
-                    && chunk.vertex_count != 0
-                {
-                    view_caps.push_direct(
-                        chunk_idx,
-                        ObjectUniforms {
-                            offset_rel: (chunk.origin - cam_pos).to_f32(),
-                            scale: 1.0,
-                        },
-                    );
-                }
-            }
-            view_caps.upload_direct_uniforms(ctx.device, ctx.queue, &p.object_layout);
-        } else {
-            let projection = ctx.camera.view_proj_relative(ctx.logical_size);
-            let frustum = iletki_core::Frustum::from_view_proj_reverse_z(projection);
-            let packed_layout = p.packed.as_ref().map(|pk| &pk.layout);
-            for (chunk_idx, entry) in self.chunks.iter().enumerate() {
-                let Some(chunk) = entry else { continue };
-                if !chunk.visible
-                    || chunk.vertex_count == 0
-                    || Self::chunk_is_translucent(chunk, &self.materials)
-                {
-                    continue;
-                }
-                if chunk.section_bounds_trusted && !chunk.local_bounds.is_empty() {
-                    let world = Bounds3::from_corners(
-                        chunk.origin + chunk.local_bounds.min,
-                        chunk.origin + chunk.local_bounds.max,
-                    );
-                    if !world.is_empty() && !frustum.intersects_bounds_world(world, cam_pos) {
-                        continue;
+        let chunks = &self.chunks;
+        let materials = &self.materials;
+        let groups = &self.section_groups;
+
+        for (slot, (plane, _, _)) in visible_planes.iter().enumerate() {
+            let direct_start = view_caps.direct_chunks.len();
+            if use_storage {
+                let mut storage_entries = Vec::new();
+                for (group_idx, group_chunks) in chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
+                    if let Some(Some(group)) = groups.get(group_idx) {
+                        if group.outside_frustum(&frustum, cam_pos) {
+                            continue;
+                        }
+                        if let Some(gb) = group.world_bounds()
+                            && !plane_crosses_bounds(*plane, gb)
+                        {
+                            continue;
+                        }
+                    }
+                    let base = group_idx * SECTION_GROUP_SIZE;
+                    for (local_idx, entry) in group_chunks.iter().enumerate() {
+                        let Some(chunk) = entry else { continue };
+                        if !chunk.visible
+                            || chunk.vertex_count == 0
+                            || Self::chunk_is_translucent(chunk, materials)
+                        {
+                            continue;
+                        }
+                        if chunk.section_bounds_trusted && !chunk.local_bounds.is_empty() {
+                            let world = Bounds3::from_corners(
+                                chunk.origin + chunk.local_bounds.min,
+                                chunk.origin + chunk.local_bounds.max,
+                            );
+                            if !world.is_empty()
+                                && (!plane_crosses_bounds(*plane, world)
+                                    || !frustum.intersects_bounds_world(world, cam_pos))
+                            {
+                                continue;
+                            }
+                        }
+                        let Some(geometry) = chunk.vertex_buf.as_ref() else {
+                            continue;
+                        };
+                        let chunk_idx = base + local_idx;
+                        if geometry.is_direct() {
+                            view_caps.push_direct(
+                                chunk_idx,
+                                ObjectUniforms {
+                                    offset_rel: (chunk.origin - cam_pos).to_f32(),
+                                    scale: 1.0,
+                                },
+                            );
+                        } else {
+                            storage_entries.push((chunk_idx, geometry));
+                        }
                     }
                 }
-                let Some(geometry) = chunk.vertex_buf.as_ref() else {
-                    continue;
-                };
-                let uniforms = ObjectUniforms {
-                    offset_rel: (chunk.origin - cam_pos).to_f32(),
-                    scale: 1.0,
-                };
-                if packed_layout.is_some() && !geometry.is_direct() {
-                    view_caps
-                        .fallback_packed
-                        .push(geometry, uniforms, chunk_idx);
-                } else {
-                    view_caps.push_direct(chunk_idx, uniforms);
+                if let Some(dst) = view_caps.plane_storage.get_mut(slot) {
+                    dst.rebuild_unordered(ctx.device, ctx.queue, storage_entries.into_iter());
+                }
+            } else {
+                for (group_idx, group_chunks) in chunks.chunks(SECTION_GROUP_SIZE).enumerate() {
+                    if let Some(Some(group)) = groups.get(group_idx) {
+                        if group.outside_frustum(&frustum, cam_pos) {
+                            continue;
+                        }
+                        if let Some(gb) = group.world_bounds()
+                            && !plane_crosses_bounds(*plane, gb)
+                        {
+                            continue;
+                        }
+                    }
+                    let base = group_idx * SECTION_GROUP_SIZE;
+                    for (local_idx, entry) in group_chunks.iter().enumerate() {
+                        let Some(chunk) = entry else { continue };
+                        if !chunk.visible
+                            || chunk.vertex_count == 0
+                            || Self::chunk_is_translucent(chunk, materials)
+                        {
+                            continue;
+                        }
+                        if chunk.section_bounds_trusted && !chunk.local_bounds.is_empty() {
+                            let world = Bounds3::from_corners(
+                                chunk.origin + chunk.local_bounds.min,
+                                chunk.origin + chunk.local_bounds.max,
+                            );
+                            if !world.is_empty()
+                                && (!plane_crosses_bounds(*plane, world)
+                                    || !frustum.intersects_bounds_world(world, cam_pos))
+                            {
+                                continue;
+                            }
+                        }
+                        let Some(geometry) = chunk.vertex_buf.as_ref() else {
+                            continue;
+                        };
+                        let chunk_idx = base + local_idx;
+                        let uniforms = ObjectUniforms {
+                            offset_rel: (chunk.origin - cam_pos).to_f32(),
+                            scale: 1.0,
+                        };
+                        if packed_layout.is_some() && !geometry.is_direct() {
+                            if let Some(dst) = view_caps.plane_fallback_packed.get_mut(slot) {
+                                dst.push(geometry, uniforms, chunk_idx);
+                            }
+                        } else {
+                            view_caps.push_direct(chunk_idx, uniforms);
+                        }
+                    }
+                }
+                if let Some(layout) = packed_layout
+                    && let Some(dst) = view_caps.plane_fallback_packed.get_mut(slot)
+                    && dst.has_packed()
+                {
+                    dst.upload(ctx.device, layout, ctx.queue);
                 }
             }
-            if let Some(layout) = packed_layout
-                && view_caps.fallback_packed.has_packed()
-            {
-                view_caps
-                    .fallback_packed
-                    .upload(ctx.device, layout, ctx.queue);
-            }
-            view_caps.upload_direct_uniforms(ctx.device, ctx.queue, &p.object_layout);
+            let direct_end = view_caps.direct_chunks.len();
+            view_caps.set_plane_direct_range(slot, direct_start..direct_end);
         }
+        view_caps.upload_direct_uniforms(ctx.device, ctx.queue, &p.object_layout);
     }
 
     fn prepare_style<W>(&mut self, ctx: &PrepareCtx<'_, W>, view_index: usize) {
@@ -2421,6 +2473,9 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                 .and_then(StorageViewBinding::bind_group);
 
             for slot in 0..plane_count {
+                if !view_caps.plane_has_geometry(slot) {
+                    continue;
+                }
                 let (Some(plane_bg), Some(quad_bg)) = (
                     view_caps.plane_bind_group(slot),
                     view_caps.quad_bind_group(slot),
@@ -2430,6 +2485,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
                 // Pass A: Two-sided stencil mark clipped strictly by this clip plane alone.
                 {
+                    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                    let gpu_timer = iletki_wgpu::profiling::pass("iletki-3d section cap stencil");
+                    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                    let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.render_writes());
+                    #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+                    let timestamp_writes = None;
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("iletki-3d section cap stencil"),
                         color_attachments: &[],
@@ -2444,7 +2505,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 store: wgpu::StoreOp::Store,
                             }),
                         }),
-                        timestamp_writes: None,
+                        timestamp_writes,
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
@@ -2452,11 +2513,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     pass.set_scissor_rect(0, 0, aw, ah);
                     pass.set_bind_group(0, ctx.camera_bind_group, &[]);
 
-                    if !view_caps.direct_chunks.is_empty() {
+                    let direct_range = view_caps.plane_direct_range(slot);
+                    if !direct_range.is_empty() {
                         pass.set_pipeline(&cap_pl.direct_stencil);
                         pass.set_bind_group(2, plane_bg, &[]);
-                        for (direct_idx, &chunk_idx) in view_caps.direct_chunks.iter().enumerate() {
-                            if let Some(Some(chunk)) = self.chunks.get(chunk_idx)
+                        for direct_idx in direct_range {
+                            if let Some(&chunk_idx) = view_caps.direct_chunks.get(direct_idx)
+                                && let Some(Some(chunk)) = self.chunks.get(chunk_idx)
                                 && chunk.visible
                                 && let Some(geometry) = chunk.vertex_buf.as_ref()
                                 && view_caps.bind_direct(&mut pass, direct_idx, p.dynamic_uniforms)
@@ -2467,12 +2530,13 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     }
 
                     if view_caps.use_storage {
-                        if self.shared_stencil_draws.has_packed()
+                        if let Some(plane_draws) = view_caps.plane_storage.get(slot)
+                            && plane_draws.has_packed()
                             && let (Some(storage_pl), Some(st_bg)) =
                                 (&cap_pl.storage_stencil, storage_bg)
                         {
                             pass.set_bind_group(2, plane_bg, &[]);
-                            self.shared_stencil_draws.paint_position_only(
+                            plane_draws.paint_position_only(
                                 &mut pass,
                                 st_bg,
                                 storage_pl,
@@ -2480,20 +2544,23 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 |_, _| {},
                             );
                         }
-                    } else if view_caps.fallback_packed.has_packed()
+                    } else if let Some(plane_packed) = view_caps.plane_fallback_packed.get(slot)
+                        && plane_packed.has_packed()
                         && let Some(packed_pl) = &cap_pl.packed_stencil
                     {
                         pass.set_bind_group(2, plane_bg, &[]);
-                        view_caps.fallback_packed.paint_position_only(
-                            &mut pass,
-                            packed_pl,
-                            |_, _| {},
-                        );
+                        plane_packed.paint_position_only(&mut pass, packed_pl, |_, _| {});
                     }
                 }
 
                 // Pass B: Plane-aligned cap quad filling nonzero stencil pixels and writing cap depth.
                 {
+                    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                    let gpu_timer = iletki_wgpu::profiling::pass("iletki-3d section cap fill");
+                    #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+                    let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.render_writes());
+                    #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+                    let timestamp_writes = None;
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("iletki-3d section cap fill"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2516,7 +2583,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                                 store: wgpu::StoreOp::Discard,
                             }),
                         }),
-                        timestamp_writes: None,
+                        timestamp_writes,
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
@@ -2571,6 +2638,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         // Pass 1: Accumulate weighted translucent colors & revealage against read-only scene depth.
         {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let gpu_timer = iletki_wgpu::profiling::pass("iletki-3d oit accum");
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.render_writes());
+            #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+            let timestamp_writes = None;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-3d oit accum"),
                 color_attachments: &[
@@ -2614,7 +2687,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                         },
                     ),
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2684,6 +2757,12 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
 
         // Pass 2: Fullscreen composite of resolved WBOIT buffers onto the scene color attachment.
         {
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let gpu_timer = iletki_wgpu::profiling::pass("iletki-3d oit composite");
+            #[cfg(all(feature = "profiling", not(target_arch = "wasm32")))]
+            let timestamp_writes = gpu_timer.as_ref().and_then(|t| t.render_writes());
+            #[cfg(not(all(feature = "profiling", not(target_arch = "wasm32"))))]
+            let timestamp_writes = None;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iletki-3d oit composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2696,7 +2775,7 @@ impl<W> ViewportLayer<W> for Scene3DLayer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

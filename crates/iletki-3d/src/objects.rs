@@ -404,6 +404,11 @@ impl SectionGroup {
         !frustum.intersects_bounds_world(self.world, camera)
     }
 
+    pub(crate) fn world_bounds(&self) -> Option<Bounds3> {
+        (!self.has_untrusted && !self.invalid_origin && !self.world.is_empty())
+            .then_some(self.world)
+    }
+
     pub(crate) fn inside_frustum(&self, frustum: &Frustum, camera: Vec3) -> bool {
         if self.invalid_origin || self.world.is_empty() {
             return false;

@@ -16,7 +16,7 @@ struct CapQuadUniform {
     // xy = exact f64-reduced [0, 1) world-locked hatch phase at quad origin; zw = unused.
     hatch_phase: vec4<f32>,
     // x = clip plane index (0..6); y = pattern (0=Solid, 1=Hatch, 2=CrossHatch); zw = unused.
-    meta: vec4<u32>,
+    params: vec4<u32>,
 };
 
 @group(1) @binding(0)
@@ -57,7 +57,7 @@ fn fs_cap_quad(in: CapQuadOut) -> @location(0) vec4<f32> {
 
     // Clip against every active clip plane other than this cap's own plane so multi-plane cuts
     // (corner cutaways, section boxes, opposing parallel slabs) meet cleanly without overhang.
-    let self_plane = cap_quad.meta.x;
+    let self_plane = cap_quad.params.x;
     let count = min(iletki_camera.clip_plane_count, 6u);
     for (var i: u32 = 0u; i < count; i = i + 1u) {
         if (i == self_plane) {
@@ -71,7 +71,7 @@ fn fs_cap_quad(in: CapQuadOut) -> @location(0) vec4<f32> {
 
     let base_rgb = iletki_color_to_target(cap_quad.color.rgb);
     let base_a = cap_quad.color.a;
-    let pattern = cap_quad.meta.y;
+    let pattern = cap_quad.params.y;
     if (pattern == 0u) {
         return vec4<f32>(base_rgb, base_a);
     }

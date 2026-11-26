@@ -71,8 +71,10 @@ fn request_headless_device(
             info.backend, info.name, info.device_type
         );
     }
+    let required_features = adapter.features() & wgpu::Features::DEPTH32FLOAT_STENCIL8;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("iletki test device"),
+        required_features,
         required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
